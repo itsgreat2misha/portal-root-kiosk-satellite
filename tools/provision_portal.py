@@ -15,6 +15,7 @@ import re
 import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -58,6 +59,9 @@ PROVISIONER_BANNER = rf"""
 HELPER_LOCAL = ROOT / "helper/build/libportal_audio_persist.so"
 HELPER_JAVA_LOCAL = ROOT / "helper/build/libportal_audio_persist_java.so"
 PRELOAD_REMOTE = "/data/local/tmp/preload-portal.so"
+CUSTOM_PAYLOAD_REMOTE = "/data/local/tmp/portal-root-daemon"
+CUSTOM_PAYLOAD_DST_REMOTE = "/data/local/tmp/portal-root-daemon"
+CUSTOM_PAYLOAD_PORT = 37373
 HELPER_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
 AUDIO_CTL_LOCAL = ROOT / "exploit/build/portal-audio-ctl.jar"
 AUDIO_CTL_REMOTE = "/data/local/tmp/portal-audio-ctl.jar"
@@ -282,6 +286,7 @@ class PortalProvisioner:
         restore_camera_light: bool = False,
         system_theme_control: str | None = None,
         shizuku_apk: pathlib.Path | None = None,
+        custom_payload: pathlib.Path | None = None,
         status_only: bool = False,
         dry_run: bool = False,
         backup_path: pathlib.Path | None = None,
@@ -344,6 +349,7 @@ class PortalProvisioner:
         self.system_theme_control_runtime_verified = False
         self.system_theme_control_log_count_before = 0
         self.shizuku_apk = shizuku_apk
+        self.custom_payload = custom_payload
         self.shizuku_public_key: pathlib.Path | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
@@ -779,6 +785,8 @@ class PortalProvisioner:
         ):
             self.prepare_mha_tuning_payloads()
         files = [(self.target.preload_path(ROOT), PRELOAD_REMOTE)]
+        if self.custom_payload is not None:
+            files.append((self.custom_payload, CUSTOM_PAYLOAD_REMOTE))
         if self.audio and not self.audio_already_configured:
             helper = (
                 HELPER_JAVA_LOCAL
@@ -828,6 +836,8 @@ class PortalProvisioner:
             )
             self.adb_run(["shell", "chmod", mode, remote], timeout=5, check=True)
         staged = f"preload={PRELOAD_REMOTE}"
+        if self.custom_payload is not None:
+            staged += f" custom_payload={CUSTOM_PAYLOAD_REMOTE}"
         if self.audio and not self.audio_already_configured:
             staged += f" helper={HELPER_REMOTE}"
         if AUDIO_CTL_REMOTE in {remote for _, remote in files}:
@@ -970,6 +980,8 @@ class PortalProvisioner:
             actions["presence_fps_cap"] = self.presence_fps_cap
         if self.system_theme_control is not None:
             actions["system_theme_control"] = self.system_theme_control
+        if self.custom_payload is not None:
+            actions["custom_payload"] = str(self.custom_payload)
         return actions
 
     def tool_revision(self) -> str:
@@ -1771,6 +1783,7 @@ class PortalProvisioner:
                 self.remove_shizuku,
                 self.disable_camera_light,
                 self.restore_camera_light,
+                self.custom_payload is not None,
                 self.system_theme_uid1000_action_requested(),
             )
         )
@@ -4192,7 +4205,10 @@ class PortalProvisioner:
         self._bugreport_cache[tag] = report
         return report
 
-    def exploit(self, base: int, memstart: int, attempt: int) -> bool:
+    def exploit(
+        self, base: int, memstart: int, attempt: int, *,
+        skip_final_reboot: bool = False,
+    ) -> bool:
         if self.target is None:
             raise ProvisionError("target must be selected before exploitation")
         stack_route = self.target.stack_route
@@ -4586,6 +4602,22 @@ class PortalProvisioner:
             environment["GHOSTLOCK_SHIZUKU_AUTHORIZE_KEY"] = "1"
         if self.remove_shizuku:
             environment["GHOSTLOCK_SHIZUKU_REMOVE_KEY"] = "1"
+        if self.custom_payload is not None:
+            environment.update(
+                {
+                    "GHOSTLOCK_CUSTOM_PAYLOAD": "1",
+                    "GHOSTLOCK_CUSTOM_PAYLOAD_SRC": CUSTOM_PAYLOAD_REMOTE,
+                    "GHOSTLOCK_CUSTOM_PAYLOAD_DST": CUSTOM_PAYLOAD_DST_REMOTE,
+                    "GHOSTLOCK_LOCK_REPAIR": os.environ.get(
+                        "PORTAL_LOCK_REPAIR", "1"
+                    ),
+                    # Keep the action child's own (shell) SELinux domain
+                    # while it receives uid-0 creds: the init domain
+                    # cannot read the shell-staged payload or write its
+                    # install location, the shell domain can.
+                    "GHOSTLOCK_ACTION_PRESERVE_SELINUX": "1",
+                }
+            )
         if self.disable_camera_light:
             environment["GHOSTLOCK_DISABLE_CAMERA_LIGHT"] = "1"
         if self.restore_camera_light:
@@ -4682,6 +4714,11 @@ class PortalProvisioner:
             "proc_uid lock waiter setup failed",
         )
         expected_markers: dict[str, tuple[str, bool]] = {}
+        if self.custom_payload is not None:
+            expected_markers["custom_payload"] = (
+                "PORTAL_CUSTOM_PAYLOAD_STARTED",
+                True,
+            )
         if self.persist_wireless_adb:
             expected_markers["wireless_adb"] = (
                 "wireless ADB persistence install",
@@ -4976,10 +5013,11 @@ class PortalProvisioner:
                 f"INSTALL_ATTEMPT_RESULT attempt={attempt} "
                 f"success={int(success)} early_failure={int(failed)}"
             )
-            try:
-                self.adb_run(["reboot"], timeout=8)
-            except ProvisionError:
-                pass
+            if not skip_final_reboot or not success:
+                try:
+                    self.adb_run(["reboot"], timeout=8)
+                except ProvisionError:
+                    pass
             process.terminate()
             try:
                 process.wait(timeout=3)
@@ -4987,6 +5025,103 @@ class PortalProvisioner:
                 process.kill()
                 process.wait(timeout=3)
         return success
+
+    def apply_custom_payload(self) -> None:
+        """Start a caller-supplied binary inside one privileged window.
+
+        The binary named by --custom-payload is staged like every other
+        payload; the native action installs it under /data/portal-root
+        and starts it detached. Unlike the install flow the device is
+        NOT rebooted after a successful attempt: the payload is expected
+        to keep serving for the rest of this boot. Verification requires
+        the payload to answer its ID command as uid 0 over loopback.
+        """
+        if self.target is None:
+            raise ProvisionError("target must be selected before custom payload")
+        if self.custom_payload is None:
+            raise ProvisionError("custom payload was not configured")
+        if not self.custom_payload.is_file():
+            raise ProvisionError(
+                f"custom payload not found: {self.custom_payload}"
+            )
+        self.stage()
+        clean_boot_id: str | None = None
+        for attempt in range(1, self.attempts + 1):
+            if clean_boot_id is None:
+                print(
+                    f"CUSTOM_PAYLOAD_ATTEMPT={attempt} preparing clean boot",
+                    flush=True,
+                )
+                _, boot_id = self.reboot()
+            else:
+                boot_id = clean_boot_id
+                clean_boot_id = None
+                print(
+                    f"CUSTOM_PAYLOAD_ATTEMPT={attempt} using post-attempt "
+                    f"clean boot boot_id={boot_id}",
+                    flush=True,
+                )
+            if self.target.address_discovery_settle_seconds:
+                time.sleep(self.target.address_discovery_settle_seconds)
+            try:
+                base = self.kaslr_base(str(attempt))
+                memstart = self.memstart(str(attempt))
+            except ProvisionError:
+                continue
+            print(
+                f"RUNTIME_ADDRESSES attempt={attempt} boot_id={boot_id} "
+                f"kaslr={base:#x} memstart={memstart:#x}",
+                flush=True,
+            )
+            if not self.exploit(
+                base, memstart, attempt, skip_final_reboot=True
+            ):
+                # A failed attempt reboots the device (see exploit());
+                # wait for that clean boot and reuse it, exactly like
+                # the install flow, instead of racing the reboot with
+                # an immediate boot_id read.
+                clean_boot_id = self.connect_after_reboot(boot_id)
+                continue
+            self.verify_custom_payload()
+            self.write_state("complete")
+            print(
+                f"CUSTOM_PAYLOAD_OK payload={CUSTOM_PAYLOAD_DST_REMOTE} "
+                f"port={CUSTOM_PAYLOAD_PORT} logs={self.log_dir}",
+                flush=True,
+            )
+            return
+        raise ProvisionError(
+            f"custom payload failed after {self.attempts} attempts"
+        )
+
+    def verify_custom_payload(self, wait_seconds: int = 30) -> None:
+        """Require the started payload to answer ID as uid 0 on loopback."""
+        self.adb_run(
+            [
+                "forward",
+                f"tcp:{CUSTOM_PAYLOAD_PORT}",
+                f"tcp:{CUSTOM_PAYLOAD_PORT}",
+            ],
+            timeout=10,
+            check=True,
+        )
+        deadline = time.monotonic() + wait_seconds
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=5
+                ) as sock:
+                    sock.sendall(b"ID\n")
+                    response = sock.recv(4096).decode(errors="replace")
+                last = response.strip()
+                if last.startswith("ID uid=0"):
+                    print(f"CUSTOM_PAYLOAD_ID {last}", flush=True)
+                    return
+            except OSError as exc:
+                last = str(exc)
+            time.sleep(2)
+        raise ProvisionError(f"custom payload did not answer as uid 0: {last}")
 
     @staticmethod
     def audio_processing_disabled_observed(
@@ -7406,6 +7541,7 @@ class PortalProvisioner:
             or self.remove_shizuku
             or self.disable_camera_light
             or self.restore_camera_light
+            or self.custom_payload is not None
             or self.system_theme_uid1000_action_requested()
         )
         if not privileged_action:
@@ -7460,6 +7596,14 @@ class PortalProvisioner:
         if use_exploit_sentinel:
             self.prepare_exploit_sentinel()
         sentinel_removed = not use_exploit_sentinel
+        if self.custom_payload is not None:
+            try:
+                self.apply_custom_payload()
+            finally:
+                if use_exploit_sentinel:
+                    self.uninstall_exploit_sentinel(best_effort=True)
+                    sentinel_removed = True
+            return
         try:
             self.prepare_exploit_users()
             self.stage()
@@ -7867,6 +8011,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--custom-payload",
+        type=pathlib.Path,
+        metavar="PATH",
+        help=(
+            "start the prebuilt binary at PATH inside one privileged "
+            "window: it is installed under /data/portal-root, started "
+            "detached as root, and verified over its loopback socket "
+            "for the rest of the current boot (no post-run reboot)"
+        ),
+    )
+    parser.add_argument(
         "--system-theme-control",
         choices=("light", "dark"),
         metavar="{light,dark}",
@@ -8203,6 +8358,7 @@ def main() -> int:
             restore_camera_light=args.restore_camera_light,
             system_theme_control=args.system_theme_control,
             shizuku_apk=args.shizuku_apk,
+            custom_payload=args.custom_payload,
             status_only=args.status or args.backup_only,
             dry_run=args.dry_run,
             backup_path=args.backup,
