@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -300,6 +301,7 @@ class PortalProvisioner:
         self.log_dir = log_dir
         self.audio = audio
         self.audio_already_configured = False
+        self.deferred_phase_failures: list[str] = []
         self.mha_tuning_stock_local: pathlib.Path | None = None
         self.mha_tuning_patched_local: pathlib.Path | None = None
         self.restore_audio = restore_audio
@@ -892,6 +894,41 @@ class PortalProvisioner:
             f"action={'restore' if self.restore_audio else 'disable'}",
             flush=True,
         )
+
+    @contextlib.contextmanager
+    def bootstrap_guard(self, label: str):
+        """Run one dedicated bootstrap phase of a multi-action run.
+
+        A phase failure used to abort the whole run, leaving every later
+        action unapplied (a failing Meta-account phase, for example, also
+        blocked debloat, remote-wipe, presence and the main pass). In a
+        multi-action run the failure is now recorded, the remaining phases
+        still run, and report_deferred_failures() fails the run at the end.
+        A run requesting only one action keeps the original fail-fast
+        behaviour.
+        """
+        try:
+            yield
+        except ProvisionError as exc:
+            requested = {
+                name for name, enabled in self.requested_actions().items() if enabled
+            }
+            if len(requested) <= 1:
+                raise
+            self.deferred_phase_failures.append(f"{label}: {exc}")
+            print(
+                f"PHASE_FAILED phase={label} error={exc}; "
+                "continuing with remaining actions",
+                flush=True,
+            )
+
+    def report_deferred_failures(self) -> None:
+        if self.deferred_phase_failures:
+            raise ProvisionError(
+                "bootstrap phases failed: "
+                + "; ".join(self.deferred_phase_failures)
+            )
+
 
     def requested_actions(self) -> dict[str, object]:
         actions: dict[str, object] = {}
@@ -4991,6 +5028,17 @@ class PortalProvisioner:
                     check=True,
                 ).stdout.strip()
                 print(f"WATCHDOG_OK boot_id={boot_id} aiservice_pid={pid}")
+                # Persist a durable install marker: the logcat-based
+                # check above rotates away on long uptimes, which made
+                # preflight/--status flap between installed and unknown.
+                self.adb_run(
+                    ["shell", "mkdir", "-p", "/data/local/tmp/portal-audio-backup"],
+                    timeout=5,
+                )
+                self.adb_run(
+                    ["shell", "touch", "/data/local/tmp/portal-audio-backup/installed-v1"],
+                    timeout=5,
+                )
                 print(last_log.rstrip())
                 return boot_id
             time.sleep(2)
@@ -6439,7 +6487,10 @@ class PortalProvisioner:
                 hardware_class = META_HARDWARE_AUTHENTICATOR.split("/", 1)[1]
                 if missing or hardware_class in disabled:
                     raise ProvisionError(
-                        "Meta authenticator guard did not persist"
+                        "Meta authenticator guard did not persist: "
+                        f"missing_disabled={sorted(missing)} "
+                        f"hardware_disabled={hardware_class in disabled} "
+                        f"disabled={sorted(disabled)}"
                     )
                 print("META_AUTHENTICATOR_GUARD_OK authenticators=disabled")
             elif self.meta_accounts_local_only:
@@ -6754,6 +6805,7 @@ class PortalProvisioner:
                     "PROVISION_ALREADY_COMPLETE actions=restore-camera-light "
                     f"logs={self.log_dir}"
                 )
+                self.report_deferred_failures()
                 return
         if self.backup_path:
             self.create_backup_bundle(self.backup_path)
@@ -6862,33 +6914,34 @@ class PortalProvisioner:
         self.audio_already_configured = (
             self.audio_preflight() if self.audio else False
         )
-        if (
-            self.audio
-            and not self.audio_already_configured
-            and self.target
-            and self.target.audio_installer_credentials
-            and self.requested_actions() != {"audio": True}
-        ):
-            phase_logs = self.log_dir / "audio-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "AUDIO_BOOTSTRAP_PHASE action=install reason=installer-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                audio=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.audio_already_configured = self.audio_preflight()
-            if not self.audio_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha audio bootstrap did not verify"
+        with self.bootstrap_guard("audio"):
+            if (
+                self.audio
+                and not self.audio_already_configured
+                and self.target
+                and self.target.audio_installer_credentials
+                and self.requested_actions() != {"audio": True}
+            ):
+                phase_logs = self.log_dir / "audio-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "AUDIO_BOOTSTRAP_PHASE action=install reason=installer-credential",
+                    flush=True,
                 )
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    audio=True,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.audio_already_configured = self.audio_preflight()
+                if not self.audio_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha audio bootstrap did not verify"
+                    )
         if (
             self.audio_already_configured
             and not self.persist_wireless_adb
@@ -6897,77 +6950,80 @@ class PortalProvisioner:
             if resumed_pending:
                 self.write_state("complete")
             print(f"PROVISION_ALREADY_COMPLETE actions=audio logs={self.log_dir}")
+            self.report_deferred_failures()
             return
         if self.install_kiosk_satellite:
             self.ensure_kiosk_satellite()
         self.write_state("pending")
         already_owner = self.device_owner_preflight() if self.device_owner else False
-        if (
-            self.device_owner
-            and not already_owner
-            and self.target
-            and self.target.device_owner_system_credentials
-            and self.requested_actions() != {"device_owner": True}
-        ):
-            phase_logs = self.log_dir / "device-owner-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "DEVICE_OWNER_BOOTSTRAP_PHASE action=install "
-                "reason=system-server-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                device_owner=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            already_owner = self.device_owner_preflight()
-            if not already_owner:
-                raise ProvisionError(
-                    "the dedicated Aloha Device Owner bootstrap did not verify"
+        with self.bootstrap_guard("device_owner"):
+            if (
+                self.device_owner
+                and not already_owner
+                and self.target
+                and self.target.device_owner_system_credentials
+                and self.requested_actions() != {"device_owner": True}
+            ):
+                phase_logs = self.log_dir / "device-owner-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "DEVICE_OWNER_BOOTSTRAP_PHASE action=install "
+                    "reason=system-server-credential",
+                    flush=True,
                 )
-            self.write_state("pending")
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    device_owner=True,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                already_owner = self.device_owner_preflight()
+                if not already_owner:
+                    raise ProvisionError(
+                        "the dedicated Aloha Device Owner bootstrap did not verify"
+                    )
+                self.write_state("pending")
         self.device_owner_already_configured = already_owner
         self.ota_already_configured = (
             self.ota_preflight() if self.disable_updates else False
         )
-        if (
-            self.disable_updates
-            and not self.ota_already_configured
-            and self.target
-            and (
-                self.target.ota_installer_credentials
-                or self.target.ota_system_credentials
-                or self.target.ota_credential_process is not None
-            )
-            and self.requested_actions() != {"disable_updates": True}
-        ):
-            phase_logs = self.log_dir / "ota-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "OTA_BOOTSTRAP_PHASE action=install "
-                "reason=installer-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                disable_updates=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.ota_already_configured = self.ota_preflight()
-            if not self.ota_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha OTA bootstrap did not verify"
+        with self.bootstrap_guard("disable_updates"):
+            if (
+                self.disable_updates
+                and not self.ota_already_configured
+                and self.target
+                and (
+                    self.target.ota_installer_credentials
+                    or self.target.ota_system_credentials
+                    or self.target.ota_credential_process is not None
                 )
-            self.write_state("pending")
+                and self.requested_actions() != {"disable_updates": True}
+            ):
+                phase_logs = self.log_dir / "ota-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "OTA_BOOTSTRAP_PHASE action=install "
+                    "reason=installer-credential",
+                    flush=True,
+                )
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    disable_updates=True,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.ota_already_configured = self.ota_preflight()
+                if not self.ota_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha OTA bootstrap did not verify"
+                    )
+                self.write_state("pending")
         if (
             self.ota_already_configured
             and not self.persist_wireless_adb
@@ -6979,57 +7035,108 @@ class PortalProvisioner:
                 f"PROVISION_ALREADY_COMPLETE actions=disable_updates "
                 f"logs={self.log_dir}"
             )
+            self.report_deferred_failures()
             return
         already_meta_clean = (
             self.meta_accounts_preflight() if self.remove_meta_accounts else False
         )
         self.meta_accounts_already_clean = already_meta_clean
-        if (
-            self.remove_meta_accounts
-            and not already_meta_clean
-            and not self.meta_accounts_absent
-            and self.target
-            and self.target.meta_accounts_package_bootstrap
-            and not self.meta_accounts_local_only
-            and not self.meta_accounts_auth_only
-            and not self.meta_accounts_finalize_only
-        ):
-            disabled = self.disabled_meta_authenticators()
-            hardware_class = META_HARDWARE_AUTHENTICATOR.split("/", 1)[1]
+        with self.bootstrap_guard("remove_meta_accounts"):
             if (
-                set(META_AUTHENTICATOR_COMPONENTS) - disabled
-                or hardware_class in disabled
+                self.remove_meta_accounts
+                and not already_meta_clean
+                and not self.meta_accounts_absent
+                and self.target
+                and self.target.meta_accounts_package_bootstrap
+                and not self.meta_accounts_local_only
+                and not self.meta_accounts_auth_only
+                and not self.meta_accounts_finalize_only
             ):
-                auth_logs = self.log_dir / "meta-accounts-auth-bootstrap"
-                auth_logs.mkdir(parents=True, exist_ok=True)
+                disabled = self.disabled_meta_authenticators()
+                hardware_class = META_HARDWARE_AUTHENTICATOR.split("/", 1)[1]
+                if (
+                    set(META_AUTHENTICATOR_COMPONENTS) - disabled
+                    or hardware_class in disabled
+                ):
+                    auth_logs = self.log_dir / "meta-accounts-auth-bootstrap"
+                    auth_logs.mkdir(parents=True, exist_ok=True)
+                    print(
+                        "META_ACCOUNTS_AUTH_PHASE action=guard "
+                        "reason=prevent-account-recreation",
+                        flush=True,
+                    )
+                    PortalProvisioner(
+                        self.serial,
+                        self.attempts,
+                        auth_logs,
+                        remove_meta_accounts=True,
+                        skip_build=self.skip_build,
+                        meta_accounts_auth_only=True,
+                    ).provision()
+                    self.connect(wait_seconds=30)
+                    self.verify_target()
+                local_clean = (
+                    self.adb_run(
+                        ["shell", "test", "-f", META_ACCOUNT_LOCAL_CLEAN_REMOTE],
+                        timeout=5,
+                    ).returncode
+                    == 0
+                )
+                if not local_clean:
+                    phase_logs = self.log_dir / "meta-accounts-package-bootstrap"
+                    phase_logs.mkdir(parents=True, exist_ok=True)
+                    print(
+                        "META_ACCOUNTS_PACKAGE_PHASE action=remove "
+                        "reason=package-private-identity",
+                        flush=True,
+                    )
+                    PortalProvisioner(
+                        self.serial,
+                        self.attempts,
+                        phase_logs,
+                        remove_meta_accounts=True,
+                        skip_build=self.skip_build,
+                        meta_accounts_local_only=True,
+                    ).provision()
+                    self.connect(wait_seconds=30)
+                    self.verify_target()
+                finalize_logs = self.log_dir / "meta-accounts-finalize-bootstrap"
+                finalize_logs.mkdir(parents=True, exist_ok=True)
                 print(
-                    "META_ACCOUNTS_AUTH_PHASE action=guard "
-                    "reason=prevent-account-recreation",
+                    "META_ACCOUNTS_FINALIZE_PHASE action=remove "
+                    "reason=system-account-records",
                     flush=True,
                 )
                 PortalProvisioner(
                     self.serial,
                     self.attempts,
-                    auth_logs,
+                    finalize_logs,
                     remove_meta_accounts=True,
                     skip_build=self.skip_build,
-                    meta_accounts_auth_only=True,
+                    meta_accounts_finalize_only=True,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
-            local_clean = (
-                self.adb_run(
-                    ["shell", "test", "-f", META_ACCOUNT_LOCAL_CLEAN_REMOTE],
-                    timeout=5,
-                ).returncode
-                == 0
-            )
-            if not local_clean:
-                phase_logs = self.log_dir / "meta-accounts-package-bootstrap"
+                already_meta_clean = self.meta_accounts_preflight()
+                self.meta_accounts_already_clean = already_meta_clean
+                if not already_meta_clean:
+                    raise ProvisionError(
+                        "the dedicated Meta account cleanup phases did not verify"
+                    )
+                self.write_state("pending")
+        with self.bootstrap_guard("remove_meta_accounts"):
+            if (
+                self.remove_meta_accounts
+                and not already_meta_clean
+                and self.target
+                and self.target.meta_accounts_system_credentials
+                and self.requested_actions() != {"remove_meta_accounts": True}
+            ):
+                phase_logs = self.log_dir / "meta-accounts-bootstrap"
                 phase_logs.mkdir(parents=True, exist_ok=True)
                 print(
-                    "META_ACCOUNTS_PACKAGE_PHASE action=remove "
-                    "reason=package-private-identity",
+                    "META_ACCOUNTS_BOOTSTRAP_PHASE action=remove "
+                    "reason=system-server-credential",
                     flush=True,
                 )
                 PortalProvisioner(
@@ -7038,64 +7145,16 @@ class PortalProvisioner:
                     phase_logs,
                     remove_meta_accounts=True,
                     skip_build=self.skip_build,
-                    meta_accounts_local_only=True,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
-            finalize_logs = self.log_dir / "meta-accounts-finalize-bootstrap"
-            finalize_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "META_ACCOUNTS_FINALIZE_PHASE action=remove "
-                "reason=system-account-records",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                finalize_logs,
-                remove_meta_accounts=True,
-                skip_build=self.skip_build,
-                meta_accounts_finalize_only=True,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            already_meta_clean = self.meta_accounts_preflight()
-            self.meta_accounts_already_clean = already_meta_clean
-            if not already_meta_clean:
-                raise ProvisionError(
-                    "the dedicated Meta account cleanup phases did not verify"
-                )
-            self.write_state("pending")
-        if (
-            self.remove_meta_accounts
-            and not already_meta_clean
-            and self.target
-            and self.target.meta_accounts_system_credentials
-            and self.requested_actions() != {"remove_meta_accounts": True}
-        ):
-            phase_logs = self.log_dir / "meta-accounts-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "META_ACCOUNTS_BOOTSTRAP_PHASE action=remove "
-                "reason=system-server-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                remove_meta_accounts=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            already_meta_clean = self.meta_accounts_preflight()
-            self.meta_accounts_already_clean = already_meta_clean
-            if not already_meta_clean:
-                raise ProvisionError(
-                    "the dedicated Aloha Meta-account cleanup did not verify"
-                )
-            self.write_state("pending")
+                already_meta_clean = self.meta_accounts_preflight()
+                self.meta_accounts_already_clean = already_meta_clean
+                if not already_meta_clean:
+                    raise ProvisionError(
+                        "the dedicated Aloha Meta-account cleanup did not verify"
+                    )
+                self.write_state("pending")
         if (
             already_meta_clean
             and not self.persist_wireless_adb
@@ -7108,40 +7167,42 @@ class PortalProvisioner:
                 f"PROVISION_ALREADY_COMPLETE actions=remove_meta_accounts "
                 f"logs={self.log_dir}"
             )
+            self.report_deferred_failures()
             return
         self.debloat_already_configured = (
             self.debloat_preflight() if self.debloat else False
         )
-        if (
-            self.debloat
-            and not self.debloat_already_configured
-            and self.target
-            and self.target.shell_root_package_actions
-            and not self.only_component_actions_requested()
-        ):
-            phase_logs = self.log_dir / "debloat-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "DEBLOAT_BOOTSTRAP_PHASE action=install "
-                "reason=root-shell-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                debloat=True,
-                block_remote_wipe=self.block_remote_wipe,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.debloat_already_configured = self.debloat_preflight()
-            if not self.debloat_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha component debloat did not verify"
+        with self.bootstrap_guard("debloat"):
+            if (
+                self.debloat
+                and not self.debloat_already_configured
+                and self.target
+                and self.target.shell_root_package_actions
+                and not self.only_component_actions_requested()
+            ):
+                phase_logs = self.log_dir / "debloat-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "DEBLOAT_BOOTSTRAP_PHASE action=install "
+                    "reason=root-shell-credential",
+                    flush=True,
                 )
-            self.write_state("pending")
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    debloat=True,
+                    block_remote_wipe=self.block_remote_wipe,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.debloat_already_configured = self.debloat_preflight()
+                if not self.debloat_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha component debloat did not verify"
+                    )
+                self.write_state("pending")
         if (
             self.debloat_already_configured
             and not self.persist_wireless_adb
@@ -7153,39 +7214,41 @@ class PortalProvisioner:
                 f"PROVISION_ALREADY_COMPLETE actions=debloat "
                 f"logs={self.log_dir}"
             )
+            self.report_deferred_failures()
             return
         self.remote_wipe_already_configured = (
             self.remote_wipe_preflight() if self.block_remote_wipe else False
         )
-        if (
-            self.block_remote_wipe
-            and not self.remote_wipe_already_configured
-            and self.target
-            and self.target.shell_root_package_actions
-            and not self.only_component_actions_requested()
-        ):
-            phase_logs = self.log_dir / "remote-wipe-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "REMOTE_WIPE_BOOTSTRAP_PHASE action=block "
-                "reason=root-shell-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                block_remote_wipe=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.remote_wipe_already_configured = self.remote_wipe_preflight()
-            if not self.remote_wipe_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha remote-wipe block did not verify"
+        with self.bootstrap_guard("block_remote_wipe"):
+            if (
+                self.block_remote_wipe
+                and not self.remote_wipe_already_configured
+                and self.target
+                and self.target.shell_root_package_actions
+                and not self.only_component_actions_requested()
+            ):
+                phase_logs = self.log_dir / "remote-wipe-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "REMOTE_WIPE_BOOTSTRAP_PHASE action=block "
+                    "reason=root-shell-credential",
+                    flush=True,
                 )
-            self.write_state("pending")
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    block_remote_wipe=True,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.remote_wipe_already_configured = self.remote_wipe_preflight()
+                if not self.remote_wipe_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha remote-wipe block did not verify"
+                    )
+                self.write_state("pending")
         if (
             self.remote_wipe_already_configured
             and not self.persist_wireless_adb
@@ -7197,39 +7260,41 @@ class PortalProvisioner:
                 "PROVISION_ALREADY_COMPLETE actions=block_remote_wipe "
                 f"logs={self.log_dir}"
             )
+            self.report_deferred_failures()
             return
         self.presence_already_configured = (
             self.presence_preflight() if self.optimize_presence else False
         )
-        if (
-            self.optimize_presence
-            and not self.presence_already_configured
-            and self.target
-            and self.target.presence_installer_credentials
-            and self.requested_actions() != {"optimize_presence": True}
-        ):
-            phase_logs = self.log_dir / "presence-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "PRESENCE_BOOTSTRAP_PHASE action=install "
-                "reason=installer-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                optimize_presence=True,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.presence_already_configured = self.presence_preflight()
-            if not self.presence_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha presence bootstrap did not verify"
+        with self.bootstrap_guard("optimize_presence"):
+            if (
+                self.optimize_presence
+                and not self.presence_already_configured
+                and self.target
+                and self.target.presence_installer_credentials
+                and self.requested_actions() != {"optimize_presence": True}
+            ):
+                phase_logs = self.log_dir / "presence-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "PRESENCE_BOOTSTRAP_PHASE action=install "
+                    "reason=installer-credential",
+                    flush=True,
                 )
-            self.write_state("pending")
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    optimize_presence=True,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.presence_already_configured = self.presence_preflight()
+                if not self.presence_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha presence bootstrap did not verify"
+                    )
+                self.write_state("pending")
         if (
             self.presence_already_configured
             and not self.persist_wireless_adb
@@ -7240,6 +7305,7 @@ class PortalProvisioner:
                 f"PROVISION_ALREADY_COMPLETE actions=optimize_presence "
                 f"logs={self.log_dir}"
             )
+            self.report_deferred_failures()
             return
         self.presence_fps_already_configured = (
             self.presence_fps_preflight()
@@ -7253,38 +7319,39 @@ class PortalProvisioner:
                 "presence_fps_cap": self.presence_fps_cap,
             },
         )
-        if (
-            self.presence_fps_cap is not None
-            and not self.presence_fps_already_configured
-            and self.target
-            and self.target.uid1000_installer_credentials
-            and self.requested_actions() not in dedicated_presence_fps_actions
-        ):
-            phase_logs = self.log_dir / "presence-fps-bootstrap"
-            phase_logs.mkdir(parents=True, exist_ok=True)
-            print(
-                "PRESENCE_FPS_BOOTSTRAP_PHASE action=install "
-                "reason=installer-credential",
-                flush=True,
-            )
-            PortalProvisioner(
-                self.serial,
-                self.attempts,
-                phase_logs,
-                optimize_presence=True,
-                presence_fps_cap=self.presence_fps_cap,
-                skip_build=self.skip_build,
-            ).provision()
-            self.connect(wait_seconds=30)
-            self.verify_target()
-            self.presence_fps_already_configured = (
-                self.presence_fps_preflight()
-            )
-            if not self.presence_fps_already_configured:
-                raise ProvisionError(
-                    "the dedicated Aloha presence FPS bootstrap did not verify"
+        with self.bootstrap_guard("presence_fps"):
+            if (
+                self.presence_fps_cap is not None
+                and not self.presence_fps_already_configured
+                and self.target
+                and self.target.uid1000_installer_credentials
+                and self.requested_actions() not in dedicated_presence_fps_actions
+            ):
+                phase_logs = self.log_dir / "presence-fps-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "PRESENCE_FPS_BOOTSTRAP_PHASE action=install "
+                    "reason=installer-credential",
+                    flush=True,
                 )
-            self.write_state("pending")
+                PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    optimize_presence=True,
+                    presence_fps_cap=self.presence_fps_cap,
+                    skip_build=self.skip_build,
+                ).provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                self.presence_fps_already_configured = (
+                    self.presence_fps_preflight()
+                )
+                if not self.presence_fps_already_configured:
+                    raise ProvisionError(
+                        "the dedicated Aloha presence FPS bootstrap did not verify"
+                    )
+                self.write_state("pending")
         if self.debloat and not self.debloat_already_configured:
             self.apply_debloat()
         if self.restore_bloat:
@@ -7356,8 +7423,10 @@ class PortalProvisioner:
                 self.verify_requested_state()
                 self.write_state("complete")
                 print(f"PROVISION_OK reboots=0 logs={self.log_dir}")
+                self.report_deferred_failures()
                 return
             self.verify_across_two_reboots()
+            self.report_deferred_failures()
             return
 
         if not self.skip_build:
@@ -7500,6 +7569,7 @@ class PortalProvisioner:
                 ):
                     self.restore_uid1000_package_state_if_unused()
                 self.verify_across_two_reboots(first_boot=post_attempt_boot)
+                self.report_deferred_failures()
                 return
         finally:
             if self.exploit_users_created:
