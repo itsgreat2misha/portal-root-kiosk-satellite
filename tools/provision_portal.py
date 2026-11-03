@@ -86,6 +86,13 @@ PRESENCE_SAVED_KEY_REMOTE = "/data/local/tmp/portal-presence-adbkey-v1.pub"
 SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
 SHIZUKU_HELPER_PACKAGE = "dev.portal.shizukuhelper"
 SHIZUKU_HELPER_LOCAL = ROOT / "shizuku-helper/build/portal-shizuku-helper.apk"
+AUTOROOT_HELPER_PACKAGE = "dev.portal.autoroothelper"
+AUTOROOT_HELPER_LOCAL = ROOT / "autoroot-helper/build/portal-autoroot-helper.apk"
+AUTOROOT_RUNNER_LOCAL = ROOT / "autoroot-helper/run.sh"
+AUTOROOT_REMOTE_DIR = "/data/local/tmp/portal-autoroot"
+AUTOROOT_CONF_REMOTE = f"{AUTOROOT_REMOTE_DIR}/autoroot.conf"
+AUTOROOT_MAX_ATTEMPTS = 4
+AUTOROOT_SESSION_WINDOW_SEC = 7200
 SHIZUKU_KEY_REMOTE = "/data/local/tmp/portal-shizuku-adbkey.pub"
 SHIZUKU_SAVED_KEY_REMOTE = "/data/local/tmp/portal-shizuku-adbkey-v1.pub"
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
@@ -288,6 +295,7 @@ class PortalProvisioner:
         shizuku_apk: pathlib.Path | None = None,
         custom_payload: pathlib.Path | None = None,
         skip_shizuku_root: bool = False,
+        autoroot: bool = False,
         status_only: bool = False,
         dry_run: bool = False,
         backup_path: pathlib.Path | None = None,
@@ -352,6 +360,7 @@ class PortalProvisioner:
         self.shizuku_apk = shizuku_apk
         self.custom_payload = custom_payload
         self.skip_shizuku_root = skip_shizuku_root
+        self.autoroot = autoroot
         self.shizuku_public_key: pathlib.Path | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
@@ -4207,12 +4216,16 @@ class PortalProvisioner:
         self._bugreport_cache[tag] = report
         return report
 
-    def exploit(
-        self, base: int, memstart: int, attempt: int, *,
-        skip_final_reboot: bool = False,
-    ) -> bool:
-        if self.target is None:
-            raise ProvisionError("target must be selected before exploitation")
+    def build_exploit_environment(
+        self, base: int, memstart: int, attempt: int
+    ) -> dict[str, str]:
+        """Build the native exploit environment for one attempt.
+
+        Shared by exploit() itself and by the autoroot staging, which
+        renders this environment (minus the per-boot addresses) into
+        the on-device runner's env files so both paths run the native
+        payload with identical settings.
+        """
         stack_route = self.target.stack_route
         retry_geometry = (
             attempt % 2 == 0
@@ -4701,6 +4714,15 @@ class PortalProvisioner:
         )
         self.adb_run(["shell", "logcat", "-c"], timeout=5)
         environment.update(self.target.exploit_env)
+        return environment
+
+    def exploit(
+        self, base: int, memstart: int, attempt: int, *,
+        skip_final_reboot: bool = False,
+    ) -> bool:
+        if self.target is None:
+            raise ProvisionError("target must be selected before exploitation")
+        environment = self.build_exploit_environment(base, memstart, attempt)
         shell = "env " + " ".join(
             f"{name}={shlex.quote(value)}" for name, value in environment.items()
         ) + " /system/bin/true"
@@ -5166,6 +5188,8 @@ class PortalProvisioner:
         """Extra root-backed steps that need the payload serving first."""
         if self.shizuku and not self.skip_shizuku_root:
             self.start_shizuku_as_root()
+        if self.autoroot:
+            self.stage_autoroot_payload()
 
     def start_shizuku_as_root(self) -> None:
         """Restart shizuku_server as uid 0 through the root payload.
@@ -5226,6 +5250,175 @@ class PortalProvisioner:
             time.sleep(2)
         raise ProvisionError(
             f"shizuku_server did not come up as uid 0: {last or 'not running'}"
+        )
+
+    def stage_autoroot_payload(self) -> None:
+        """Stage the on-device autoroot runner and its boot helper.
+
+        After this, a reboot needs no host: the boot helper notices the
+        root payload is down, redoes the per-boot address discovery
+        on-device (bugreport + the staged simpleperf), and runs the
+        staged runner script, which replays the exploit environment
+        this provisioner generated for attempts 1 and 2 (parity picks
+        the geometry, exactly like host retries). The helper reuses the
+        Shizuku helper's already-authorized ADB key, and the exploit
+        sentinel app stays installed because every on-device attempt
+        needs it.
+        """
+        if self.target is None:
+            raise ProvisionError("target must be selected before autoroot")
+        if not self.shizuku:
+            raise ProvisionError(
+                "--autoroot requires --shizuku: the boot helper reuses "
+                "the Shizuku helper's authorized ADB key"
+            )
+        if not AUTOROOT_HELPER_LOCAL.is_file():
+            raise ProvisionError(
+                f"missing autoroot helper build output: {AUTOROOT_HELPER_LOCAL}"
+            )
+        if not AUTOROOT_RUNNER_LOCAL.is_file():
+            raise ProvisionError(
+                f"missing autoroot runner script: {AUTOROOT_RUNNER_LOCAL}"
+            )
+        sentinel_path = self.adb_run(
+            ["shell", "pm", "path", EXPLOIT_SENTINEL_PACKAGE], timeout=15
+        ).stdout
+        if not sentinel_path.startswith("package:"):
+            raise ProvisionError(
+                "exploit sentinel is not installed; autoroot attempts "
+                "need it on every boot"
+            )
+        simpleperf_remote = "/data/local/tmp/portal-simpleperf"
+        if self.adb_run(
+            ["shell", "test", "-f", simpleperf_remote], timeout=5
+        ).returncode != 0:
+            raise ProvisionError(
+                "staged simpleperf is absent; KASLR discovery for this "
+                "target pushes it during the custom-payload attempts"
+            )
+        self.install_apk_preserving_verifier(
+            AUTOROOT_HELPER_LOCAL, "autoroot-helper"
+        )
+        self.settle_package_state()
+        self.verify_package_verifier_state()
+        # Give the boot helper the Shizuku helper's ADB keypair: that
+        # public key is already authorized on the device, so the helper
+        # can drive loopback ADB without another privileged grant.
+        for name in ("adbkey", "adbkey.pub"):
+            staged = f"/data/local/tmp/portal-autoroot-{name}.tmp"
+            self.adb_run(
+                [
+                    "shell",
+                    f"run-as {SHIZUKU_HELPER_PACKAGE} cat files/{name}"
+                    f" > {staged} && chmod 0644 {staged}",
+                ],
+                timeout=10,
+                check=True,
+            )
+            self.adb_run(
+                [
+                    "shell",
+                    "run-as",
+                    AUTOROOT_HELPER_PACKAGE,
+                    "mkdir",
+                    "-p",
+                    "files",
+                ],
+                timeout=10,
+                check=True,
+            )
+            self.adb_run(
+                [
+                    "shell",
+                    "run-as",
+                    AUTOROOT_HELPER_PACKAGE,
+                    "cp",
+                    staged,
+                    f"files/{name}",
+                ],
+                timeout=10,
+                check=True,
+            )
+            self.adb_run(
+                [
+                    "shell",
+                    "run-as",
+                    AUTOROOT_HELPER_PACKAGE,
+                    "chmod",
+                    "0600",
+                    f"files/{name}",
+                ],
+                timeout=10,
+                check=True,
+            )
+            self.adb_run(["shell", "rm", "-f", staged], timeout=5)
+        self.adb_run(
+            ["shell", "mkdir", "-p", AUTOROOT_REMOTE_DIR],
+            timeout=5,
+            check=True,
+        )
+        self.adb_run(
+            ["push", str(AUTOROOT_RUNNER_LOCAL), f"{AUTOROOT_REMOTE_DIR}/run.sh"],
+            timeout=15,
+            check=True,
+        )
+        self.adb_run(
+            ["shell", "chmod", "0755", f"{AUTOROOT_REMOTE_DIR}/run.sh"],
+            timeout=5,
+            check=True,
+        )
+        # Render the exploit environment for both attempt parities from
+        # the same builder exploit() uses, minus the per-boot addresses
+        # (the helper discovers those and passes them to run.sh).
+        with tempfile.TemporaryDirectory(prefix="portal-autoroot-env-") as temp:
+            for attempt, name in ((1, "env-odd.sh"), (2, "env-even.sh")):
+                environment = self.build_exploit_environment(0, 0, attempt)
+                environment.pop("GHOSTLOCK_KASLR_BASE", None)
+                environment.pop("GHOSTLOCK_P0_MEMSTART", None)
+                if "GHOSTLOCK_ACTION_CREDENTIAL_PID" in environment:
+                    raise ProvisionError(
+                        "autoroot cannot stage this run: its exploit "
+                        "environment carries a per-boot credential "
+                        "identity (pid/uid resolved live), which cannot "
+                        "be frozen into the on-device runner"
+                    )
+                rendered = "".join(
+                    f"export {key}={shlex.quote(value)}\n"
+                    for key, value in sorted(environment.items())
+                )
+                local = pathlib.Path(temp) / name
+                local.write_text(rendered, encoding="utf-8")
+                remote = f"{AUTOROOT_REMOTE_DIR}/{name}"
+                self.adb_run(["push", str(local), remote], timeout=15, check=True)
+                self.adb_run(
+                    ["shell", "chmod", "0644", remote], timeout=5, check=True
+                )
+            offsets = ",".join(
+                hex(offset) for offset in self.target.kaslr_pc_offsets
+            )
+            conf = (
+                f"MAX_ATTEMPTS={AUTOROOT_MAX_ATTEMPTS}\n"
+                f"SESSION_WINDOW_SEC={AUTOROOT_SESSION_WINDOW_SEC}\n"
+                f"SIMPLEPERF={simpleperf_remote}\n"
+                f"KASLR_OFFSETS={offsets}\n"
+            )
+            local_conf = pathlib.Path(temp) / "autoroot.conf"
+            local_conf.write_text(conf, encoding="utf-8")
+            self.adb_run(
+                ["push", str(local_conf), AUTOROOT_CONF_REMOTE],
+                timeout=15,
+                check=True,
+            )
+            self.adb_run(
+                ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
+                timeout=5,
+                check=True,
+            )
+        print(
+            f"AUTOROOT_STAGED_OK dir={AUTOROOT_REMOTE_DIR} "
+            f"helper={AUTOROOT_HELPER_PACKAGE} "
+            f"max_attempts={AUTOROOT_MAX_ATTEMPTS}",
+            flush=True,
         )
 
     @staticmethod
@@ -7682,6 +7875,7 @@ class PortalProvisioner:
                     self.needs_component_ctl()
                 ),
                 build_shizuku=self.shizuku,
+                build_autoroot=self.autoroot,
                 build_presence=False,
                 build_uid1000=self.needs_uid1000_payload(),
                 build_sentinel=self.uses_exploit_sentinel(),
@@ -7705,9 +7899,14 @@ class PortalProvisioner:
             try:
                 self.apply_custom_payload()
             finally:
-                if use_exploit_sentinel:
+                if use_exploit_sentinel and not self.autoroot:
                     self.uninstall_exploit_sentinel(best_effort=True)
                     sentinel_removed = True
+                elif use_exploit_sentinel:
+                    print(
+                        "EXPLOIT_SENTINEL_RETAINED reason=autoroot",
+                        flush=True,
+                    )
             return
         try:
             self.prepare_exploit_users()
@@ -7942,6 +8141,7 @@ def build(
     build_account: bool,
     build_components: bool,
     build_shizuku: bool,
+    build_autoroot: bool,
     build_presence: bool,
     build_uid1000: bool,
     build_sentinel: bool,
@@ -7978,6 +8178,8 @@ def build(
         )
     if build_shizuku:
         commands.append(["make", "-C", str(ROOT / "shizuku-helper"), "all"])
+    if build_autoroot:
+        commands.append(["make", "-C", str(ROOT / "autoroot-helper"), "all"])
     if build_presence:
         commands.append(["make", "-C", str(ROOT / "presence-helper"), "all"])
     if build_uid1000:
@@ -8133,6 +8335,16 @@ def parse_args() -> argparse.Namespace:
             "with --shizuku and --custom-payload, leave shizuku_server "
             "running with shell privileges instead of restarting it as "
             "uid 0 through the root payload"
+        ),
+    )
+    parser.add_argument(
+        "--autoroot",
+        action="store_true",
+        help=(
+            "with --shizuku and --custom-payload, also stage the "
+            "on-device autoroot runner and boot helper so the root "
+            "payload returns by itself after later reboots, with no "
+            "host watcher (the exploit sentinel app stays installed)"
         ),
     )
     parser.add_argument(
@@ -8474,6 +8686,7 @@ def main() -> int:
             shizuku_apk=args.shizuku_apk,
             custom_payload=args.custom_payload,
             skip_shizuku_root=args.skip_shizuku_root,
+            autoroot=args.autoroot,
             status_only=args.status or args.backup_only,
             dry_run=args.dry_run,
             backup_path=args.backup,
