@@ -4723,6 +4723,7 @@ class PortalProvisioner:
         if self.target is None:
             raise ProvisionError("target must be selected before exploitation")
         environment = self.build_exploit_environment(base, memstart, attempt)
+        credential_action = "GHOSTLOCK_ACTION_CREDENTIAL_PID" in environment
         shell = "env " + " ".join(
             f"{name}={shlex.quote(value)}" for name, value in environment.items()
         ) + " /system/bin/true"
