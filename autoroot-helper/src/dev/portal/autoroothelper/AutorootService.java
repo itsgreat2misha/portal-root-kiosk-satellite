@@ -1,0 +1,428 @@
+package dev.portal.autoroothelper;
+
+import android.app.Service;
+import android.content.Intent;
+import android.os.IBinder;
+import android.util.Log;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+/**
+ * Boot trigger for the on-device autoroot runner.
+ *
+ * On BOOT_COMPLETED this service checks whether the root payload daemon
+ * is already serving as uid 0 on 127.0.0.1:37373. If it is, it only
+ * makes sure Shizuku was restarted in root mode. If it is not, it
+ * performs the same discovery the host provisioner does (bugreport for
+ * the memory start, staged simpleperf for the KASLR base), launches the
+ * staged runner script detached, and waits for the daemon to answer.
+ * Attempts are counted in a state file under /data/local/tmp so the
+ * per-session cap survives the reboots a failed attempt can cause.
+ */
+public final class AutorootService extends Service {
+    private static final String TAG = "PortalAutoroot";
+    private static final String DIR = "/data/local/tmp/portal-autoroot";
+    private static final String CONF = DIR + "/autoroot.conf";
+    private static final String STATE = DIR + "/state";
+    private static final String RESULT = DIR + "/result";
+    private static final String RUN_SH = DIR + "/run.sh";
+    private static final String SERVICE_LOG = DIR + "/service.log";
+    private static final String DISABLE_FLAG = "/data/local/tmp/portal-autoroot.disable";
+    private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
+    private static final int DAEMON_PORT = 37373;
+
+    private volatile boolean workerRunning;
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (!workerRunning) {
+            workerRunning = true;
+            new Thread(() -> run(startId), "portal-autoroot").start();
+        }
+        return START_STICKY;
+    }
+
+    private void run(int startId) {
+        try {
+            runAutoroot();
+        } catch (Exception error) {
+            Log.e(TAG, "autoroot pass failed", error);
+            logFile("error " + error);
+        } finally {
+            workerRunning = false;
+            stopSelf(startId);
+        }
+    }
+
+    private void runAutoroot() throws Exception {
+        if (!shell("test -f " + DISABLE_FLAG + " && echo yes").contains("yes")) {
+            // not disabled: fall through
+        } else {
+            Log.i(TAG, "autoroot disabled by flag " + DISABLE_FLAG);
+            logFile("disabled by flag");
+            return;
+        }
+        String bootId = shell("cat /proc/sys/kernel/random/boot_id").trim();
+        Map<String, String> conf = readKeyValues(CONF);
+        int maxAttempts = parseInt(conf.get("MAX_ATTEMPTS"), 4);
+        long sessionWindowSec = parseLong(conf.get("SESSION_WINDOW_SEC"), 7200);
+        String simpleperf = conf.getOrDefault("SIMPLEPERF", "/data/local/tmp/portal-simpleperf");
+        String[] offsetParts = conf.getOrDefault("KASLR_OFFSETS", "0x3354").split(",");
+        long[] offsets = new long[offsetParts.length];
+        for (int i = 0; i < offsetParts.length; i++) {
+            offsets[i] = Long.parseLong(offsetParts[i].trim().replace("0x", ""), 16);
+        }
+
+        if (daemonServingRoot()) {
+            logFile("daemon already up boot=" + bootId);
+            ensureShizukuRoot();
+            Map<String, String> state = readKeyValues(STATE);
+            state.put("done_boot", bootId);
+            writeState(state);
+            return;
+        }
+
+        Map<String, String> state = readKeyValues(STATE);
+        long now = System.currentTimeMillis() / 1000;
+        long sessionStart = parseLong(state.get("session_start"), 0);
+        int attempts = parseInt(state.get("attempts"), 0);
+        if (sessionStart == 0 || now - sessionStart > sessionWindowSec) {
+            sessionStart = now;
+            attempts = 0;
+        }
+        if (attempts >= maxAttempts) {
+            Log.w(TAG, "autoroot attempt cap reached attempts=" + attempts);
+            logFile("capped attempts=" + attempts);
+            return;
+        }
+        attempts++;
+        state.put("session_start", Long.toString(sessionStart));
+        state.put("attempts", Integer.toString(attempts));
+        writeState(state);
+        logFile("attempt " + attempts + " of " + maxAttempts + " boot=" + bootId);
+
+        String memstart = discoverMemstart();
+        String kaslr = memstart == null ? null : discoverKaslr(simpleperf, offsets);
+        if (memstart == null || kaslr == null) {
+            Log.w(TAG, "discovery failed memstart=" + memstart + " kaslr=" + kaslr);
+            logFile("discovery failed memstart=" + memstart + " kaslr=" + kaslr);
+            rebootForCleanAttempt(attempts, maxAttempts);
+            return;
+        }
+        logFile("discovered kaslr=" + kaslr + " memstart=" + memstart);
+
+        shell("rm -f " + RESULT);
+        shell("nohup sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts
+                + " >/dev/null 2>&1 & echo launched");
+        boolean up = false;
+        for (int waited = 0; waited < 300; waited += 5) {
+            Thread.sleep(5000);
+            if (daemonServingRoot()) {
+                up = true;
+                break;
+            }
+            if (shell("test -f " + RESULT + " && cat " + RESULT).contains("RESULT=failed")) {
+                break;
+            }
+        }
+        if (up) {
+            Log.i(TAG, "daemon up after attempt " + attempts);
+            logFile("daemon up attempt=" + attempts);
+            ensureShizukuRoot();
+            state.put("done_boot", bootId);
+            writeState(state);
+            return;
+        }
+        Log.w(TAG, "attempt " + attempts + " did not bring the daemon up");
+        logFile("attempt failed n=" + attempts);
+        rebootForCleanAttempt(attempts, maxAttempts);
+    }
+
+    private void rebootForCleanAttempt(int attempts, int maxAttempts) {
+        if (attempts >= maxAttempts) {
+            return;
+        }
+        try {
+            logFile("rebooting for clean attempt " + (attempts + 1));
+            shell("reboot");
+        } catch (Exception ignored) {
+            // The reboot itself tears the connection down; failure to
+            // observe its result is expected, not an error.
+        }
+    }
+
+    // ---- discovery ----------------------------------------------------
+
+    private String discoverMemstart() {
+        try {
+            String out = shell("bugreportz -p");
+            Matcher pathMatch = Pattern.compile("(?:OK|BEGIN):(\\S+\\.zip)").matcher(out);
+            if (!pathMatch.find()) {
+                return null;
+            }
+            String zipPath = pathMatch.group(1);
+            try {
+                String b64 = shell("base64 " + zipPath);
+                byte[] zip = java.util.Base64.getMimeDecoder()
+                        .decode(b64.replaceAll("\\s", ""));
+                String text = extractBugreportText(zip);
+                if (text == null) {
+                    return null;
+                }
+                Matcher memMatch = Pattern.compile("memory\\s+: (0x[0-9a-fA-F]+) -")
+                        .matcher(text);
+                if (!memMatch.find()) {
+                    return null;
+                }
+                long virtualStart = Long.parseUnsignedLong(
+                        memMatch.group(1).substring(2), 16);
+                long memstart = 0x80000000L - (virtualStart - 0xFFFFFFC000000000L);
+                return "0x" + Long.toHexString(memstart);
+            } finally {
+                shell("rm -f " + zipPath);
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "memstart discovery failed", error);
+            return null;
+        }
+    }
+
+    private String extractBugreportText(byte[] zip) throws Exception {
+        try (ZipInputStream zin = new ZipInputStream(new ByteArrayInputStream(zip))) {
+            ZipEntry entry;
+            while ((entry = zin.getNextEntry()) != null) {
+                String name = entry.getName();
+                String base = name.substring(name.lastIndexOf('/') + 1);
+                if (base.startsWith("bugreport-") && base.endsWith(".txt")) {
+                    BufferedReader reader = new BufferedReader(
+                            new InputStreamReader(zin, StandardCharsets.UTF_8));
+                    String line;
+                    StringBuilder found = new StringBuilder();
+                    while ((line = reader.readLine()) != null) {
+                        if (line.contains("memory") && line.contains(": 0x")) {
+                            found.append(line).append('\n');
+                            if (found.length() > 4096) {
+                                break;
+                            }
+                        }
+                    }
+                    return found.toString();
+                }
+            }
+        }
+        return null;
+    }
+
+    private String discoverKaslr(String simpleperf, long[] offsets) {
+        Pattern valuePattern = Pattern.compile("vaddr_in_file: (ffffff[0-9a-f]+)");
+        for (int sampleTry = 0; sampleTry < 3; sampleTry++) {
+            try {
+                String remote = DIR + "/perf-" + sampleTry + ".data";
+                shell(simpleperf + " record -g -e cpu-clock -f 4000 --duration 2 -o "
+                        + remote + " -- /system/bin/dd if=/dev/zero of=/dev/null bs=4096");
+                String report = shell(simpleperf + " report-sample -i " + remote
+                        + " | grep -m 512 'vaddr_in_file: ffffff'");
+                shell("rm -f " + remote);
+                Map<Long, int[]> candidates = new HashMap<>();
+                Matcher matcher = valuePattern.matcher(report);
+                while (matcher.find()) {
+                    long value = Long.parseUnsignedLong(matcher.group(1), 16);
+                    for (long offset : offsets) {
+                        long base = value - offset;
+                        if (Long.compareUnsigned(base, 0xFFFFFF8000000000L) >= 0
+                                && ((base - 0xFFFFFF8008080000L) & 0x1FFFFFL) == 0) {
+                            candidates.computeIfAbsent(base, k -> new int[1])[0]++;
+                        }
+                    }
+                }
+                long best = 0;
+                int bestCount = 0;
+                for (Map.Entry<Long, int[]> e : candidates.entrySet()) {
+                    if (e.getValue()[0] > bestCount) {
+                        bestCount = e.getValue()[0];
+                        best = e.getKey();
+                    }
+                }
+                if (bestCount > 0) {
+                    return "0x" + Long.toHexString(best);
+                }
+            } catch (Exception error) {
+                Log.w(TAG, "kaslr sample " + sampleTry + " failed", error);
+            }
+        }
+        return null;
+    }
+
+    // ---- root daemon --------------------------------------------------
+
+    private boolean daemonServingRoot() {
+        try {
+            String response = daemonRequest("ID\n", 1);
+            return response != null && response.startsWith("ID uid=0");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private String daemonExec(String command) throws Exception {
+        String response = daemonRequest("EXEC " + command + "\n", 64 * 1024);
+        return response == null ? "" : response;
+    }
+
+    /** Sends one request line; returns response lines up to END. */
+    private String daemonRequest(String request, int maxLines) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(
+                    InetAddress.getByName("127.0.0.1"), DAEMON_PORT), 3000);
+            socket.setSoTimeout(30000);
+            socket.getOutputStream().write(request.getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    socket.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder result = new StringBuilder();
+            String line;
+            int lines = 0;
+            while ((line = reader.readLine()) != null && lines++ < maxLines) {
+                if (line.equals("END")) {
+                    break;
+                }
+                result.append(line).append('\n');
+                if (request.startsWith("ID") && lines >= 1) {
+                    break;
+                }
+            }
+            return result.toString();
+        }
+    }
+
+    private void ensureShizukuRoot() {
+        try {
+            String pid = shell("pidof shizuku_server").trim().split("\\s+")[0];
+            if (!pid.isEmpty() && pid.matches("\\d+") && shizukuUid(pid) == 0) {
+                Log.i(TAG, "shizuku already root pid=" + pid);
+                logFile("shizuku already root pid=" + pid);
+                return;
+            }
+            String dump = shell("dumpsys package " + SHIZUKU_PACKAGE);
+            Matcher nativeMatch = Pattern.compile("nativeLibraryDir=(\\S+)").matcher(dump);
+            String pmPath = shell("pm path " + SHIZUKU_PACKAGE);
+            Matcher apkMatch = Pattern.compile("package:(\\S+)").matcher(pmPath);
+            if (!nativeMatch.find() || !apkMatch.find()) {
+                Log.w(TAG, "could not resolve shizuku paths");
+                return;
+            }
+            String starter = nativeMatch.group(1) + "/libshizuku.so";
+            String command = "pkill -f shizuku_server; sleep 1; "
+                    + quote(starter) + " --apk=" + quote(apkMatch.group(1))
+                    + "; sleep 1; pidof shizuku_server";
+            daemonExec(command);
+            for (int waited = 0; waited < 30; waited += 2) {
+                Thread.sleep(2000);
+                String newPid = shell("pidof shizuku_server").trim().split("\\s+")[0];
+                if (!newPid.isEmpty() && newPid.matches("\\d+")
+                        && shizukuUid(newPid) == 0) {
+                    Log.i(TAG, "shizuku root ok pid=" + newPid);
+                    logFile("shizuku root ok pid=" + newPid);
+                    return;
+                }
+            }
+            Log.w(TAG, "shizuku did not come up as uid 0");
+            logFile("shizuku root failed");
+        } catch (Exception error) {
+            Log.w(TAG, "ensureShizukuRoot failed", error);
+        }
+    }
+
+    private int shizukuUid(String pid) {
+        try {
+            String status = shell("cat /proc/" + pid + "/status");
+            Matcher uidMatch = Pattern.compile("^Uid:\\s+(\\d+)", Pattern.MULTILINE)
+                    .matcher(status);
+            return uidMatch.find() ? Integer.parseInt(uidMatch.group(1)) : -1;
+        } catch (Exception error) {
+            return -1;
+        }
+    }
+
+    // ---- plumbing -----------------------------------------------------
+
+    private String shell(String command) throws Exception {
+        try (AdbClient client = new AdbClient(getFilesDir())) {
+            client.connect();
+            return client.shell(command);
+        }
+    }
+
+    private Map<String, String> readKeyValues(String path) {
+        Map<String, String> values = new HashMap<>();
+        try {
+            String text = shell("cat " + path + " 2>/dev/null");
+            for (String line : text.split("\n")) {
+                int eq = line.indexOf('=');
+                if (eq > 0) {
+                    values.put(line.substring(0, eq).trim(),
+                            line.substring(eq + 1).trim());
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return values;
+    }
+
+    private void writeState(Map<String, String> state) {
+        try {
+            StringBuilder body = new StringBuilder();
+            for (Map.Entry<String, String> e : state.entrySet()) {
+                body.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+            }
+            shell("printf %s " + quote(body.toString()) + " > " + STATE + ".tmp"
+                    + " && mv " + STATE + ".tmp " + STATE);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void logFile(String message) {
+        try {
+            shell("echo " + quote(System.currentTimeMillis() / 1000 + " " + message)
+                    + " >> " + SERVICE_LOG);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static int parseInt(String value, int fallback) {
+        try {
+            return value == null ? fallback : Integer.parseInt(value);
+        } catch (NumberFormatException error) {
+            return fallback;
+        }
+    }
+
+    private static long parseLong(String value, long fallback) {
+        try {
+            return value == null ? fallback : Long.parseLong(value);
+        } catch (NumberFormatException error) {
+            return fallback;
+        }
+    }
+
+    private static String quote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}
