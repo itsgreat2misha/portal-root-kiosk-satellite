@@ -287,6 +287,7 @@ class PortalProvisioner:
         system_theme_control: str | None = None,
         shizuku_apk: pathlib.Path | None = None,
         custom_payload: pathlib.Path | None = None,
+        skip_shizuku_root: bool = False,
         status_only: bool = False,
         dry_run: bool = False,
         backup_path: pathlib.Path | None = None,
@@ -350,6 +351,7 @@ class PortalProvisioner:
         self.system_theme_control_log_count_before = 0
         self.shizuku_apk = shizuku_apk
         self.custom_payload = custom_payload
+        self.skip_shizuku_root = skip_shizuku_root
         self.shizuku_public_key: pathlib.Path | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
@@ -5083,6 +5085,7 @@ class PortalProvisioner:
                 clean_boot_id = self.connect_after_reboot(boot_id)
                 continue
             self.verify_custom_payload()
+            self.apply_post_payload_root_steps()
             self.write_state("complete")
             print(
                 f"CUSTOM_PAYLOAD_OK payload={CUSTOM_PAYLOAD_DST_REMOTE} "
@@ -5122,6 +5125,108 @@ class PortalProvisioner:
                 last = str(exc)
             time.sleep(2)
         raise ProvisionError(f"custom payload did not answer as uid 0: {last}")
+
+    def daemon_exec(self, command: str, timeout: int = 40) -> tuple[int, str]:
+        """Run one command through the custom payload's loopback EXEC.
+
+        The payload protocol answers every request with the command's
+        stdout+stderr, an ``EXIT <code>`` line and a terminating ``END``
+        line. Uses the adb forward set up by verify_custom_payload().
+        """
+        with socket.create_connection(
+            ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=10
+        ) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(f"EXEC {command}\n".encode())
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                lines = data.decode(errors="replace").splitlines()
+                if "END" in lines:
+                    break
+        lines = data.decode(errors="replace").splitlines()
+        exit_code = 1
+        output_lines: list[str] = []
+        for line in lines:
+            if line.startswith("EXIT "):
+                try:
+                    exit_code = int(line.split()[1])
+                except (IndexError, ValueError):
+                    exit_code = 1
+                break
+            if line == "END":
+                break
+            output_lines.append(line)
+        return exit_code, "\n".join(output_lines)
+
+    def apply_post_payload_root_steps(self) -> None:
+        """Extra root-backed steps that need the payload serving first."""
+        if self.shizuku and not self.skip_shizuku_root:
+            self.start_shizuku_as_root()
+
+    def start_shizuku_as_root(self) -> None:
+        """Restart shizuku_server as uid 0 through the root payload.
+
+        The boot helper starts Shizuku with shell privileges through
+        loopback ADB. With the root payload serving on this boot, kill
+        that instance and re-run the official starter from the payload's
+        uid-0 context instead, then require the new server process to
+        report uid 0 in its /proc status.
+        """
+        dump = self.adb_run(
+            ["shell", "dumpsys", "package", SHIZUKU_PACKAGE],
+            timeout=15,
+            check=True,
+        ).stdout
+        native_match = re.search(r"nativeLibraryDir=(\S+)", dump)
+        if native_match is None:
+            raise ProvisionError(
+                "could not resolve Shizuku nativeLibraryDir for root start"
+            )
+        starter = f"{native_match.group(1)}/libshizuku.so"
+        pm_path = self.adb_run(
+            ["shell", "pm", "path", SHIZUKU_PACKAGE],
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        apk_match = re.search(r"package:(.+)", pm_path)
+        if apk_match is None:
+            raise ProvisionError("could not resolve Shizuku APK path")
+        apk = apk_match.group(1).strip()
+        command = (
+            "pkill -f shizuku_server; sleep 1; "
+            f"{shlex.quote(starter)} --apk={shlex.quote(apk)}; "
+            "sleep 1; pidof shizuku_server"
+        )
+        code, output = self.daemon_exec(command)
+        print(
+            f"SHIZUKU_ROOT_START exit={code} output={output.strip()!r}",
+            flush=True,
+        )
+        deadline = time.monotonic() + 30
+        last = ""
+        while time.monotonic() < deadline:
+            pid = self.adb_run(
+                ["shell", "pidof", "shizuku_server"], timeout=5
+            ).stdout.strip()
+            if pid:
+                status = self.adb_run(
+                    ["shell", "cat", f"/proc/{pid.split()[0]}/status"],
+                    timeout=5,
+                ).stdout
+                uid_match = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
+                if uid_match is not None:
+                    last = f"pid={pid.split()[0]} uid={uid_match.group(1)}"
+                    if uid_match.group(1) == "0":
+                        print(f"SHIZUKU_ROOT_OK {last}", flush=True)
+                        return
+            time.sleep(2)
+        raise ProvisionError(
+            f"shizuku_server did not come up as uid 0: {last or 'not running'}"
+        )
 
     @staticmethod
     def audio_processing_disabled_observed(
@@ -8022,6 +8127,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-shizuku-root",
+        action="store_true",
+        help=(
+            "with --shizuku and --custom-payload, leave shizuku_server "
+            "running with shell privileges instead of restarting it as "
+            "uid 0 through the root payload"
+        ),
+    )
+    parser.add_argument(
         "--system-theme-control",
         choices=("light", "dark"),
         metavar="{light,dark}",
@@ -8359,6 +8473,7 @@ def main() -> int:
             system_theme_control=args.system_theme_control,
             shizuku_apk=args.shizuku_apk,
             custom_payload=args.custom_payload,
+            skip_shizuku_root=args.skip_shizuku_root,
             status_only=args.status or args.backup_only,
             dry_run=args.dry_run,
             backup_path=args.backup,
