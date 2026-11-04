@@ -9,6 +9,13 @@ not persistent: it dies with the boot. On an `--autoroot` install the
 autoroot helper re-establishes it after each reboot; otherwise the
 provisioner must be re-run.
 
+The daemon is a bootstrap bridge, not a standing service. Its job is to
+carry root from the privileged window to the Shizuku server: once
+`shizuku_server` is verified running as uid 0, the provisioner (and, on
+autoroot boots, the helper) stops the daemon with `STOP`. It remains
+running for the rest of the boot only when root-mode Shizuku is not in
+play — a plain `--custom-payload` run, or `--skip-shizuku-root`.
+
 ## Protocol
 
 TCP on **127.0.0.1:37373 only**, line-based, one command per line; `EXEC`
