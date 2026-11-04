@@ -2,6 +2,7 @@ package dev.portal.autoroothelper;
 
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.IBinder;
 import android.util.Log;
 
@@ -43,12 +44,57 @@ public final class AutorootService extends Service {
     private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
     private static final int DAEMON_PORT = 37373;
 
+    // Control surface for AutorootActivity. The activity only sends
+    // intents; this service stays the single owner of shell work and
+    // session state.
+    public static final String ACTION_CANCEL_BOOT =
+            "dev.portal.autoroothelper.CANCEL_BOOT";
+    public static final String ACTION_SET_DISABLED =
+            "dev.portal.autoroothelper.SET_DISABLED";
+    public static final String ACTION_RUN_NOW =
+            "dev.portal.autoroothelper.RUN_NOW";
+    public static final String ACTION_STATUS_QUERY =
+            "dev.portal.autoroothelper.STATUS_QUERY";
+    public static final String EXTRA_ENABLED = "enabled";
+
+    public static final String PREFS_NAME = "autoroot_status";
+    public static final String PREF_PHASE = "phase";
+    public static final String PREF_ATTEMPT = "attempt";
+    public static final String PREF_MAX = "max";
+    public static final String PREF_DETAIL = "detail";
+    public static final String PREF_DISABLED = "disabled";
+
     private volatile boolean workerRunning;
+    private volatile boolean cancelRequested;
+    private volatile boolean forceFreshSession;
+    private volatile AdbClient activeClient;
+    private volatile String lastPhase = "IDLE";
+    private volatile int lastAttempt;
+    private volatile int lastMax;
+    private volatile String lastDetail = "";
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent == null ? null : intent.getAction();
+        if (ACTION_CANCEL_BOOT.equals(action)) {
+            handleCancel();
+            return START_STICKY;
+        }
+        if (ACTION_SET_DISABLED.equals(action)) {
+            boolean enabled = intent.getBooleanExtra(EXTRA_ENABLED, true);
+            new Thread(() -> setDisabled(!enabled), "portal-autoroot-ctl").start();
+            return START_STICKY;
+        }
+        if (ACTION_STATUS_QUERY.equals(action)) {
+            new Thread(this::refreshDisabledPref, "portal-autoroot-ctl").start();
+            return START_STICKY;
+        }
+        if (ACTION_RUN_NOW.equals(action)) {
+            forceFreshSession = true;
+        }
         if (!workerRunning) {
             workerRunning = true;
+            cancelRequested = false;
             new Thread(() -> run(startId), "portal-autoroot").start();
         }
         return START_STICKY;
@@ -72,8 +118,10 @@ public final class AutorootService extends Service {
         } else {
             Log.i(TAG, "autoroot disabled by flag " + DISABLE_FLAG);
             logFile("disabled by flag");
+            publishStatus("DISABLED", 0, 0, "disabled by flag");
             return;
         }
+        publishStatus("WORKING", lastAttempt, lastMax, "checking");
         String bootId = shell("cat /proc/sys/kernel/random/boot_id").trim();
         Map<String, String> conf = readKeyValues(CONF);
         int maxAttempts = parseInt(conf.get("MAX_ATTEMPTS"), 4);
@@ -87,6 +135,7 @@ public final class AutorootService extends Service {
 
         if (daemonServingRoot()) {
             logFile("daemon already up boot=" + bootId);
+            publishStatus("DONE", lastAttempt, lastMax, "daemon already up");
             ensureShizukuRoot();
             Map<String, String> state = readKeyValues(STATE);
             state.put("done_boot", bootId);
@@ -98,6 +147,22 @@ public final class AutorootService extends Service {
         long now = System.currentTimeMillis() / 1000;
         long sessionStart = parseLong(state.get("session_start"), 0);
         int attempts = parseInt(state.get("attempts"), 0);
+        if (forceFreshSession) {
+            // RUN_NOW from the UI: start over with a full budget even
+            // if this window's session capped out or was cancelled.
+            forceFreshSession = false;
+            sessionStart = now;
+            attempts = 0;
+            state.remove("done_boot");
+            state.remove("cancelled_boot");
+        }
+        if (bootId.equals(state.get("cancelled_boot"))) {
+            Log.i(TAG, "autoroot cancelled for this boot");
+            logFile("cancelled for this boot");
+            publishStatus("CANCELLED", attempts, maxAttempts,
+                    "cancelled for this boot");
+            return;
+        }
         String doneBoot = state.get("done_boot");
         if (doneBoot != null && !doneBoot.isEmpty() && !doneBoot.equals(bootId)) {
             // A previous boot completed autoroot (done_boot set): that
@@ -118,6 +183,8 @@ public final class AutorootService extends Service {
         if (attempts >= maxAttempts) {
             Log.w(TAG, "autoroot attempt cap reached attempts=" + attempts);
             logFile("capped attempts=" + attempts);
+            publishStatus("CAPPED", attempts, maxAttempts,
+                    "attempt cap reached");
             return;
         }
         attempts++;
@@ -125,16 +192,24 @@ public final class AutorootService extends Service {
         state.put("attempts", Integer.toString(attempts));
         writeState(state);
         logFile("attempt " + attempts + " of " + maxAttempts + " boot=" + bootId);
+        publishStatus("ATTEMPT", attempts, maxAttempts, "discovering addresses");
+        showStatusUi();
 
         String memstart = discoverMemstart();
         String kaslr = memstart == null ? null : discoverKaslr(simpleperf, offsets);
+        if (cancelRequested) {
+            markCancelled(state, bootId, attempts, maxAttempts);
+            return;
+        }
         if (memstart == null || kaslr == null) {
             Log.w(TAG, "discovery failed memstart=" + memstart + " kaslr=" + kaslr);
             logFile("discovery failed memstart=" + memstart + " kaslr=" + kaslr);
+            publishStatus("FAILED", attempts, maxAttempts, "discovery failed");
             rebootForCleanAttempt(attempts, maxAttempts);
             return;
         }
         logFile("discovered kaslr=" + kaslr + " memstart=" + memstart);
+        publishStatus("ATTEMPT", attempts, maxAttempts, "attempt running");
 
         shell("rm -f " + RESULT);
         // Run the attempt in the FOREGROUND of a long-timeout shell
@@ -155,11 +230,15 @@ public final class AutorootService extends Service {
         // and the kernel panic its damaged lock causes bounds it
         // independently.
         try {
-            shell("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
+            shellTracked("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
                     600000);
         } catch (Exception launchError) {
             Log.w(TAG, "attempt runner error", launchError);
             logFile("attempt runner error " + launchError);
+        }
+        if (cancelRequested) {
+            markCancelled(state, bootId, attempts, maxAttempts);
+            return;
         }
         boolean up = false;
         for (int waited = 0; waited < 30; waited += 5) {
@@ -167,11 +246,16 @@ public final class AutorootService extends Service {
                 up = true;
                 break;
             }
+            if (cancelRequested) {
+                markCancelled(state, bootId, attempts, maxAttempts);
+                return;
+            }
             Thread.sleep(5000);
         }
         if (up) {
             Log.i(TAG, "daemon up after attempt " + attempts);
             logFile("daemon up attempt=" + attempts);
+            publishStatus("DONE", attempts, maxAttempts, "root active");
             ensureShizukuRoot();
             state.put("done_boot", bootId);
             writeState(state);
@@ -179,7 +263,89 @@ public final class AutorootService extends Service {
         }
         Log.w(TAG, "attempt " + attempts + " did not bring the daemon up");
         logFile("attempt failed n=" + attempts);
+        publishStatus("FAILED", attempts, maxAttempts, "attempt failed");
         rebootForCleanAttempt(attempts, maxAttempts);
+    }
+
+    // ---- UI control surface -------------------------------------------
+
+    private void handleCancel() {
+        cancelRequested = true;
+        AdbClient client = activeClient;
+        if (client != null) {
+            try {
+                client.close();
+            } catch (Exception ignored) {
+            }
+        }
+        logFile("cancel requested");
+    }
+
+    private void markCancelled(Map<String, String> state, String bootId,
+            int attempts, int maxAttempts) {
+        state.put("cancelled_boot", bootId);
+        writeState(state);
+        Log.i(TAG, "autoroot cancelled for boot " + bootId);
+        logFile("cancelled boot=" + bootId);
+        publishStatus("CANCELLED", attempts, maxAttempts,
+                "cancelled for this boot");
+    }
+
+    private void setDisabled(boolean disabled) {
+        try {
+            if (disabled) {
+                shell("touch " + DISABLE_FLAG);
+                handleCancel();
+            } else {
+                shell("rm -f " + DISABLE_FLAG);
+            }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_DISABLED, disabled).apply();
+            logFile(disabled ? "disabled from UI" : "enabled from UI");
+            if (!disabled) {
+                publishStatus("IDLE", lastAttempt, lastMax, "enabled");
+            } else {
+                publishStatus("DISABLED", lastAttempt, lastMax,
+                        "disabled from UI");
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "setDisabled failed", error);
+        }
+    }
+
+    private void refreshDisabledPref() {
+        try {
+            boolean disabled = shell(
+                    "test -f " + DISABLE_FLAG + " && echo yes").contains("yes");
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_DISABLED, disabled).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void publishStatus(String phase, int attempt, int max,
+            String detail) {
+        lastPhase = phase;
+        lastAttempt = attempt;
+        lastMax = max;
+        lastDetail = detail;
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(PREF_PHASE, phase)
+                .putInt(PREF_ATTEMPT, attempt)
+                .putInt(PREF_MAX, max)
+                .putString(PREF_DETAIL, detail)
+                .apply();
+    }
+
+    private void showStatusUi() {
+        try {
+            Intent intent = new Intent(this, AutorootActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.putExtra("auto_shown", true);
+            startActivity(intent);
+        } catch (Exception error) {
+            Log.w(TAG, "could not show status UI", error);
+        }
     }
 
     private void rebootForCleanAttempt(int attempts, int maxAttempts) {
@@ -495,6 +661,28 @@ public final class AutorootService extends Service {
         try (AdbClient client = new AdbClient(getFilesDir(), soTimeoutMs)) {
             client.connect();
             return client.shell(command);
+        }
+    }
+
+    /**
+     * Like shell(), but registers the client so handleCancel() can
+     * close it from another thread. Closing the socket breaks the
+     * blocked read, and the runner on the far end dies with its ADB
+     * session - the same teardown that made detached launches fail,
+     * used here on purpose as the cancel mechanism.
+     */
+    private String shellTracked(String command, int soTimeoutMs) throws Exception {
+        AdbClient client = new AdbClient(getFilesDir(), soTimeoutMs);
+        activeClient = client;
+        try {
+            client.connect();
+            return client.shell(command);
+        } finally {
+            activeClient = null;
+            try {
+                client.close();
+            } catch (Exception ignored) {
+            }
         }
     }
 
