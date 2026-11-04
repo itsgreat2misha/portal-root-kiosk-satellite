@@ -48,3 +48,32 @@ With --shizuku and a verified custom payload, after CUSTOM_PAYLOAD_OK the provis
 Staged under /data/local/tmp/portal-autoroot/: the autoroot-helper app (dev.portal.autoroothelper), run.sh, per-parity environment files env-odd.sh and env-even.sh (per-boot addresses are discovered at runtime, never frozen into these files), autoroot.conf (attempt cap, session window), and a copy of the Shizuku helper's device ADB keypair so the helper can open a loopback ADB shell after boot. Staging refuses to proceed if a per-boot live-resolved value would be baked into the staged files.
 
 Boot flow: BOOT_COMPLETED starts AutorootService. If the payload already answers as uid 0, it only ensures Shizuku runs as root and records the boot done. Otherwise it measures this boot's addresses on-device, launches the attempt detached, and polls the payload channel for up to 5 minutes. Success: Shizuku is switched to root and the boot is marked done. Failure: it reboots and retries on a clean boot, up to the staged cap (default 4 attempts) within a 2-hour session window. Create /data/local/tmp/portal-autoroot.disable to turn autoroot off without uninstalling. Logs: logcat tag PortalAutoroot; files service.log and attempt.log in the staged directory.
+
+## 7. Live-test findings (Nov 4, 2026)
+
+Validated end-to-end on the library Portal+ (build 1041515800015050):
+a single fork provisioning run (Run 14) followed by two independent
+reboots, each recovering the root daemon (127.0.0.1:37373, uid 0) and
+root-mode Shizuku with no host involvement and the sandbox watcher
+stopped.
+
+Findings folded back into the code above:
+
+- Detached (nohup) attempt launches die with their launching ADB
+  shell session: no banner, no result, no surviving process. The
+  helper now runs run.sh in the foreground of a long-timeout shell
+  call (600 s), the same shape as the host provisioner's attempts.
+- run.sh housekeeping must precede sourcing the parity env files:
+  the env exports LD_PRELOAD, and the first external command after
+  sourcing (am force-stop) otherwise runs the exploit inside the
+  am process and the script never proceeds.
+- A completed boot (done_boot) ends its session. Without that
+  reset, a second reboot inside the session window inherits the
+  previous boot's spent attempts and caps out with no recovery.
+- Attempt budget is 8 per 60-minute session window. Observed
+  attempt outcomes include clean misses, mid-attempt kernel panics
+  (the damaged proc_uid lock), and hangs past 600 s; the two
+  validated recoveries landed on attempts 4 and 6 respectively.
+- A winning attempt's launcher call may still end in a read
+  timeout (the native run outlives it); the service treats the
+  post-call daemon check as authoritative.
