@@ -5269,6 +5269,30 @@ class PortalProvisioner:
         if apk_match is None:
             raise ProvisionError("could not resolve Shizuku APK path")
         apk = apk_match.group(1).strip()
+        # Kill any shell-mode server from THIS shell context first.
+        # The helper-started server runs as uid 2000; the payload
+        # daemon is uid 0 but sits in the shell SELinux domain, and
+        # signaling the helper's server from there returns EPERM, so
+        # neither the daemon-side kill loop nor the starter can stop
+        # it (run 13, 2026-11-04: starter aborted "can't kill 4105",
+        # PROVISION_ERROR pid=4105 uid=2000). A same-uid shell kill
+        # works — proven manually on that boot: adb shell kill, then
+        # the root starter came up clean (pid 13288, Uid 0).
+        self.adb_run(
+            [
+                "shell",
+                "for p in $(pidof shizuku_server); do kill $p; done; true",
+            ],
+            timeout=10,
+        )
+        kill_deadline = time.monotonic() + 10
+        while time.monotonic() < kill_deadline:
+            remaining = self.adb_run(
+                ["shell", "pidof", "shizuku_server"], timeout=5
+            ).stdout.strip()
+            if not remaining:
+                break
+            time.sleep(0.5)
         # Kill via pidof, never "pkill -f shizuku_server": this EXEC
         # shell's own command line contains that pattern, so pkill -f
         # matches the shell itself and kills it before the starter
