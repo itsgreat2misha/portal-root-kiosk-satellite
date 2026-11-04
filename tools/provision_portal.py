@@ -296,6 +296,7 @@ class PortalProvisioner:
         custom_payload: pathlib.Path | None = None,
         skip_shizuku_root: bool = False,
         autoroot: bool = False,
+        verify_boots: int = 2,
         status_only: bool = False,
         dry_run: bool = False,
         backup_path: pathlib.Path | None = None,
@@ -366,6 +367,9 @@ class PortalProvisioner:
         self.custom_payload = custom_payload
         self.skip_shizuku_root = skip_shizuku_root
         self.autoroot = autoroot
+        self.verify_boots = verify_boots
+        if self.verify_boots not in (1, 2):
+            raise ProvisionError('--verify-boots must be 1 or 2')
         self.shizuku_public_key: pathlib.Path | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
@@ -7242,13 +7246,16 @@ class PortalProvisioner:
         if first_boot is None:
             _, first_boot = self.reboot()
         self.verify_requested_state()
-        print("VERIFY_REBOOT starting", flush=True)
-        before, second_boot = self.reboot()
-        if before != first_boot:
-            raise ProvisionError(
-                f"unexpected boot changed before verification: {first_boot} -> {before}"
-            )
-        self.verify_requested_state()
+        second_boot = first_boot
+        if self.verify_boots >= 2:
+            print("VERIFY_REBOOT starting", flush=True)
+            before, second_boot = self.reboot()
+            if before != first_boot:
+                raise ProvisionError(
+                    f"unexpected boot changed before verification: "
+                    f"{first_boot} -> {before}"
+                )
+            self.verify_requested_state()
         if self.persist_wireless_adb:
             property_name = (
                 self.target.wireless_adb_file_property
@@ -8494,6 +8501,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verify-boots",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        metavar="{1,2}",
+        help=(
+            "number of boots to verify the requested state on before "
+            "PROVISION_OK (default: 2); 1 skips the second verification "
+            "reboot"
+        ),
+    )
+    parser.add_argument(
         "--system-theme-control",
         choices=("light", "dark"),
         metavar="{light,dark}",
@@ -8833,6 +8852,7 @@ def main() -> int:
             custom_payload=args.custom_payload,
             skip_shizuku_root=args.skip_shizuku_root,
             autoroot=args.autoroot,
+            verify_boots=args.verify_boots,
             status_only=args.status or args.backup_only,
             dry_run=args.dry_run,
             backup_path=args.backup,

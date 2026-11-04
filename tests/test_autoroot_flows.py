@@ -470,3 +470,64 @@ class AutorootStagingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import tempfile
+
+
+class VerifyBootsTests(unittest.TestCase):
+    def _provisioner(self, verify_boots):
+        obj = PortalProvisioner.__new__(PortalProvisioner)
+        obj.verify_boots = verify_boots
+        obj.persist_wireless_adb = False
+        obj.target = None
+        obj.log_dir = pathlib.Path(tempfile.mkdtemp())
+        state = {'cur': 'boot-A', 'reboots': 0, 'verifies': 0, 'written': None}
+
+        def fake_reboot():
+            old = state['cur']
+            state['cur'] = old + 'x'
+            state['reboots'] += 1
+            return old, state['cur']
+
+        def fake_verify():
+            state['verifies'] += 1
+
+        def fake_write_state(status, first=None, second=None):
+            state['written'] = (status, first, second)
+
+        obj.reboot = fake_reboot
+        obj.verify_requested_state = fake_verify
+        obj.write_state = fake_write_state
+        obj.adb_framework_boot_install_requested = lambda: False
+        return obj, state
+
+    def test_one_boot_skips_second_verification_reboot(self):
+        obj, st = self._provisioner(1)
+        obj.verify_across_two_reboots(first_boot='boot-A')
+        self.assertEqual(st['reboots'], 0)
+        self.assertEqual(st['verifies'], 1)
+        self.assertEqual(st['written'], ('complete', 'boot-A', 'boot-A'))
+
+    def test_one_boot_after_initial_reboot(self):
+        obj, st = self._provisioner(1)
+        obj.verify_across_two_reboots()
+        self.assertEqual(st['reboots'], 1)
+        self.assertEqual(st['verifies'], 1)
+        self.assertEqual(st['written'][0], 'complete')
+        self.assertEqual(st['written'][1], st['written'][2])
+
+    def test_two_boots_unchanged(self):
+        obj, st = self._provisioner(2)
+        obj.verify_across_two_reboots(first_boot='boot-A')
+        self.assertEqual(st['reboots'], 1)
+        self.assertEqual(st['verifies'], 2)
+        self.assertEqual(st['written'], ('complete', 'boot-A', 'boot-Ax'))
+
+    def test_verify_boots_cli(self):
+        with mock.patch.object(sys, 'argv', ['provision_portal.py']):
+            self.assertEqual(parse_args().verify_boots, 2)
+        with mock.patch.object(
+            sys, 'argv', ['provision_portal.py', '--verify-boots', '1']
+        ):
+            self.assertEqual(parse_args().verify_boots, 1)
