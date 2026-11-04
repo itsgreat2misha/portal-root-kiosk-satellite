@@ -166,15 +166,37 @@ public final class AutorootService extends Service {
     // ---- discovery ----------------------------------------------------
 
     private String discoverMemstart() {
-        try {
-            String out = shell("bugreportz -p");
-            Matcher pathMatch = Pattern.compile("(?:OK|BEGIN):(\\S+\\.zip)").matcher(out);
-            if (!pathMatch.find()) {
-                return null;
+        // A bugreport on this device takes ~1 minute (the host provisioner
+        // allows 180 s), and dumpstate can reset the connection mid-run,
+        // leaving only the BEGIN line; the archive still lands on disk.
+        for (int tries = 0; tries < 2; tries++) {
+            String found = discoverMemstartOnce();
+            if (found != null) {
+                return found;
             }
-            String zipPath = pathMatch.group(1);
+        }
+        return null;
+    }
+
+    private String discoverMemstartOnce() {
+        try {
+            String out = shell("bugreportz -p", 200000);
+            Matcher okMatch = Pattern.compile("OK:(\\S+\\.zip)").matcher(out);
+            String zipPath;
+            if (okMatch.find()) {
+                zipPath = okMatch.group(1);
+            } else {
+                Matcher beginMatch = Pattern.compile("BEGIN:(\\S+\\.zip)").matcher(out);
+                if (!beginMatch.find()) {
+                    return null;
+                }
+                zipPath = beginMatch.group(1);
+                if (!awaitStableFile(zipPath, 120000)) {
+                    return null;
+                }
+            }
             try {
-                String b64 = shell("base64 " + zipPath);
+                String b64 = shell("base64 " + zipPath, 120000);
                 byte[] zip = java.util.Base64.getMimeDecoder()
                         .decode(b64.replaceAll("\\s", ""));
                 String text = extractBugreportText(zip);
@@ -197,6 +219,28 @@ public final class AutorootService extends Service {
             Log.w(TAG, "memstart discovery failed", error);
             return null;
         }
+    }
+
+    private boolean awaitStableFile(String path, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long lastSize = -1;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                String out = shell("stat -c %s " + path + " 2>/dev/null").trim();
+                long size = Long.parseLong(out);
+                if (size > 0 && size == lastSize) {
+                    return true;
+                }
+                lastSize = size;
+            } catch (Exception ignored) {
+            }
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                return false;
+            }
+        }
+        return false;
     }
 
     private String extractBugreportText(byte[] zip) throws Exception {
@@ -231,9 +275,10 @@ public final class AutorootService extends Service {
             try {
                 String remote = DIR + "/perf-" + sampleTry + ".data";
                 shell(simpleperf + " record -g -e cpu-clock -f 4000 --duration 2 -o "
-                        + remote + " -- /system/bin/dd if=/dev/zero of=/dev/null bs=4096");
+                        + remote + " -- /system/bin/dd if=/dev/zero of=/dev/null bs=4096",
+                        60000);
                 String report = shell(simpleperf + " report-sample -i " + remote
-                        + " | grep -m 512 'vaddr_in_file: ffffff'");
+                        + " | grep -m 512 'vaddr_in_file: ffffff'", 60000);
                 shell("rm -f " + remote);
                 Map<Long, int[]> candidates = new HashMap<>();
                 Matcher matcher = valuePattern.matcher(report);
@@ -397,7 +442,11 @@ public final class AutorootService extends Service {
     // ---- plumbing -----------------------------------------------------
 
     private String shell(String command) throws Exception {
-        try (AdbClient client = new AdbClient(getFilesDir())) {
+        return shell(command, 15000);
+    }
+
+    private String shell(String command, int soTimeoutMs) throws Exception {
+        try (AdbClient client = new AdbClient(getFilesDir(), soTimeoutMs)) {
             client.connect();
             return client.shell(command);
         }
