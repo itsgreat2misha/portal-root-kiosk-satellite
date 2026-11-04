@@ -403,6 +403,20 @@ public final class AutorootService extends Service {
                 Log.w(TAG, "could not resolve shizuku paths");
                 return;
             }
+            // Kill any shell-mode server from THIS shell context
+            // first: shell() runs as uid 2000, the same uid as the
+            // helper-started server, so the signal is permitted. The
+            // uid-0 daemon's shell SELinux domain gets EPERM signaling
+            // that server, so the daemon-side kill loop and the
+            // starter both fail against it (provisioner run 13,
+            // 2026-11-04; same-uid kill proven manually that boot).
+            shell("for p in $(pidof shizuku_server); do kill $p; done; true");
+            for (int waited = 0; waited < 10; waited++) {
+                Thread.sleep(500);
+                if (shell("pidof shizuku_server").trim().isEmpty()) {
+                    break;
+                }
+            }
             // Kill via pidof, never "pkill -f shizuku_server": the
             // daemon EXEC shell's own command line contains that
             // pattern, so pkill -f would kill the shell itself before
