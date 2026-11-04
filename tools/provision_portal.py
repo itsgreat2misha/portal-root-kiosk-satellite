@@ -5262,8 +5262,13 @@ class PortalProvisioner:
         if apk_match is None:
             raise ProvisionError("could not resolve Shizuku APK path")
         apk = apk_match.group(1).strip()
+        # Kill via pidof, never "pkill -f shizuku_server": this EXEC
+        # shell's own command line contains that pattern, so pkill -f
+        # matches the shell itself and kills it before the starter
+        # runs (run 10, 2026-11-03: SHIZUKU_ROOT_START output empty).
+        # pidof matches the process name only, so it cannot self-match.
         command = (
-            "pkill -f shizuku_server; sleep 1; "
+            "for p in $(pidof shizuku_server); do kill $p; done; sleep 1; "
             f"{shlex.quote(starter)} --apk={shlex.quote(apk)}; "
             "sleep 1; pidof shizuku_server"
         )
