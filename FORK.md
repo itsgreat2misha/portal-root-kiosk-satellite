@@ -77,3 +77,57 @@ Findings folded back into the code above:
 - A winning attempt's launcher call may still end in a read
   timeout (the native run outlives it); the service treats the
   post-call daemon check as authoritative.
+
+## 8. Streamlined build: helper UI and shizuku-helper removal (2026-11-04)
+
+Two changes on top of the validated autoroot system, both live-tested
+the same day (provision run 15 plus a full control-surface pass):
+
+**The shizuku helper is gone from the autoroot flow.** It only ever
+existed to hold the loopback ADB keypair, and staging already copies
+that keypair into the autoroot helper's own files. At the end of
+`stage_autoroot_payload()` the provisioner now uninstalls
+`dev.portal.shizukuhelper` and prints
+`SHIZUKU_HELPER_REMOVED reason=autoroot-keypair-merged`. The
+authorized public key in `adb_keys` is a plain line in a file and is
+unaffected. The plain `--shizuku` flow (no `--autoroot`) still
+installs and uses the helper as before. Deployed package set for an
+autoroot device: exploit sentinel, Shizuku, autoroot helper.
+
+**The autoroot helper has a status/control activity (v1.1).** The
+service publishes its phase (attempt n of m, detail) to
+SharedPreferences; `AutorootActivity` polls it while visible. The
+service opens the activity itself when an attempt session starts, so
+the screen warns "do not use the device yet - it may reboot without
+warning" while an attempt runs; it can also be opened from the
+launcher at any time. Buttons send intents to the service, which
+stays the single owner of shell work and session state:
+
+- **Cancel (this boot)** - the service closes the tracked ADB client
+  of the in-flight attempt; the blocked read throws, the runner dies
+  with its session (the detached-launch teardown, used on purpose),
+  the boot is recorded in `cancelled_boot`, and no reboot follows.
+  Later boots are unaffected.
+- **Disable / Enable autoroot** - creates or removes the existing
+  `/data/local/tmp/portal-autoroot.disable` flag. Disabling mid-
+  session also cancels the in-flight attempt.
+- **Run now** - starts a session with a fresh attempt budget,
+  ignoring a spent budget, a cancelled boot, or an unexpired session
+  window.
+
+Live results: reprovision passed end to end including the helper
+removal; the next reboot recovered on attempt 5 with no
+shizuku-helper package present (the autoroot helper's own keypair
+authenticated loopback for discovery and the root Shizuku restart).
+Cancel was exercised with a real tap on the on-screen button
+mid-attempt: the attempt died instantly and the device stayed up,
+unrooted, for that boot. Disable produced a boot that logged
+"disabled by flag" and made no attempts; Enable + Run Now started a
+fresh session on the same boot.
+
+Session data point: of the four full recovery sessions observed on
+2026-11-04, three landed inside the 8-attempt budget (attempts 5, 6,
+and 3) and one capped at 0/8, after which Run Now recovered on
+attempt 3 of a fresh session. A timeout-cut attempt can still panic
+the device a minute or so later from the lock damage; the session
+machinery absorbs that as just another failed attempt.
