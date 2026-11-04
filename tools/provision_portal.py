@@ -5232,11 +5232,27 @@ class PortalProvisioner:
             check=True,
         ).stdout
         native_match = re.search(r"nativeLibraryDir=(\S+)", dump)
-        if native_match is None:
-            raise ProvisionError(
-                "could not resolve Shizuku nativeLibraryDir for root start"
-            )
-        starter = f"{native_match.group(1)}/libshizuku.so"
+        if native_match is not None:
+            starter = f"{native_match.group(1)}/libshizuku.so"
+        else:
+            # Android 9 package dumps carry only legacyNativeLibraryDir,
+            # which points at the extraction root; the libraries live in
+            # its per-ABI subdirectory (lib/<abi-dir>/libshizuku.so).
+            legacy_match = re.search(r"legacyNativeLibraryDir=(\S+)", dump)
+            abi_match = re.search(r"primaryCpuAbi=(\S+)", dump)
+            abi_dirs = {
+                "arm64-v8a": "arm64",
+                "armeabi-v7a": "arm",
+                "armeabi": "arm",
+                "x86_64": "x86_64",
+                "x86": "x86",
+            }
+            abi_dir = abi_dirs.get(abi_match.group(1)) if abi_match else None
+            if legacy_match is None or abi_dir is None:
+                raise ProvisionError(
+                    "could not resolve Shizuku nativeLibraryDir for root start"
+                )
+            starter = f"{legacy_match.group(1)}/{abi_dir}/libshizuku.so"
         pm_path = self.adb_run(
             ["shell", "pm", "path", SHIZUKU_PACKAGE],
             timeout=10,
