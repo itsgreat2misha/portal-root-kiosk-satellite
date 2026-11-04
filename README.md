@@ -1248,13 +1248,19 @@ repairing the kernel lock state the race leaves behind (see
 answers a line-based protocol on `127.0.0.1:37373` — `ID`, `EXEC <command>`
 and `STOP`; see `root-daemon/README.md` for the details. It is per-boot
 only: it dies with the boot and is not restarted unless the provisioner
-runs again or autoroot is enabled.
+runs again or autoroot is enabled. The daemon is a bridge, not a standing
+service: when root-mode Shizuku is enabled, the provisioner stops it as
+soon as Shizuku is verified running as UID 0 (`PAYLOAD_DAEMON_STOPPED`),
+because Shizuku is the root interface apps use from then on. It stays
+running only when root-mode Shizuku is not in play — a plain
+`--custom-payload` run, or `--skip-shizuku-root`.
 
 > [!WARNING]
 > The daemon has **no authentication**. Any app on the Portal that can open
 > a loopback TCP connection can run commands as UID 0. It binds loopback
-> only and lives for one boot, but enable this mode only on devices where
-> that trade-off is acceptable.
+> only and lives for one boot — and with root-mode Shizuku enabled it is
+> stopped after the handoff, so the exposure lasts minutes — but enable
+> this mode only on devices where that trade-off is acceptable.
 
 The payload binary is operator-supplied: `--custom-payload` accepts any
 executable, and `root-daemon/` builds the reference one. Post-payload
@@ -1299,14 +1305,16 @@ python3 tools/provision_portal.py \
 ```
 
 `--autoroot` stages an on-device runner and a boot helper app so a reboot
-needs no host. After every boot the helper checks whether the root daemon
-is answering; if it is not, the helper redoes the per-boot address
-discovery on the device (bugreport plus the staged `simpleperf`), then
-re-runs the exploit with the same environment the host provisioner would
-generate, in both attempt geometries. A session allows up to 8 attempts in
-a 60-minute window; a failed attempt reboots the Portal for a clean retry,
-and a session that exhausts its budget retries after the window. On
-success the helper restarts Shizuku as root and records the boot as done.
+needs no host. After every boot the helper checks whether Shizuku is
+already running as UID 0; if it is, the boot is done. Otherwise the
+helper redoes the per-boot address discovery on the device (bugreport
+plus the staged `simpleperf`), then re-runs the exploit with the same
+environment the host provisioner would generate, in both attempt
+geometries. A session allows up to 8 attempts in a 60-minute window; a
+failed attempt reboots the Portal for a clean retry, and a session that
+exhausts its budget retries after the window. On success the helper
+restarts Shizuku as root through the daemon, stops the daemon, and
+records the boot as done.
 
 The helper app shows the live session state and provides three controls:
 **Stop autoroot & reboot** (stops any in-flight attempt, disables autoroot
