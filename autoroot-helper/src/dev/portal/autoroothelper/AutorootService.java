@@ -358,7 +358,11 @@ public final class AutorootService extends Service {
                 Log.w(TAG, "could not resolve shizuku paths");
                 return;
             }
-            String command = "pkill -f shizuku_server; sleep 1; "
+            // Kill via pidof, never "pkill -f shizuku_server": the
+            // daemon EXEC shell's own command line contains that
+            // pattern, so pkill -f would kill the shell itself before
+            // the starter runs. pidof matches the process name only.
+            String command = "for p in $(pidof shizuku_server); do kill $p; done; sleep 1; "
                     + quote(starter) + " --apk=" + quote(apkMatch.group(1))
                     + "; sleep 1; pidof shizuku_server";
             daemonExec(command);
