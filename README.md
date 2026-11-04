@@ -1445,7 +1445,9 @@ option with:
 python3 tools/provision_portal.py --help
 ```
 
-Each successful run verifies the requested state on two distinct boots. Read
+Each successful run verifies the requested state on two distinct boots by
+default. `--verify-boots 1` verifies on a single boot instead, skipping the
+second verification reboot. Read
 the final `PROVISION_OK` line and keep the attempt directory when diagnosing a
 failure.
 
