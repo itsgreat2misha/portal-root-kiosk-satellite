@@ -5525,6 +5525,24 @@ class PortalProvisioner:
         except ProvisionError:
             print("AUTOROOT_HELPER_ACTIVATION_PENDING early_boot=1")
         print("AUTOROOT_HELPER_ACTIVATED first_install=1")
+        # The autoroot helper now holds its own copy of the loopback
+        # keypair (copied above) and runs its own ADB client, so the
+        # shizuku helper app has no remaining role in the autoroot
+        # flow: remove it so the deployed system is just the sentinel,
+        # Shizuku, and the autoroot helper. The authorized public key
+        # in adb_keys is a plain line in a file and is unaffected by
+        # removing the other app that happened to hold a copy.
+        installed, _ = self.package_sets()
+        if SHIZUKU_HELPER_PACKAGE in installed:
+            result = self.adb_run(
+                ["uninstall", SHIZUKU_HELPER_PACKAGE], timeout=60
+            )
+            if result.returncode != 0 or "Success" not in result.stdout:
+                raise ProvisionError(
+                    "failed to remove the shizuku helper after "
+                    f"autoroot staging: {result.stdout.strip()}"
+                )
+            print("SHIZUKU_HELPER_REMOVED reason=autoroot-keypair-merged")
         print(
             f"AUTOROOT_STAGED_OK dir={AUTOROOT_REMOTE_DIR} "
             f"helper={AUTOROOT_HELPER_PACKAGE} "
