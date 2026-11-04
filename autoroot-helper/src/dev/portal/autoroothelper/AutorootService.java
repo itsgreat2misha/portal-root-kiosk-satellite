@@ -47,8 +47,8 @@ public final class AutorootService extends Service {
     // Control surface for AutorootActivity. The activity only sends
     // intents; this service stays the single owner of shell work and
     // session state.
-    public static final String ACTION_CANCEL_BOOT =
-            "dev.portal.autoroothelper.CANCEL_BOOT";
+    public static final String ACTION_STOP_REBOOT =
+            "dev.portal.autoroothelper.STOP_REBOOT";
     public static final String ACTION_SET_DISABLED =
             "dev.portal.autoroothelper.SET_DISABLED";
     public static final String ACTION_RUN_NOW =
@@ -65,7 +65,7 @@ public final class AutorootService extends Service {
     public static final String PREF_DISABLED = "disabled";
 
     private volatile boolean workerRunning;
-    private volatile boolean cancelRequested;
+    private volatile boolean stopRequested;
     private volatile boolean forceFreshSession;
     private volatile AdbClient activeClient;
     private volatile String lastPhase = "IDLE";
@@ -76,8 +76,8 @@ public final class AutorootService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
-        if (ACTION_CANCEL_BOOT.equals(action)) {
-            handleCancel();
+        if (ACTION_STOP_REBOOT.equals(action)) {
+            new Thread(this::handleStopReboot, "portal-autoroot-ctl").start();
             return START_STICKY;
         }
         if (ACTION_SET_DISABLED.equals(action)) {
@@ -94,7 +94,7 @@ public final class AutorootService extends Service {
         }
         if (!workerRunning) {
             workerRunning = true;
-            cancelRequested = false;
+            stopRequested = false;
             new Thread(() -> run(startId), "portal-autoroot").start();
         }
         return START_STICKY;
@@ -149,19 +149,11 @@ public final class AutorootService extends Service {
         int attempts = parseInt(state.get("attempts"), 0);
         if (forceFreshSession) {
             // RUN_NOW from the UI: start over with a full budget even
-            // if this window's session capped out or was cancelled.
+            // if this window's session capped out.
             forceFreshSession = false;
             sessionStart = now;
             attempts = 0;
             state.remove("done_boot");
-            state.remove("cancelled_boot");
-        }
-        if (bootId.equals(state.get("cancelled_boot"))) {
-            Log.i(TAG, "autoroot cancelled for this boot");
-            logFile("cancelled for this boot");
-            publishStatus("CANCELLED", attempts, maxAttempts,
-                    "cancelled for this boot");
-            return;
         }
         String doneBoot = state.get("done_boot");
         if (doneBoot != null && !doneBoot.isEmpty() && !doneBoot.equals(bootId)) {
@@ -197,8 +189,8 @@ public final class AutorootService extends Service {
 
         String memstart = discoverMemstart();
         String kaslr = memstart == null ? null : discoverKaslr(simpleperf, offsets);
-        if (cancelRequested) {
-            markCancelled(state, bootId, attempts, maxAttempts);
+        if (stopRequested) {
+            logFile("stopped by user");
             return;
         }
         if (memstart == null || kaslr == null) {
@@ -236,8 +228,8 @@ public final class AutorootService extends Service {
             Log.w(TAG, "attempt runner error", launchError);
             logFile("attempt runner error " + launchError);
         }
-        if (cancelRequested) {
-            markCancelled(state, bootId, attempts, maxAttempts);
+        if (stopRequested) {
+            logFile("stopped by user");
             return;
         }
         boolean up = false;
@@ -246,8 +238,8 @@ public final class AutorootService extends Service {
                 up = true;
                 break;
             }
-            if (cancelRequested) {
-                markCancelled(state, bootId, attempts, maxAttempts);
+            if (stopRequested) {
+                logFile("stopped by user");
                 return;
             }
             Thread.sleep(5000);
@@ -269,8 +261,20 @@ public final class AutorootService extends Service {
 
     // ---- UI control surface -------------------------------------------
 
-    private void handleCancel() {
-        cancelRequested = true;
+    /**
+     * The Stop control: disable autoroot, kill any in-flight
+     * attempt, and reboot. Stopping in place is deliberately not
+     * offered: once the race has run, the kernel lock it damages
+     * stays damaged until a reboot (in the 2026-11-04 live tests a
+     * timeout-cut attempt panic-rebooted the device about a minute
+     * later), so a stop that left the device on the same boot would
+     * leave it in exactly the unstable state the UI warns about.
+     * The reboot clears the damage; the disable flag makes the
+     * fresh boot come up quiet, with autoroot off until the user
+     * re-enables it.
+     */
+    private void handleStopReboot() {
+        stopRequested = true;
         AdbClient client = activeClient;
         if (client != null) {
             try {
@@ -278,24 +282,38 @@ public final class AutorootService extends Service {
             } catch (Exception ignored) {
             }
         }
-        logFile("cancel requested");
-    }
-
-    private void markCancelled(Map<String, String> state, String bootId,
-            int attempts, int maxAttempts) {
-        state.put("cancelled_boot", bootId);
-        writeState(state);
-        Log.i(TAG, "autoroot cancelled for boot " + bootId);
-        logFile("cancelled boot=" + bootId);
-        publishStatus("CANCELLED", attempts, maxAttempts,
-                "cancelled for this boot");
+        try {
+            shell("touch " + DISABLE_FLAG);
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_DISABLED, true).apply();
+            publishStatus("STOPPED", lastAttempt, lastMax,
+                    "autoroot off - rebooting to a clean state");
+            logFile("stop from UI: disabled, rebooting");
+            shell("reboot");
+        } catch (Exception error) {
+            Log.w(TAG, "stop/reboot failed", error);
+        }
     }
 
     private void setDisabled(boolean disabled) {
         try {
             if (disabled) {
                 shell("touch " + DISABLE_FLAG);
-                handleCancel();
+                if (workerRunning) {
+                    // An in-flight attempt may have damaged the
+                    // kernel lock; reboot so the disabled state
+                    // starts from a clean boot.
+                    stopRequested = true;
+                    AdbClient client = activeClient;
+                    if (client != null) {
+                        try {
+                            client.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    logFile("disabled mid-session: rebooting");
+                    shell("reboot");
+                }
             } else {
                 shell("rm -f " + DISABLE_FLAG);
             }
@@ -665,11 +683,11 @@ public final class AutorootService extends Service {
     }
 
     /**
-     * Like shell(), but registers the client so handleCancel() can
+     * Like shell(), but registers the client so the stop path can
      * close it from another thread. Closing the socket breaks the
      * blocked read, and the runner on the far end dies with its ADB
      * session - the same teardown that made detached launches fail,
-     * used here on purpose as the cancel mechanism.
+     * used here on purpose as the kill mechanism.
      */
     private String shellTracked(String command, int soTimeoutMs) throws Exception {
         AdbClient client = new AdbClient(getFilesDir(), soTimeoutMs);
