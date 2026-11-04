@@ -5461,6 +5461,31 @@ class PortalProvisioner:
                 timeout=5,
                 check=True,
             )
+        # Android keeps freshly installed packages in the stopped state,
+        # which suppresses BOOT_COMPLETED delivery; launch the helper once
+        # now (mirrors the shizuku helper activation in verify_shizuku) so
+        # its boot receiver can fire on later reboots. The daemon is up at
+        # this point, so the service's first run just records this boot as
+        # done and exits.
+        try:
+            self.adb_run(
+                [
+                    "shell",
+                    "am",
+                    "broadcast",
+                    "-f",
+                    "0x20",
+                    "-a",
+                    "dev.portal.autoroothelper.START",
+                    "-p",
+                    AUTOROOT_HELPER_PACKAGE,
+                ],
+                timeout=15,
+                check=True,
+            )
+        except ProvisionError:
+            print("AUTOROOT_HELPER_ACTIVATION_PENDING early_boot=1")
+        print("AUTOROOT_HELPER_ACTIVATED first_install=1")
         print(
             f"AUTOROOT_STAGED_OK dir={AUTOROOT_REMOTE_DIR} "
             f"helper={AUTOROOT_HELPER_PACKAGE} "
@@ -7195,6 +7220,128 @@ class PortalProvisioner:
             f"logs={self.log_dir}"
         )
 
+    def run_standard_install(self, use_exploit_sentinel: bool) -> None:
+        sentinel_removed = not use_exploit_sentinel
+        try:
+            self.prepare_exploit_users()
+            self.stage()
+            clean_boot_id: str | None = None
+            for attempt in range(1, self.attempts + 1):
+                if clean_boot_id is None:
+                    print(f"INSTALL_ATTEMPT={attempt} preparing clean boot", flush=True)
+                    _, boot_id = self.reboot()
+                else:
+                    boot_id = clean_boot_id
+                    clean_boot_id = None
+                    print(
+                        f"INSTALL_ATTEMPT={attempt} using post-attempt clean boot "
+                        f"boot_id={boot_id}",
+                        flush=True,
+                    )
+                if self.target.address_discovery_settle_seconds:
+                    print(
+                        "ADDRESS_DISCOVERY_SETTLE "
+                        f"seconds={self.target.address_discovery_settle_seconds}",
+                        flush=True,
+                    )
+                    time.sleep(self.target.address_discovery_settle_seconds)
+                try:
+                    base = self.kaslr_base(str(attempt))
+                    memstart = self.memstart(str(attempt))
+                except ProvisionError as exc:
+                    print(f"ADDRESS_DISCOVERY_RETRY attempt={attempt} error={exc}")
+                    try:
+                        self.connect(wait_seconds=600)
+                        recovered_boot = self.adb_run(
+                            [
+                                "shell",
+                                "cat",
+                                "/proc/sys/kernel/random/boot_id",
+                            ],
+                            timeout=5,
+                            check=True,
+                        ).stdout.strip()
+                        if recovered_boot:
+                            clean_boot_id = recovered_boot
+                            print(
+                                "ADDRESS_DISCOVERY_RECOVERED "
+                                f"boot_id={recovered_boot}",
+                                flush=True,
+                            )
+                            if self.target.address_discovery_reboot_on_failure:
+                                print(
+                                    "ADDRESS_DISCOVERY_REBOOT "
+                                    "reason=unusable-capture",
+                                    flush=True,
+                                )
+                                _, clean_boot_id = self.reboot()
+                    except ProvisionError as reconnect_error:
+                        print(
+                            "ADDRESS_DISCOVERY_RECONNECT_FAILED "
+                            f"error={reconnect_error}",
+                            flush=True,
+                        )
+                    continue
+                print(
+                    f"RUNTIME_ADDRESSES attempt={attempt} boot_id={boot_id} "
+                    f"kaslr={base:#x} memstart={memstart:#x}",
+                    flush=True,
+                )
+                exploit_ok = self.exploit(base, memstart, attempt)
+                post_attempt_boot = self.connect_after_reboot(boot_id)
+                if not exploit_ok:
+                    clean_boot_id = post_attempt_boot
+                    continue
+                if use_exploit_sentinel:
+                    self.uninstall_exploit_sentinel()
+                    sentinel_removed = True
+                if self.shizuku:
+                    self.finalize_buffered_shizuku_key()
+                if self.needs_uid1000_payload():
+                    self.finalize_buffered_uid1000_markers()
+                if (
+                    self.system_theme_control is not None
+                    and not self.system_theme_control_already_configured
+                ):
+                    self.apply_system_theme_request()
+                if (
+                    self.uid1000_runtime_package_installed
+                    and not (
+                        self.restore_camera_light
+                        or self.restore_presence_fps
+                        or self.restore_presence_profile
+                    )
+                ):
+                    self.uid1000_runtime_package_installed = False
+                    print("UID1000_RUNTIME_APK_RETAIN package=installed")
+                if self.enable_updates:
+                    self.enable_ota_packages()
+                if self.remove_shizuku:
+                    self.uninstall_shizuku_payload()
+                if self.presence_fps_action_requested():
+                    self.uninstall_presence_helper()
+                if self.kiosk_home:
+                    self.ensure_kiosk_home()
+                if self.restore_kiosk_home:
+                    self.configure_kiosk_home(enabled=False)
+                if (
+                    self.restore_camera_light
+                    or self.restore_presence_fps
+                    or self.restore_presence_profile
+                ):
+                    self.restore_uid1000_package_state_if_unused()
+                self.verify_across_two_reboots(first_boot=post_attempt_boot)
+                self.report_deferred_failures()
+                return
+        finally:
+            if self.exploit_users_created:
+                self.cleanup_exploit_users(best_effort=True)
+            if use_exploit_sentinel and not sentinel_removed:
+                self.uninstall_exploit_sentinel(best_effort=True)
+            if self.uid1000_runtime_package_installed:
+                self.uninstall_uid1000_runtime_payload(best_effort=True)
+        raise ProvisionError(f"provisioning failed after {self.attempts} attempts")
+
     def provision(self) -> None:
         self.connect(wait_seconds=30)
         resumed_pending = False
@@ -7942,6 +8089,19 @@ class PortalProvisioner:
         if use_exploit_sentinel:
             self.prepare_exploit_sentinel()
         sentinel_removed = not use_exploit_sentinel
+        if self.custom_payload is not None and self.shizuku:
+            # The helper ADB key authorization only takes effect as part
+            # of the standard install loop's post-root actions; attempted
+            # from the custom-payload phase it fails, which used to make
+            # the payload phase discard otherwise-won attempts and left
+            # the key unauthorized for later boots. Run the standard
+            # install first so the key is authorized on the device, then
+            # re-stage the sentinel the install loop removed and apply
+            # the payload on the resulting boot.
+            print("COMBINED_FLOW standard_install_first=1", flush=True)
+            self.run_standard_install(use_exploit_sentinel)
+            if use_exploit_sentinel:
+                self.prepare_exploit_sentinel()
         if self.custom_payload is not None:
             try:
                 self.apply_custom_payload()
@@ -7955,125 +8115,7 @@ class PortalProvisioner:
                         flush=True,
                     )
             return
-        try:
-            self.prepare_exploit_users()
-            self.stage()
-            clean_boot_id: str | None = None
-            for attempt in range(1, self.attempts + 1):
-                if clean_boot_id is None:
-                    print(f"INSTALL_ATTEMPT={attempt} preparing clean boot", flush=True)
-                    _, boot_id = self.reboot()
-                else:
-                    boot_id = clean_boot_id
-                    clean_boot_id = None
-                    print(
-                        f"INSTALL_ATTEMPT={attempt} using post-attempt clean boot "
-                        f"boot_id={boot_id}",
-                        flush=True,
-                    )
-                if self.target.address_discovery_settle_seconds:
-                    print(
-                        "ADDRESS_DISCOVERY_SETTLE "
-                        f"seconds={self.target.address_discovery_settle_seconds}",
-                        flush=True,
-                    )
-                    time.sleep(self.target.address_discovery_settle_seconds)
-                try:
-                    base = self.kaslr_base(str(attempt))
-                    memstart = self.memstart(str(attempt))
-                except ProvisionError as exc:
-                    print(f"ADDRESS_DISCOVERY_RETRY attempt={attempt} error={exc}")
-                    try:
-                        self.connect(wait_seconds=600)
-                        recovered_boot = self.adb_run(
-                            [
-                                "shell",
-                                "cat",
-                                "/proc/sys/kernel/random/boot_id",
-                            ],
-                            timeout=5,
-                            check=True,
-                        ).stdout.strip()
-                        if recovered_boot:
-                            clean_boot_id = recovered_boot
-                            print(
-                                "ADDRESS_DISCOVERY_RECOVERED "
-                                f"boot_id={recovered_boot}",
-                                flush=True,
-                            )
-                            if self.target.address_discovery_reboot_on_failure:
-                                print(
-                                    "ADDRESS_DISCOVERY_REBOOT "
-                                    "reason=unusable-capture",
-                                    flush=True,
-                                )
-                                _, clean_boot_id = self.reboot()
-                    except ProvisionError as reconnect_error:
-                        print(
-                            "ADDRESS_DISCOVERY_RECONNECT_FAILED "
-                            f"error={reconnect_error}",
-                            flush=True,
-                        )
-                    continue
-                print(
-                    f"RUNTIME_ADDRESSES attempt={attempt} boot_id={boot_id} "
-                    f"kaslr={base:#x} memstart={memstart:#x}",
-                    flush=True,
-                )
-                exploit_ok = self.exploit(base, memstart, attempt)
-                post_attempt_boot = self.connect_after_reboot(boot_id)
-                if not exploit_ok:
-                    clean_boot_id = post_attempt_boot
-                    continue
-                if use_exploit_sentinel:
-                    self.uninstall_exploit_sentinel()
-                    sentinel_removed = True
-                if self.shizuku:
-                    self.finalize_buffered_shizuku_key()
-                if self.needs_uid1000_payload():
-                    self.finalize_buffered_uid1000_markers()
-                if (
-                    self.system_theme_control is not None
-                    and not self.system_theme_control_already_configured
-                ):
-                    self.apply_system_theme_request()
-                if (
-                    self.uid1000_runtime_package_installed
-                    and not (
-                        self.restore_camera_light
-                        or self.restore_presence_fps
-                        or self.restore_presence_profile
-                    )
-                ):
-                    self.uid1000_runtime_package_installed = False
-                    print("UID1000_RUNTIME_APK_RETAIN package=installed")
-                if self.enable_updates:
-                    self.enable_ota_packages()
-                if self.remove_shizuku:
-                    self.uninstall_shizuku_payload()
-                if self.presence_fps_action_requested():
-                    self.uninstall_presence_helper()
-                if self.kiosk_home:
-                    self.ensure_kiosk_home()
-                if self.restore_kiosk_home:
-                    self.configure_kiosk_home(enabled=False)
-                if (
-                    self.restore_camera_light
-                    or self.restore_presence_fps
-                    or self.restore_presence_profile
-                ):
-                    self.restore_uid1000_package_state_if_unused()
-                self.verify_across_two_reboots(first_boot=post_attempt_boot)
-                self.report_deferred_failures()
-                return
-        finally:
-            if self.exploit_users_created:
-                self.cleanup_exploit_users(best_effort=True)
-            if use_exploit_sentinel and not sentinel_removed:
-                self.uninstall_exploit_sentinel(best_effort=True)
-            if self.uid1000_runtime_package_installed:
-                self.uninstall_uid1000_runtime_payload(best_effort=True)
-        raise ProvisionError(f"provisioning failed after {self.attempts} attempts")
+        self.run_standard_install(use_exploit_sentinel)
 
 
 def android_build_environment(
