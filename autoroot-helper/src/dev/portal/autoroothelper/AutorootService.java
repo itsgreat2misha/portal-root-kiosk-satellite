@@ -147,14 +147,16 @@ public final class AutorootService extends Service {
         // the host provisioner's per-attempt adb shell and as the
         // long discovery calls above. run.sh redirects the exploit
         // output to attempt.log itself and writes the result file
-        // before it returns. The 900 s timeout sits above the native
+        // before it returns. The 600 s timeout sits above the native
         // run's long pole (the socket-watch phase alone waited ~305 s
-        // in the first landed attempt, which crossed a 420 s timeout
-        // just before the win); a genuinely stuck attempt is still
-        // bounded by the kernel panic its damaged lock causes.
+        // in the first landed attempt, and that win concluded by
+        // ~500 s); a hung attempt - one ran past 900 s with no
+        // verdict - is cut at 600 s instead of eating the session,
+        // and the kernel panic its damaged lock causes bounds it
+        // independently.
         try {
             shell("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
-                    900000);
+                    600000);
         } catch (Exception launchError) {
             Log.w(TAG, "attempt runner error", launchError);
             logFile("attempt runner error " + launchError);
