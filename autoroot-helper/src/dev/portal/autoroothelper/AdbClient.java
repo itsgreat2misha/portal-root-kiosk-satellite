@@ -44,12 +44,16 @@ final class AdbClient implements AutoCloseable {
     private final PrivateKey privateKey;
 
     AdbClient(File keyDirectory) throws Exception {
+        this(keyDirectory, 15000);
+    }
+
+    AdbClient(File keyDirectory, int soTimeoutMs) throws Exception {
         privateKey = readPrivateKey(new File(keyDirectory, "adbkey"));
         socket = new Socket();
         socket.connect(new InetSocketAddress(
                 InetAddress.getByName("127.0.0.1"), 5555), 5000);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(15000);
+        socket.setSoTimeout(soTimeoutMs);
         input = new DataInputStream(socket.getInputStream());
         output = new DataOutputStream(socket.getOutputStream());
     }
