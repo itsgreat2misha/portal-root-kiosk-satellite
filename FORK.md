@@ -131,3 +131,32 @@ and 3) and one capped at 0/8, after which Run Now recovered on
 attempt 3 of a fresh session. A timeout-cut attempt can still panic
 the device a minute or so later from the lock damage; the session
 machinery absorbs that as just another failed attempt.
+
+## 9. Helper 1.2: Stop is disable + reboot (corrects section 8's Cancel)
+
+Section 8's "Cancel (this boot)" was replaced the same day. The in-place
+cancel is only safe during discovery: once a race has run, the damaged
+proc_uid lock stays damaged until a reboot (only a win repairs it), so
+stopping in place left the user sitting on exactly the unstable state
+the UI warns about. The delayed panic after the capped session's final
+attempt (section 8) is that failure mode observed live.
+
+Helper 1.2 (versionCode 3):
+
+- The button is now "Stop autoroot & reboot". It kills any in-flight
+  attempt (same socket-close mechanism), sets the disable flag, and
+  reboots immediately. Disable toggled mid-session does the same;
+  toggled while idle it just sets the flag. The cancelled_boot state
+  and the CANCELLED phase are gone; the terminal phase is STOPPED.
+
+Live test (library Portal, 2026-11-04): a real UI tap ~3 s into
+attempt 1's race ran the full sequence (runner killed, flag set,
+"stop from UI: disabled, rebooting" logged) -- but the reboot itself
+wedged in the race's hot phase and the device hung until a smart-plug
+power cycle ~6 minutes later. The post-cycle boot came up disabled
+with zero attempts: the intended end state, reached via the power
+backstop. Lesson: no userspace stop can make a mid-race halt fully
+graceful -- the kernel state is the hazard, not the sequencing -- and
+a power cycle is the documented recovery, after which the device is
+guaranteed clean and quiet. Re-enable + Run Now then landed attempt 1
+of 8, leaving the device rooted with autoroot enabled.
