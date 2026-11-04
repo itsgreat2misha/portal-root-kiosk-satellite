@@ -322,6 +322,7 @@ class SystemThemeControlCliTest(unittest.TestCase):
                 build_account=False,
                 build_components=False,
                 build_shizuku=False,
+                build_autoroot=False,
                 build_presence=False,
                 build_uid1000=True,
                 build_sentinel=False,
@@ -685,6 +686,10 @@ class ShizukuCliTest(unittest.TestCase):
             )
             with (
                 mock.patch.object(provisioner, "connect"),
+                mock.patch(
+                    "provision_portal.android_build_environment",
+                    return_value={},
+                ),
                 mock.patch.object(provisioner, "verify_target"),
                 mock.patch.object(
                     provisioner,
