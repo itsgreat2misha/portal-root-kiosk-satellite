@@ -28,7 +28,7 @@ public final class AutorootActivity extends Activity {
 
     private TextView statusView;
     private TextView detailView;
-    private Button cancelButton;
+    private Button stopButton;
     private Button disableButton;
     private Button runNowButton;
     private Handler handler;
@@ -73,11 +73,11 @@ public final class AutorootActivity extends Activity {
         detailView.setPadding(0, pad / 2, 0, pad);
         root.addView(detailView);
 
-        cancelButton = new Button(this);
-        cancelButton.setText("Cancel (this boot)");
-        cancelButton.setOnClickListener(v -> sendAction(
-                AutorootService.ACTION_CANCEL_BOOT));
-        root.addView(cancelButton);
+        stopButton = new Button(this);
+        stopButton.setText("Stop autoroot & reboot");
+        stopButton.setOnClickListener(v -> sendAction(
+                AutorootService.ACTION_STOP_REBOOT));
+        root.addView(stopButton);
 
         disableButton = new Button(this);
         disableButton.setOnClickListener(v -> {
@@ -156,8 +156,8 @@ public final class AutorootActivity extends Activity {
             case "DISABLED":
                 status = "Autoroot is disabled";
                 break;
-            case "CANCELLED":
-                status = "Autoroot cancelled for this boot";
+            case "STOPPED":
+                status = "Autoroot stopped - rebooting";
                 break;
             case "FAILED":
                 status = "Autoroot attempt failed";
@@ -171,13 +171,13 @@ public final class AutorootActivity extends Activity {
                 ? "Please do not use the device yet - it may reboot "
                         + "without warning while an attempt runs.\n" + detail
                 : detail);
-        cancelButton.setEnabled(running);
+        stopButton.setEnabled(running);
         disableButton.setText(disabled ? "Enable autoroot" : "Disable autoroot");
         runNowButton.setEnabled(!running && !disabled);
 
         if (autoShown && !running && !finishScheduled
                 && ("DONE".equals(phase) || "CAPPED".equals(phase)
-                        || "CANCELLED".equals(phase))) {
+                        || "STOPPED".equals(phase))) {
             finishScheduled = true;
             handler.postDelayed(this::finish, 4000);
         }
