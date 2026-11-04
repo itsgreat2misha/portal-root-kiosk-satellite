@@ -160,3 +160,51 @@ graceful -- the kernel state is the hazard, not the sequencing -- and
 a power cycle is the documented recovery, after which the device is
 guaranteed clean and quiet. Re-enable + Run Now then landed attempt 1
 of 8, leaving the device rooted with autoroot enabled.
+## 10. Daemon lifecycle: a bootstrap bridge, stopped after the handoff (2026-11-04)
+
+Owner's question: with Shizuku running in root mode, apps get their root
+interface from Shizuku itself - so does the custom-payload daemon need to
+exist at all? Answer: only for the handoff. Something running as uid 0 has
+to start `shizuku_server` as root, on the provisioning boot (the host
+provisioner's post-payload steps) and on every autoroot boot (the helper).
+That is the daemon's whole job. Once `shizuku_server` is verified as
+uid 0, the daemon has no remaining consumer, and leaving an
+unauthenticated root EXEC listener on loopback up for the rest of the
+boot is pure exposure. Helper 1.3 and the provisioner now both stop it
+at exactly that point:
+
+- Provisioner (`apply_post_payload_root_steps`): after root-mode Shizuku
+  is verified and autoroot staging (if any) has completed, it sends the
+  daemon the `STOP` verb and prints `PAYLOAD_DAEMON_STOPPED
+  reason=shizuku-root-ok`; a failed stop prints `PAYLOAD_DAEMON_STOP_FAILED`
+  and does not fail the run. The stop happens only when root-mode Shizuku
+  was requested and verified - with `--skip-shizuku-root` or without
+  `--shizuku`, the daemon is the run's root channel and stays up.
+- Helper 1.3 (versionCode 4): `ensureShizukuRoot()` now reports success;
+  on both the win path and the daemon-already-up path the helper sends
+  `STOP` immediately after a verified handoff (`daemon stopped after
+  shizuku handoff` in service.log). If the handoff fails, the daemon
+  stays up - it is the only root channel left for a retry.
+- The helper's boot check is now Shizuku-first: if `shizuku_server`
+  already runs as uid 0, the boot is done with no daemon involvement
+  (`shizuku already root boot=<id>`). The daemon-up check remains as the
+  mid-handoff recovery path (provisioning boot, or a session interrupted
+  between the win and the handoff).
+
+Side effect: the unexplained daemon death on the basement-couchassistant
+provisioning boot (section 7 era; still unexplained under the old code)
+becomes moot - under this lifecycle a daemon that exits after its
+handoff is expected, by design. The couchassistant still runs helper 1.2
+until its next bootstrap run; its on-device session continues under the
+old rules meanwhile.
+
+Live validation (library Portal+, 2026-11-04, helper 1.3 installed in
+place over 1.2): reboot -> session attempts 1-3 missed (attempt 3 fast),
+attempt 4 won; the win's foreground call resolved at the 600 s timeout
+with the daemon already serving; 6 s later `shizuku root ok pid=13457`,
+and in the same second `daemon stopped after shizuku handoff`.
+Post-state verified from the host: daemon port closed, `shizuku_server`
+uid 0, `done_boot` = the win boot. A manual service re-trigger then took
+the new fast path with the daemon down (`shizuku already root`), leaving
+attempts and done_boot untouched. Unit suite: 86 green (6 new: STOP
+protocol + post-payload stop gating).
