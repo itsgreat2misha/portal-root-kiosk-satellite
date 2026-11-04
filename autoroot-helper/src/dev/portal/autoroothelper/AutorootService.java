@@ -98,6 +98,19 @@ public final class AutorootService extends Service {
         long now = System.currentTimeMillis() / 1000;
         long sessionStart = parseLong(state.get("session_start"), 0);
         int attempts = parseInt(state.get("attempts"), 0);
+        String doneBoot = state.get("done_boot");
+        if (doneBoot != null && !doneBoot.isEmpty() && !doneBoot.equals(bootId)) {
+            // A previous boot completed autoroot (done_boot set): that
+            // session is over, so this boot starts a fresh session with
+            // a full attempt budget. Without this, two reboots inside
+            // one session window leave the second boot capped out by
+            // the first boot's spent attempts (found live 2026-11-04:
+            // the recovery session landed on attempt 4 of 4, leaving
+            // attempts=4 on disk for the next boot).
+            sessionStart = now;
+            attempts = 0;
+            state.remove("done_boot");
+        }
         if (sessionStart == 0 || now - sessionStart > sessionWindowSec) {
             sessionStart = now;
             attempts = 0;
@@ -134,10 +147,14 @@ public final class AutorootService extends Service {
         // the host provisioner's per-attempt adb shell and as the
         // long discovery calls above. run.sh redirects the exploit
         // output to attempt.log itself and writes the result file
-        // before it returns.
+        // before it returns. The 900 s timeout sits above the native
+        // run's long pole (the socket-watch phase alone waited ~305 s
+        // in the first landed attempt, which crossed a 420 s timeout
+        // just before the win); a genuinely stuck attempt is still
+        // bounded by the kernel panic its damaged lock causes.
         try {
             shell("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
-                    420000);
+                    900000);
         } catch (Exception launchError) {
             Log.w(TAG, "attempt runner error", launchError);
             logFile("attempt runner error " + launchError);
