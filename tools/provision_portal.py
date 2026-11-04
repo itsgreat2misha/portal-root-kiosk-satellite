@@ -351,6 +351,11 @@ class PortalProvisioner:
         self.restore_app_verifier = restore_app_verifier
         self.shizuku = shizuku
         self.remove_shizuku = remove_shizuku
+        # True while apply_custom_payload() runs its attempt loop (and
+        # the post-payload steps it invokes). In that phase the exploit
+        # environment must NOT carry the Shizuku key-authorization
+        # action; see build_exploit_environment().
+        self._in_custom_payload_phase = False
         self.disable_camera_light = disable_camera_light
         self.restore_camera_light = restore_camera_light
         self.system_theme_control = system_theme_control
@@ -4613,7 +4618,16 @@ class PortalProvisioner:
                 environment["GHOSTLOCK_META_ACCOUNT_PACKAGE_UID"] = (
                     package_uid_match.group(1)
                 )
-        if self.shizuku:
+        if self.shizuku and not self._in_custom_payload_phase:
+            # The key-authorization action belongs to the dedicated
+            # Shizuku step, which runs before the custom-payload phase
+            # and already authorized the helper key. Carrying it into
+            # payload attempts makes the native post-root sequence run
+            # it again in a phase where the helper's loopback ADB
+            # endpoint is not prepared: it fails with ECONNREFUSED
+            # (step 20, errno 111) AFTER the payload has started, the
+            # attempt verdict flips to WATCH_CFI_OK=0, and a won race
+            # is discarded as a miss (bisect attempt 5, 2026-11-03).
             environment["GHOSTLOCK_SHIZUKU_AUTHORIZE_KEY"] = "1"
         if self.remove_shizuku:
             environment["GHOSTLOCK_SHIZUKU_REMOVE_KEY"] = "1"
@@ -5070,55 +5084,66 @@ class PortalProvisioner:
                 f"custom payload not found: {self.custom_payload}"
             )
         self.stage()
-        clean_boot_id: str | None = None
-        for attempt in range(1, self.attempts + 1):
-            if clean_boot_id is None:
+        # From here through the post-payload root steps, exploit
+        # environments are built without the Shizuku key-authorization
+        # action (see build_exploit_environment). The autoroot staging
+        # in apply_post_payload_root_steps() renders its frozen
+        # on-device environments through the same builder, so they
+        # inherit the suppression: the helper key is already
+        # authorized by then, on host and on device alike.
+        self._in_custom_payload_phase = True
+        try:
+            clean_boot_id: str | None = None
+            for attempt in range(1, self.attempts + 1):
+                if clean_boot_id is None:
+                    print(
+                        f"CUSTOM_PAYLOAD_ATTEMPT={attempt} preparing clean boot",
+                        flush=True,
+                    )
+                    _, boot_id = self.reboot()
+                else:
+                    boot_id = clean_boot_id
+                    clean_boot_id = None
+                    print(
+                        f"CUSTOM_PAYLOAD_ATTEMPT={attempt} using post-attempt "
+                        f"clean boot boot_id={boot_id}",
+                        flush=True,
+                    )
+                if self.target.address_discovery_settle_seconds:
+                    time.sleep(self.target.address_discovery_settle_seconds)
+                try:
+                    base = self.kaslr_base(str(attempt))
+                    memstart = self.memstart(str(attempt))
+                except ProvisionError:
+                    continue
                 print(
-                    f"CUSTOM_PAYLOAD_ATTEMPT={attempt} preparing clean boot",
+                    f"RUNTIME_ADDRESSES attempt={attempt} boot_id={boot_id} "
+                    f"kaslr={base:#x} memstart={memstart:#x}",
                     flush=True,
                 )
-                _, boot_id = self.reboot()
-            else:
-                boot_id = clean_boot_id
-                clean_boot_id = None
+                if not self.exploit(
+                    base, memstart, attempt, skip_final_reboot=True
+                ):
+                    # A failed attempt reboots the device (see exploit());
+                    # wait for that clean boot and reuse it, exactly like
+                    # the install flow, instead of racing the reboot with
+                    # an immediate boot_id read.
+                    clean_boot_id = self.connect_after_reboot(boot_id)
+                    continue
+                self.verify_custom_payload()
+                self.apply_post_payload_root_steps()
+                self.write_state("complete")
                 print(
-                    f"CUSTOM_PAYLOAD_ATTEMPT={attempt} using post-attempt "
-                    f"clean boot boot_id={boot_id}",
+                    f"CUSTOM_PAYLOAD_OK payload={CUSTOM_PAYLOAD_DST_REMOTE} "
+                    f"port={CUSTOM_PAYLOAD_PORT} logs={self.log_dir}",
                     flush=True,
                 )
-            if self.target.address_discovery_settle_seconds:
-                time.sleep(self.target.address_discovery_settle_seconds)
-            try:
-                base = self.kaslr_base(str(attempt))
-                memstart = self.memstart(str(attempt))
-            except ProvisionError:
-                continue
-            print(
-                f"RUNTIME_ADDRESSES attempt={attempt} boot_id={boot_id} "
-                f"kaslr={base:#x} memstart={memstart:#x}",
-                flush=True,
+                return
+            raise ProvisionError(
+                f"custom payload failed after {self.attempts} attempts"
             )
-            if not self.exploit(
-                base, memstart, attempt, skip_final_reboot=True
-            ):
-                # A failed attempt reboots the device (see exploit());
-                # wait for that clean boot and reuse it, exactly like
-                # the install flow, instead of racing the reboot with
-                # an immediate boot_id read.
-                clean_boot_id = self.connect_after_reboot(boot_id)
-                continue
-            self.verify_custom_payload()
-            self.apply_post_payload_root_steps()
-            self.write_state("complete")
-            print(
-                f"CUSTOM_PAYLOAD_OK payload={CUSTOM_PAYLOAD_DST_REMOTE} "
-                f"port={CUSTOM_PAYLOAD_PORT} logs={self.log_dir}",
-                flush=True,
-            )
-            return
-        raise ProvisionError(
-            f"custom payload failed after {self.attempts} attempts"
-        )
+        finally:
+            self._in_custom_payload_phase = False
 
     def verify_custom_payload(self, wait_seconds: int = 30) -> None:
         """Require the started payload to answer ID as uid 0 on loopback."""
