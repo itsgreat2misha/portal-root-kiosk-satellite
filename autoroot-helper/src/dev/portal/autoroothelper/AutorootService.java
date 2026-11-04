@@ -23,12 +23,15 @@ import java.util.zip.ZipInputStream;
 /**
  * Boot trigger for the on-device autoroot runner.
  *
- * On BOOT_COMPLETED this service checks whether the root payload daemon
- * is already serving as uid 0 on 127.0.0.1:37373. If it is, it only
- * makes sure Shizuku was restarted in root mode. If it is not, it
- * performs the same discovery the host provisioner does (bugreport for
- * the memory start, staged simpleperf for the KASLR base), launches the
- * staged runner script detached, and waits for the daemon to answer.
+ * On BOOT_COMPLETED this service first checks whether Shizuku already
+ * serves as uid 0; if it does, the boot is done - the root daemon is a
+ * bootstrap bridge only and is stopped as soon as the Shizuku handoff
+ * completes. If the daemon is up but Shizuku is not root yet, the
+ * service finishes the handoff through the daemon and then stops it.
+ * Otherwise it performs the same discovery the host provisioner does
+ * (bugreport for the memory start, staged simpleperf for the KASLR
+ * base), launches the staged runner script, and waits for the daemon
+ * to answer.
  * Attempts are counted in a state file under /data/local/tmp so the
  * per-session cap survives the reboots a failed attempt can cause.
  */
@@ -133,10 +136,24 @@ public final class AutorootService extends Service {
             offsets[i] = Long.parseLong(offsetParts[i].trim().replace("0x", ""), 16);
         }
 
+        if (shizukuServingRoot()) {
+            logFile("shizuku already root boot=" + bootId);
+            publishStatus("DONE", lastAttempt, lastMax, "root active (shizuku)");
+            Map<String, String> state = readKeyValues(STATE);
+            state.put("done_boot", bootId);
+            writeState(state);
+            return;
+        }
         if (daemonServingRoot()) {
+            // Daemon up but Shizuku not root yet (the provisioning
+            // boot, or a session interrupted mid-handoff): finish the
+            // handoff through the daemon, then stop it - with Shizuku
+            // serving as root the daemon has no further job.
             logFile("daemon already up boot=" + bootId);
-            publishStatus("DONE", lastAttempt, lastMax, "daemon already up");
-            ensureShizukuRoot();
+            publishStatus("DONE", lastAttempt, lastMax, "root active");
+            if (ensureShizukuRoot()) {
+                stopDaemon();
+            }
             Map<String, String> state = readKeyValues(STATE);
             state.put("done_boot", bootId);
             writeState(state);
@@ -248,7 +265,9 @@ public final class AutorootService extends Service {
             Log.i(TAG, "daemon up after attempt " + attempts);
             logFile("daemon up attempt=" + attempts);
             publishStatus("DONE", attempts, maxAttempts, "root active");
-            ensureShizukuRoot();
+            if (ensureShizukuRoot()) {
+                stopDaemon();
+            }
             state.put("done_boot", bootId);
             writeState(state);
             return;
@@ -537,6 +556,32 @@ public final class AutorootService extends Service {
         }
     }
 
+    private boolean shizukuServingRoot() {
+        try {
+            String pid = shell("pidof shizuku_server").trim().split("\\s+")[0];
+            return !pid.isEmpty() && pid.matches("\\d+") && shizukuUid(pid) == 0;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * The daemon is a bootstrap bridge: it exists to carry root from
+     * the exploit's privileged window to the Shizuku server. Once
+     * Shizuku serves as uid 0 the bridge has no further job, and an
+     * unauthenticated root EXEC listener should not outlive it.
+     */
+    private void stopDaemon() {
+        try {
+            daemonRequest("STOP\n", 1);
+            Log.i(TAG, "root daemon stopped after shizuku handoff");
+            logFile("daemon stopped after shizuku handoff");
+        } catch (Exception error) {
+            Log.w(TAG, "daemon stop failed", error);
+            logFile("daemon stop failed " + error);
+        }
+    }
+
     private String daemonExec(String command) throws Exception {
         String response = daemonRequest("EXEC " + command + "\n", 64 * 1024);
         return response == null ? "" : response;
@@ -603,13 +648,13 @@ public final class AutorootService extends Service {
         return null;
     }
 
-    private void ensureShizukuRoot() {
+    private boolean ensureShizukuRoot() {
         try {
             String pid = shell("pidof shizuku_server").trim().split("\\s+")[0];
             if (!pid.isEmpty() && pid.matches("\\d+") && shizukuUid(pid) == 0) {
                 Log.i(TAG, "shizuku already root pid=" + pid);
                 logFile("shizuku already root pid=" + pid);
-                return;
+                return true;
             }
             String dump = shell("dumpsys package " + SHIZUKU_PACKAGE);
             String pmPath = shell("pm path " + SHIZUKU_PACKAGE);
@@ -617,7 +662,7 @@ public final class AutorootService extends Service {
             String starter = resolveShizukuStarter(dump);
             if (starter == null || !apkMatch.find()) {
                 Log.w(TAG, "could not resolve shizuku paths");
-                return;
+                return false;
             }
             // Kill any shell-mode server from THIS shell context
             // first: shell() runs as uid 2000, the same uid as the
@@ -648,7 +693,7 @@ public final class AutorootService extends Service {
                         && shizukuUid(newPid) == 0) {
                     Log.i(TAG, "shizuku root ok pid=" + newPid);
                     logFile("shizuku root ok pid=" + newPid);
-                    return;
+                    return true;
                 }
             }
             Log.w(TAG, "shizuku did not come up as uid 0");
@@ -656,6 +701,7 @@ public final class AutorootService extends Service {
         } catch (Exception error) {
             Log.w(TAG, "ensureShizukuRoot failed", error);
         }
+        return false;
     }
 
     private int shizukuUid(String pid) {
