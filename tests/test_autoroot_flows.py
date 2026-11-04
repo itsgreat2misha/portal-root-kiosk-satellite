@@ -120,7 +120,16 @@ class ExploitEnvironmentPhaseGateTest(unittest.TestCase):
     misses because an action ran in a phase where it could only fail)."""
 
     def build_env(self, provisioner, attempt: int = 1):
-        return provisioner.build_exploit_environment(0xFFFFFF8000000000, 0xFFFFFFC000000000, attempt)
+        # The builder finishes by removing the previous attempt's watch
+        # result file on the device; that adb call is not under test here.
+        with mock.patch.object(
+            provisioner,
+            "adb_run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ):
+            return provisioner.build_exploit_environment(
+                0xFFFFFF8000000000, 0xFFFFFFC000000000, attempt
+            )
 
     def test_authorize_key_present_outside_payload_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -295,7 +304,7 @@ class ShizukuRootStartTest(unittest.TestCase):
             command,
         )
         self.assertIn(
-            "--apk=/data/app/~~x/moe.shizuku.privileged.api-y/base.apk", command
+            "--apk='/data/app/~~x/moe.shizuku.privileged.api-y/base.apk'", command
         )
         # Regression (2026-11-03 Run 10): the kill must use pidof only.
         # "pkill -f shizuku_server" matches the EXEC shell's own command
