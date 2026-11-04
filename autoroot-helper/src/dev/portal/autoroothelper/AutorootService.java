@@ -124,18 +124,31 @@ public final class AutorootService extends Service {
         logFile("discovered kaslr=" + kaslr + " memstart=" + memstart);
 
         shell("rm -f " + RESULT);
-        shell("nohup sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts
-                + " >/dev/null 2>&1 & echo launched");
+        // Run the attempt in the FOREGROUND of a long-timeout shell
+        // call. The detached nohup launch did not survive: across the
+        // first live sessions (2026-11-04) no service-launched attempt
+        // ever wrote its banner or result file, and no runner process
+        // was alive minutes into the poll window - the runner dies
+        // with its launching shell session. A foreground call keeps
+        // the session open for the whole attempt, the same shape as
+        // the host provisioner's per-attempt adb shell and as the
+        // long discovery calls above. run.sh redirects the exploit
+        // output to attempt.log itself and writes the result file
+        // before it returns.
+        try {
+            shell("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
+                    420000);
+        } catch (Exception launchError) {
+            Log.w(TAG, "attempt runner error", launchError);
+            logFile("attempt runner error " + launchError);
+        }
         boolean up = false;
-        for (int waited = 0; waited < 300; waited += 5) {
-            Thread.sleep(5000);
+        for (int waited = 0; waited < 30; waited += 5) {
             if (daemonServingRoot()) {
                 up = true;
                 break;
             }
-            if (shell("test -f " + RESULT + " && cat " + RESULT).contains("RESULT=failed")) {
-                break;
-            }
+            Thread.sleep(5000);
         }
         if (up) {
             Log.i(TAG, "daemon up after attempt " + attempts);
