@@ -22,7 +22,7 @@ applies the features you select, then verifies them across two normal boots.
 Persistent features use focused configuration changes or small boot helpers.
 
 > [!NOTE]
-> This is not a persistent root exploit. It is a timed, surgical way to change otherwise inaccessible system settings and make the most of a Portal with Kiosk Satellite. All features applied by the provisioner are persistent and survive reboots.
+> This is not a persistent root exploit. It is a timed, surgical way to change otherwise inaccessible system settings and make the most of a Portal with Kiosk Satellite. All features applied by the provisioner are persistent and survive reboots — but root access itself does not, unless you deliberately enable one of the two opt-in root modes below: a root daemon that runs for the rest of the boot (`--custom-payload`), or automatic re-rooting after every reboot (`--autoroot`).
 
 > [!WARNING]
 > I have tried to make the provisioner as safe and guarded as possible, but
@@ -54,6 +54,9 @@ Persistent features use focused configuration changes or small boot helpers.
 | [Third-party app updates](#allow-kiosk-satellite-and-third-party-app-updates) | Lets correctly signed Kiosk Satellite and other non-Meta APKs update normally. |
 | [Runtime system theme control](#control-the-runtime-system-theme) | Switches locked Android 10 Portals between light and dark mode through a constrained UID-1000 worker. |
 | [Automatic Shizuku startup](#install-shizuku-with-automatic-startup) | Starts Shizuku locally after every boot for apps that need ADB-shell privileges. |
+| [Per-boot root daemon](#per-boot-root-daemon) | Leaves a small root command daemon running on loopback for the rest of the boot, after repairing the kernel lock state the exploit leaves behind. |
+| [Root-mode Shizuku](#run-shizuku-as-root) | Restarts Shizuku as UID 0 through the root daemon instead of as the shell user. |
+| [Automatic re-rooting](#automatic-re-rooting-with-autoroot) | Re-runs the exploit automatically after every reboot and restores the root daemon and root-mode Shizuku with no host involved. |
 | [Read-only status](#status-report) | Reports the device, provisioning and runtime state without exploiting or rebooting. |
 | [Dry-run planning](#dry-run-planning) | Shows required tools, actions and reboots before changing the Portal. |
 | [Private backup bundles](#backup-bundles) | Saves diagnostics and reversible settings in a private, checksummed archive. |
@@ -215,6 +218,8 @@ Add only the extra features you want:
 - `--dhcp-dns` or `--privacy-dns HOSTNAME` to change DNS behavior
 - `--system-theme-control light|dark` to enable and set live theme control
 - `--shizuku` to install Shizuku with automatic startup
+- `--custom-payload` (with `--shizuku`) to leave a per-boot root daemon running and restart Shizuku as root; build the daemon first with `make -C root-daemon`
+- `--autoroot` (with `--shizuku` and `--custom-payload`) to re-establish root automatically after every reboot
 
 The Portal reboots several times and ends with `PROVISION_OK` plus two
 different verification boot IDs. If you do not want the complete profile, use
@@ -1224,6 +1229,102 @@ python3 tools/provision_portal.py \
 
 </details>
 
+<a id="per-boot-root-daemon"></a>
+<details>
+<summary><strong>Optional add-on:</strong> Per-boot root daemon (custom payload)</summary>
+<p></p>
+
+```sh
+make -C root-daemon
+python3 tools/provision_portal.py \
+  --serial "$PORTAL_IP:5555" --shizuku \
+  --custom-payload root-daemon/portal-root-daemon
+```
+
+Instead of ending the privileged window with a reboot, this mode starts a
+small root daemon as a UID-0 delegated child of the exploit process, after
+repairing the kernel lock state the race leaves behind (see
+[How the root exploit works](#how-the-root-exploit-works)). The daemon
+answers a line-based protocol on `127.0.0.1:37373` — `ID`, `EXEC <command>`
+and `STOP`; see `root-daemon/README.md` for the details. It is per-boot
+only: it dies with the boot and is not restarted unless the provisioner
+runs again or autoroot is enabled.
+
+> [!WARNING]
+> The daemon has **no authentication**. Any app on the Portal that can open
+> a loopback TCP connection can run commands as UID 0. It binds loopback
+> only and lives for one boot, but enable this mode only on devices where
+> that trade-off is acceptable.
+
+The payload binary is operator-supplied: `--custom-payload` accepts any
+executable, and `root-daemon/` builds the reference one. Post-payload
+steps that need the daemon (root-mode Shizuku, autoroot staging) run only
+after it answers an `ID` check as UID 0.
+
+</details>
+
+<a id="run-shizuku-as-root"></a>
+<details>
+<summary><strong>Optional add-on:</strong> Run Shizuku as root</summary>
+<p></p>
+
+With `--shizuku` and a running root daemon, the provisioner restarts
+Shizuku as UID 0: it stops the shell instance from the shell context (the
+daemon's SELinux domain cannot signal it), re-runs Shizuku's official
+starter through the daemon, and requires the new `shizuku_server` process
+to report UID 0 in its `/proc` status before printing `SHIZUKU_ROOT_OK`.
+Apps using Shizuku then get root-level rather than shell-level access.
+
+```sh
+python3 tools/provision_portal.py \
+  --serial "$PORTAL_IP:5555" --shizuku \
+  --custom-payload root-daemon/portal-root-daemon \
+  --skip-shizuku-root
+```
+
+Add `--skip-shizuku-root` to keep Shizuku at its normal shell privilege
+level while still using the daemon for other steps.
+
+</details>
+
+<a id="automatic-re-rooting-with-autoroot"></a>
+<details>
+<summary><strong>Optional add-on:</strong> Automatic re-rooting after reboot (autoroot)</summary>
+<p></p>
+
+```sh
+python3 tools/provision_portal.py \
+  --serial "$PORTAL_IP:5555" --shizuku \
+  --custom-payload root-daemon/portal-root-daemon --autoroot
+```
+
+`--autoroot` stages an on-device runner and a boot helper app so a reboot
+needs no host. After every boot the helper checks whether the root daemon
+is answering; if it is not, the helper redoes the per-boot address
+discovery on the device (bugreport plus the staged `simpleperf`), then
+re-runs the exploit with the same environment the host provisioner would
+generate, in both attempt geometries. A session allows up to 8 attempts in
+a 60-minute window; a failed attempt reboots the Portal for a clean retry,
+and a session that exhausts its budget retries after the window. On
+success the helper restarts Shizuku as root and records the boot as done.
+
+The helper app shows the live session state and provides three controls:
+**Stop autoroot & reboot** (stops any in-flight attempt, disables autoroot
+and reboots to a clean state), **Disable/Enable autoroot**, and **Run
+now** (starts a fresh session immediately). The exploit sentinel app stays
+installed because every attempt needs it. The Shizuku boot helper is
+removed at staging time: the autoroot helper holds its own copy of the
+already-authorized ADB keypair, so the deployed set is the sentinel,
+Shizuku and the autoroot helper.
+
+Autoroot attempts carry the same race risks as host-driven attempts,
+without anyone watching: a failed attempt reboots the Portal, and an
+attempt can occasionally leave it unresponsive until it is power-cycled.
+This mode is validated end-to-end on the Portal+ (`aloha`) build
+`1041515800015050`; other supported models have not been validated for it.
+
+</details>
+
 ## Inspection, backups and recovery
 
 ### Status report
@@ -1298,10 +1399,20 @@ reboots into a clean state, derives randomized kernel addresses and starts the
 exploit through a staged native library. Temporary kernel read/write access
 gives only that process the credentials needed to perform the selected work.
 
-The device then reboots normally with SELinux enforcing. The exploit does not
-install `su`, a root shell or a root daemon. Features that must survive reboot
-use narrow configuration changes or dedicated helpers with only the privileges
-they need. The provisioner verifies the requested state on two normal boots.
+The device then reboots normally with SELinux enforcing. In the default flow
+the exploit does not install `su`, a root shell or a root daemon. Features
+that must survive reboot use narrow configuration changes or dedicated
+helpers with only the privileges they need. The provisioner verifies the
+requested state on two normal boots.
+
+The `--custom-payload` mode is the deliberate exception: it starts the root
+daemon inside the privileged window instead of returning straight to a
+normal boot. Because the race leaves the kernel's `proc_uid` lock waiter
+tree damaged — the reason the stock flow reboots immediately — the payload
+path first repairs that tree to its canonical empty state. The repair is
+pattern-gated: it writes only when the current state matches the exact
+expected damage shape, and it verifies the result by read-back. On any
+mismatch it writes nothing and the attempt counts as a miss.
 
 Kernel exploitation is race-sensitive, so a missed attempt can reboot or
 briefly freeze the Portal. The provisioner retries from a clean boot. Exact
