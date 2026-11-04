@@ -4631,7 +4631,14 @@ class PortalProvisioner:
             environment["GHOSTLOCK_SHIZUKU_AUTHORIZE_KEY"] = "1"
         if self.remove_shizuku:
             environment["GHOSTLOCK_SHIZUKU_REMOVE_KEY"] = "1"
-        if self.custom_payload is not None:
+        if self.custom_payload is not None and self._in_custom_payload_phase:
+            # The payload action belongs only to the custom-payload
+            # phase. In the combined flow the standard install runs
+            # first with the payload already configured; ungated, every
+            # install attempt also carried the payload action, whose
+            # post-root chain fails at step 20 in that context, so won
+            # install races were discarded as misses (Run 12 burned
+            # all 24 attempts this way, 2026-11-04).
             environment.update(
                 {
                     "GHOSTLOCK_CUSTOM_PAYLOAD": "1",
