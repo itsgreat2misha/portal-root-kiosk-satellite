@@ -531,3 +531,84 @@ class VerifyBootsTests(unittest.TestCase):
             sys, 'argv', ['provision_portal.py', '--verify-boots', '1']
         ):
             self.assertEqual(parse_args().verify_boots, 1)
+
+
+class DaemonStopTest(unittest.TestCase):
+    def run_stop(self, chunks: list[bytes]) -> FakeSocket:
+        fake = FakeSocket(chunks)
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                '192.0.2.1:5555', 1, pathlib.Path(temporary)
+            )
+            with mock.patch(
+                'provision_portal.socket.create_connection', return_value=fake
+            ):
+                provisioner.stop_root_daemon()
+        return fake
+
+    def test_stop_sends_stop_and_accepts_bye(self) -> None:
+        fake = self.run_stop([b'BYE\n'])
+        self.assertEqual(fake.sent, b'STOP\n')
+
+    def test_stop_rejects_wrong_responder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                '192.0.2.1:5555', 1, pathlib.Path(temporary)
+            )
+            fake = FakeSocket([b'ERR unknown-command\nEND\n'])
+            with mock.patch(
+                'provision_portal.socket.create_connection', return_value=fake
+            ):
+                with self.assertRaises(ProvisionError):
+                    provisioner.stop_root_daemon()
+
+
+class PostPayloadDaemonStopTest(unittest.TestCase):
+    def run_steps(self, *, shizuku, skip, autoroot, start_raises=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                '192.0.2.1:5555', 1, pathlib.Path(temporary)
+            )
+        provisioner.shizuku = shizuku
+        provisioner.skip_shizuku_root = skip
+        provisioner.autoroot = autoroot
+        calls: list[str] = []
+
+        def start() -> None:
+            calls.append('start')
+            if start_raises:
+                raise ProvisionError('boom')
+
+        provisioner.start_shizuku_as_root = start
+        provisioner.stage_autoroot_payload = lambda: calls.append('stage')
+        provisioner.stop_root_daemon = lambda: calls.append('stop')
+        return provisioner, calls
+
+    def test_stop_after_handoff_and_staging(self) -> None:
+        provisioner, calls = self.run_steps(
+            shizuku=True, skip=False, autoroot=True
+        )
+        provisioner.apply_post_payload_root_steps()
+        self.assertEqual(calls, ['start', 'stage', 'stop'])
+
+    def test_no_stop_when_shizuku_root_skipped(self) -> None:
+        provisioner, calls = self.run_steps(
+            shizuku=True, skip=True, autoroot=True
+        )
+        provisioner.apply_post_payload_root_steps()
+        self.assertEqual(calls, ['stage'])
+
+    def test_no_stop_without_shizuku(self) -> None:
+        provisioner, calls = self.run_steps(
+            shizuku=False, skip=False, autoroot=False
+        )
+        provisioner.apply_post_payload_root_steps()
+        self.assertEqual(calls, [])
+
+    def test_no_stop_when_handoff_fails(self) -> None:
+        provisioner, calls = self.run_steps(
+            shizuku=True, skip=False, autoroot=False, start_raises=True
+        )
+        with self.assertRaises(ProvisionError):
+            provisioner.apply_post_payload_root_steps()
+        self.assertEqual(calls, ['start'])

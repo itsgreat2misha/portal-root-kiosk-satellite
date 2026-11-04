@@ -5221,12 +5221,61 @@ class PortalProvisioner:
             output_lines.append(line)
         return exit_code, "\n".join(output_lines)
 
+    def stop_root_daemon(self) -> None:
+        """Ask the custom payload daemon to exit (the STOP verb).
+
+        The daemon answers "BYE" and closes as it exits; there is no
+        END line for this verb. Anything else means the listener on
+        CUSTOM_PAYLOAD_PORT is not our daemon.
+        """
+        with socket.create_connection(
+            ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=10
+        ) as sock:
+            sock.settimeout(10)
+            sock.sendall(b"STOP\n")
+            data = b""
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except (ConnectionResetError, socket.timeout):
+                pass
+        if b"BYE" not in data:
+            raise ProvisionError(
+                "root daemon did not acknowledge STOP: "
+                f"{data.decode(errors='replace')!r}"
+            )
+
     def apply_post_payload_root_steps(self) -> None:
         """Extra root-backed steps that need the payload serving first."""
+        shizuku_root_ok = False
         if self.shizuku and not self.skip_shizuku_root:
             self.start_shizuku_as_root()
+            shizuku_root_ok = True
         if self.autoroot:
             self.stage_autoroot_payload()
+        if shizuku_root_ok:
+            # The daemon was the bridge to root-mode Shizuku. With the
+            # server verified as uid 0 it has no further job this boot,
+            # and an unauthenticated root EXEC listener should not
+            # outlive the handoff. Autoroot boots re-create the daemon
+            # for their own handoff and stop it the same way. When
+            # root-mode Shizuku is not in play (--skip-shizuku-root or
+            # no --shizuku) the daemon is the run's root channel and
+            # stays up.
+            try:
+                self.stop_root_daemon()
+                print(
+                    "PAYLOAD_DAEMON_STOPPED reason=shizuku-root-ok",
+                    flush=True,
+                )
+            except (OSError, ProvisionError) as exc:
+                print(
+                    f"PAYLOAD_DAEMON_STOP_FAILED error={exc}",
+                    flush=True,
+                )
 
     def start_shizuku_as_root(self) -> None:
         """Restart shizuku_server as uid 0 through the root payload.
