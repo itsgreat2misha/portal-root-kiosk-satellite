@@ -307,6 +307,41 @@ public final class AutorootService extends Service {
         }
     }
 
+    private static String abiDirFor(String abi) {
+        switch (abi) {
+            case "arm64-v8a":
+                return "arm64";
+            case "armeabi-v7a":
+            case "armeabi":
+                return "arm";
+            case "x86_64":
+                return "x86_64";
+            case "x86":
+                return "x86";
+            default:
+                return null;
+        }
+    }
+
+    private static String resolveShizukuStarter(String dump) {
+        Matcher nativeMatch = Pattern.compile("nativeLibraryDir=(\\S+)").matcher(dump);
+        if (nativeMatch.find()) {
+            return nativeMatch.group(1) + "/libshizuku.so";
+        }
+        // Android 9 package dumps carry only legacyNativeLibraryDir (the
+        // extraction root); the libraries live under its per-ABI
+        // subdirectory, e.g. lib/arm64/libshizuku.so.
+        Matcher legacyMatch = Pattern.compile("legacyNativeLibraryDir=(\\S+)").matcher(dump);
+        Matcher abiMatch = Pattern.compile("primaryCpuAbi=(\\S+)").matcher(dump);
+        if (legacyMatch.find() && abiMatch.find()) {
+            String abiDir = abiDirFor(abiMatch.group(1));
+            if (abiDir != null) {
+                return legacyMatch.group(1) + "/" + abiDir + "/libshizuku.so";
+            }
+        }
+        return null;
+    }
+
     private void ensureShizukuRoot() {
         try {
             String pid = shell("pidof shizuku_server").trim().split("\\s+")[0];
@@ -316,14 +351,13 @@ public final class AutorootService extends Service {
                 return;
             }
             String dump = shell("dumpsys package " + SHIZUKU_PACKAGE);
-            Matcher nativeMatch = Pattern.compile("nativeLibraryDir=(\\S+)").matcher(dump);
             String pmPath = shell("pm path " + SHIZUKU_PACKAGE);
             Matcher apkMatch = Pattern.compile("package:(\\S+)").matcher(pmPath);
-            if (!nativeMatch.find() || !apkMatch.find()) {
+            String starter = resolveShizukuStarter(dump);
+            if (starter == null || !apkMatch.find()) {
                 Log.w(TAG, "could not resolve shizuku paths");
                 return;
             }
-            String starter = nativeMatch.group(1) + "/libshizuku.so";
             String command = "pkill -f shizuku_server; sleep 1; "
                     + quote(starter) + " --apk=" + quote(apkMatch.group(1))
                     + "; sleep 1; pidof shizuku_server";
