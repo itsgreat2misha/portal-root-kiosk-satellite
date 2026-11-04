@@ -5461,6 +5461,14 @@ class PortalProvisioner:
                 timeout=5,
                 check=True,
             )
+        # A fresh provision starts a fresh autoroot session: drop any state
+        # an earlier staging left behind, so an exhausted attempt budget or
+        # a stale session window cannot block recovery after this run.
+        self.adb_run(
+            ["shell", "rm", "-f", f"{AUTOROOT_REMOTE_DIR}/state"],
+            timeout=5,
+            check=False,
+        )
         # Android keeps freshly installed packages in the stopped state,
         # which suppresses BOOT_COMPLETED delivery; launch the helper once
         # now (mirrors the shizuku helper activation in verify_shizuku) so
