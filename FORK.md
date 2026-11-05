@@ -208,3 +208,37 @@ uid 0, `done_boot` = the win boot. A manual service re-trigger then took
 the new fast path with the daemon down (`shizuku already root`), leaving
 attempts and done_boot untouched. Unit suite: 86 green (6 new: STOP
 protocol + post-payload stop gating).
+
+## 11. Planned: root stack consolidation (root adb, CLI streamlining, de-Kiosk)
+
+Upstream declined feature PRs (section: the maintainer is limiting the
+project to maintenance), so this fork is the release vehicle; once the
+work below is validated, it will likely move to a new repo under a new
+name. Full plan: maintained with the goal workspace
+(root-adb-plan.md); the decisions:
+
+- Autoroot stays intentionally opt-in (--autoroot). Lock repair is
+  not optional - it always runs in the payload path. Root adb is not
+  optional either: establishing root means adbd runs as uid 0 too,
+  matching Shizuku. Mechanism (to be spiked first on the library
+  unit): flip ro.debuggable in the shared property area from the
+  uid-0 daemon and restart adbd - per-boot, since the property area
+  is rebuilt every boot; RSA auth (ro.adb.secure=1) stays on.
+- Shizuku root stays optional and on by default (--skip-shizuku-root,
+  recorded per boot as SHIZUKU_ROOT=0 in autoroot.conf). Daemon stop
+  rule generalizes: it stops once every enabled promotion is
+  verified (Shizuku unless opted out, plus root adb); a failed
+  enabled promotion leaves it up as the fallback channel.
+- CLI: --autoroot will imply --custom-payload and --shizuku;
+  --custom-payload becomes an optional-value flag (bare = build/use
+  the in-repo daemon, path = override). After root adb lands, the
+  provisioner's post-handoff host steps move to plain root adb shell
+  and its daemon-protocol client is deleted.
+- Audio tuning (--audio) is opt-in only, default off, never bundled
+  into a profile - it serves voice flows, not root/debloat.
+- De-Kiosk (at the clean relaunch): the kiosk feature flags, the
+  kiosk profile bundle, the Kiosk framing in the README, and
+  "kiosk-satellite" in the name all go - this becomes a general
+  Portal root provisioner. One deliberate survivor: a credits line
+  in the README naming the original creator. The root stack itself
+  never referenced Kiosk and needs no changes for this.
