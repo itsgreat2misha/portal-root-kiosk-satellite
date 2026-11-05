@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from provision_portal import (  # noqa: E402
     ADB_AUTH_TIMEOUT_BACKUP_REMOTE,
     ADB_ENABLED_SETTING,
+    DEFAULT_CUSTOM_PAYLOAD_LOCAL,
     KIOSK_RELEASE_DOWNLOAD_PREFIX,
     MHA_AUDIO_VERIFIED_LOG,
     REMOTE_WIPE_COMPONENTS,
@@ -333,6 +334,87 @@ class SystemThemeControlCliTest(unittest.TestCase):
             ["make", "-B", "-C", str(ROOT / "uid1000-helper"), "all"],
             commands,
         )
+
+
+
+class CustomPayloadCliTest(unittest.TestCase):
+    def parse(self, argv):
+        with mock.patch.object(sys, "argv", ["provision_portal.py", *argv]):
+            return parse_args()
+
+    def test_bare_custom_payload_uses_the_in_repo_daemon_build(self) -> None:
+        arguments = self.parse(["--custom-payload"])
+
+        self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
+        self.assertEqual(
+            arguments.custom_payload, ROOT / "root-daemon" / "portal-root-daemon"
+        )
+        self.assertFalse(arguments.shizuku)
+        self.assertFalse(arguments.autoroot)
+
+    def test_bare_custom_payload_does_not_enable_default_audio(self) -> None:
+        arguments = self.parse(["--custom-payload"])
+
+        self.assertFalse(arguments.audio)
+
+    def test_explicit_custom_payload_path_is_an_override(self) -> None:
+        arguments = self.parse(["--custom-payload", "/tmp/other-daemon"])
+
+        self.assertEqual(arguments.custom_payload, pathlib.Path("/tmp/other-daemon"))
+
+    def test_autoroot_implies_shizuku_and_bare_custom_payload(self) -> None:
+        arguments = self.parse(["--autoroot"])
+
+        self.assertTrue(arguments.autoroot)
+        self.assertTrue(arguments.shizuku)
+        self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
+        self.assertFalse(arguments.audio)
+
+    def test_autoroot_keeps_an_explicit_custom_payload_override(self) -> None:
+        arguments = self.parse(["--autoroot", "--custom-payload", "/tmp/other"])
+
+        self.assertTrue(arguments.shizuku)
+        self.assertEqual(arguments.custom_payload, pathlib.Path("/tmp/other"))
+
+    def test_autoroot_implied_shizuku_satisfies_shizuku_apk(self) -> None:
+        arguments = self.parse(["--autoroot", "--shizuku-apk", "/tmp/shizuku.apk"])
+
+        self.assertTrue(arguments.shizuku)
+        self.assertEqual(arguments.shizuku_apk, pathlib.Path("/tmp/shizuku.apk"))
+
+    def test_autoroot_rejects_remove_shizuku(self) -> None:
+        with mock.patch.object(
+            sys, "argv", ["provision_portal.py", "--autoroot", "--remove-shizuku"]
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_daemon_build_command_is_included_only_when_requested(self) -> None:
+        target = TARGETS[0]
+        with (
+            mock.patch(
+                "provision_portal.android_build_environment", return_value={}
+            ),
+            mock.patch(
+                "provision_portal.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run,
+        ):
+            build(
+                target=target,
+                build_audio=False,
+                build_account=False,
+                build_components=False,
+                build_shizuku=False,
+                build_autoroot=False,
+                build_presence=False,
+                build_uid1000=False,
+                build_sentinel=False,
+                build_daemon=True,
+            )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["make", "-C", str(ROOT / "root-daemon")], commands)
 
 
 class AndroidBuildEnvironmentTest(unittest.TestCase):

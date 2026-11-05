@@ -33,7 +33,7 @@ points at this fork. All changes are in `tools/provision_portal.py`:
 
 ## 4. Custom payload + lock repair
 
-With --custom-payload <binary> the provisioner stages the binary at /data/local/tmp and starts it inside the exploit's privileged window (GHOSTLOCK_CUSTOM_PAYLOAD=1). The payload runs as uid 0 in the shell SELinux domain, which cannot create files anywhere (open(O_CREAT) fails with EACCES) - so the payload is executed in place from its staged path, and success is detected by its observable effect, never by files it writes. Marker: CUSTOM_PAYLOAD_OK.
+With --custom-payload [binary] the provisioner stages the binary at /data/local/tmp and starts it inside the exploit's privileged window (GHOSTLOCK_CUSTOM_PAYLOAD=1). The payload runs as uid 0 in the shell SELinux domain, which cannot create files anywhere (open(O_CREAT) fails with EACCES) - so the payload is executed in place from its staged path, and success is detected by its observable effect, never by files it writes. Marker: CUSTOM_PAYLOAD_OK.
 
 The exploit intentionally damages the proc_uid futex lock waiter tree; without repair the kernel panics 25-60 s after a successful landing. With PORTAL_LOCK_REPAIR=1 (default) the payload performs the solo-sentinel restore before returning: it verifies the exact waiter pattern, restores the sentinel node as tree root/leftmost, detaches the forged waiter, and only then clears the lock owner, with full read-back verification. Any mismatch aborts with PORTAL_LOCK_REPAIR_ABORT and writes nothing. Marker: PORTAL_LOCK_REPAIR_OK. A repaired boot reboots later only for normal reasons.
 
@@ -43,7 +43,7 @@ With --shizuku and a verified custom payload, after CUSTOM_PAYLOAD_OK the provis
 
 ## 6. On-device autoroot (--autoroot)
 
---autoroot makes a provisioned device self-sustaining: after one provisioning run, no host watcher is needed. Requires --shizuku and --custom-payload. After the payload and root-mode Shizuku verify, the provisioner stages the on-device helper and keeps the exploit sentinel installed. Marker: AUTOROOT_STAGED_OK.
+--autoroot makes a provisioned device self-sustaining: after one provisioning run, no host watcher is needed. It implies --shizuku and --custom-payload (see section 12). After the payload and root-mode Shizuku verify, the provisioner stages the on-device helper and keeps the exploit sentinel installed. Marker: AUTOROOT_STAGED_OK.
 
 Staged under /data/local/tmp/portal-autoroot/: the autoroot-helper app (dev.portal.autoroothelper), run.sh, per-parity environment files env-odd.sh and env-even.sh (per-boot addresses are discovered at runtime, never frozen into these files), autoroot.conf (attempt cap, session window), and a copy of the Shizuku helper's device ADB keypair so the helper can open a loopback ADB shell after boot. Staging refuses to proceed if a per-boot live-resolved value would be baked into the staged files.
 
@@ -242,3 +242,48 @@ name. Full plan: maintained with the goal workspace
   Portal root provisioner. One deliberate survivor: a credits line
   in the README naming the original creator. The root stack itself
   never referenced Kiosk and needs no changes for this.
+
+## 12. Adjusted plan: root adb removed, CLI streamlining (2026-11-05)
+
+Section 11's root-adb work is **removed from the plan entirely**
+(owner decision, 2026-11-05 — not deferred and not an
+operator-supplied step). Everything that depended on it is dropped
+or reverted:
+
+- **Goal state:** a provisioned Portal ends every boot with Shizuku
+  as uid 0 (unless opted out) and the unauthenticated root daemon
+  stopped. adbd stays shell (uid 2000) — accepted.
+- **Daemon stop rule:** the section 10 rule stands as-is — the
+  daemon stops once Shizuku root is verified. It does **not**
+  generalize to a second promotion, because there is none.
+- **Helper:** stays at 1.3 behavior. There is no 1.4 adbd work and
+  no adbd fast-path check.
+- **Daemon protocol client:** retained in the provisioner. It
+  remains the host's root channel inside the provisioning window;
+  the post-handoff move to plain root `adb shell` is cancelled.
+
+**Loud consequence of opting out of Shizuku root:** with
+`--skip-shizuku-root` (or without `--shizuku`) there is no second
+root channel to fall back on. That configuration keeps the section
+10 behavior — the daemon stays up for the rest of the boot as the
+run's only root channel, with its unauthenticated loopback EXEC
+surface (section 5) exposed for that whole boot. It must not be
+presented as equivalent to the default Shizuku-root configuration.
+
+**CLI streamlining (this change):**
+
+- `--autoroot` now implies `--shizuku` and `--custom-payload`
+  instead of silently staging an autoroot setup that could never
+  run when either prerequisite was forgotten. Combining
+  `--autoroot` with `--remove-shizuku` is an error.
+- `--custom-payload` is an optional-value flag. Bare
+  `--custom-payload` builds (via `root-daemon/Makefile`, as part of
+  the normal build step) and uses this repository's root daemon at
+  `root-daemon/portal-root-daemon`; `--custom-payload <path>` keeps
+  using the given prebuilt binary as an override, unchanged.
+- A standalone `--custom-payload` no longer falls through to the
+  default audio action.
+
+Next, in order: the de-Kiosk scrub (section 11), then the release
+polish. Live validation of this change is recorded in the goal
+workspace log.

@@ -59,6 +59,7 @@ PROVISIONER_BANNER = rf"""
 HELPER_LOCAL = ROOT / "helper/build/libportal_audio_persist.so"
 HELPER_JAVA_LOCAL = ROOT / "helper/build/libportal_audio_persist_java.so"
 PRELOAD_REMOTE = "/data/local/tmp/preload-portal.so"
+DEFAULT_CUSTOM_PAYLOAD_LOCAL = ROOT / "root-daemon" / "portal-root-daemon"
 CUSTOM_PAYLOAD_REMOTE = "/data/local/tmp/portal-root-daemon"
 CUSTOM_PAYLOAD_DST_REMOTE = "/data/local/tmp/portal-root-daemon"
 CUSTOM_PAYLOAD_PORT = 37373
@@ -8186,6 +8187,10 @@ class PortalProvisioner:
                 build_presence=False,
                 build_uid1000=self.needs_uid1000_payload(),
                 build_sentinel=self.uses_exploit_sentinel(),
+                build_daemon=(
+                    self.custom_payload is not None
+                    and self.custom_payload == DEFAULT_CUSTOM_PAYLOAD_LOCAL
+                ),
             )
         if self.needs_uid1000_payload():
             self.validate_uid1000_payload()
@@ -8347,6 +8352,7 @@ def build(
     build_presence: bool,
     build_uid1000: bool,
     build_sentinel: bool,
+    build_daemon: bool = False,
 ) -> None:
     if target is None:
         raise ProvisionError("target must be selected before building")
@@ -8393,6 +8399,8 @@ def build(
         )
     if build_sentinel:
         commands.append(["make", "-C", str(ROOT / "exploit-sentinel"), "all"])
+    if build_daemon:
+        commands.append(["make", "-C", str(ROOT / "root-daemon")])
     for command in commands:
         result = subprocess.run(
             command, cwd=ROOT, env=environment, check=False
@@ -8522,12 +8530,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--custom-payload",
         type=pathlib.Path,
+        nargs="?",
+        const=DEFAULT_CUSTOM_PAYLOAD_LOCAL,
+        default=None,
         metavar="PATH",
         help=(
-            "start the prebuilt binary at PATH inside one privileged "
-            "window: it is installed under /data/portal-root, started "
-            "detached as root, and verified over its loopback socket "
-            "for the rest of the current boot (no post-run reboot)"
+            "start a prebuilt binary inside one privileged window: it "
+            "is installed under /data/portal-root, started detached as "
+            "root, and verified over its loopback socket for the rest "
+            "of the current boot (no post-run reboot). The PATH is "
+            "optional: a bare --custom-payload builds and uses this "
+            "repository's root daemon (root-daemon/portal-root-daemon); "
+            "pass an explicit PATH to use a different binary instead"
         ),
     )
     parser.add_argument(
@@ -8543,10 +8557,12 @@ def parse_args() -> argparse.Namespace:
         "--autoroot",
         action="store_true",
         help=(
-            "with --shizuku and --custom-payload, also stage the "
-            "on-device autoroot runner and boot helper so the root "
-            "payload returns by itself after later reboots, with no "
-            "host watcher (the exploit sentinel app stays installed)"
+            "stage the on-device autoroot runner and boot helper so "
+            "the root payload returns by itself after later reboots, "
+            "with no host watcher (the exploit sentinel app stays "
+            "installed). Implies --shizuku and --custom-payload (a "
+            "bare --custom-payload, i.e. the in-repo root daemon, "
+            "unless one was given explicitly)"
         ),
     )
     parser.add_argument(
@@ -8799,8 +8815,21 @@ def parse_args() -> argparse.Namespace:
                 "--restore-adb-auth-timeout"
             )
         args.disable_adb_auth_timeout = True
+    if args.autoroot:
+        if args.remove_shizuku:
+            parser.error("--autoroot cannot be combined with --remove-shizuku")
+        # Autoroot's boot helper reuses the Shizuku loopback-ADB key
+        # and its runner replays the custom payload, so both steps are
+        # prerequisites. Imply them instead of silently staging an
+        # autoroot setup that can never run (the previous behaviour
+        # when either was forgotten).
+        args.shizuku = True
+        if args.custom_payload is None:
+            args.custom_payload = DEFAULT_CUSTOM_PAYLOAD_LOCAL
     selected = any(
         (
+            args.custom_payload is not None,
+            args.autoroot,
             args.persistent_wireless_adb,
             args.disable_adb_auth_timeout,
             args.restore_adb_auth_timeout,
