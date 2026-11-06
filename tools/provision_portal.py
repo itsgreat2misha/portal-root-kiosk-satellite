@@ -40,7 +40,7 @@ from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROJECT_URL = "https://github.com/jxlarrea/portal-root-kiosk-satellite"
+PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
 ANDROID_PLATFORM_VERSION = "android-36"
@@ -49,10 +49,10 @@ VOICE_AUDIO_VERIFIED_LOG = "audio processing verified aec=0 ns=0"
 PROVISIONER_BANNER = rf"""
 +----------------------------------------------------------------+
 |                                                                |
-|          Meta Portal Provisioner for Kiosk Satellite           |
+|                  Meta Portal Root Provisioner                  |
 |                                                                |
 |                    Created by Xavier Larrea                    |
-|    {PROJECT_URL}     |
+| {PROJECT_URL}  |
 |                                                                |
 +----------------------------------------------------------------+
 """.strip()
@@ -113,36 +113,6 @@ ADB_ENABLED_SETTING = "adb_enabled"
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
 ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
-)
-KIOSK_COMPONENT = "me.jxl.kiosk_satellite/.KioskAdminReceiver"
-KIOSK_PACKAGE = "me.jxl.kiosk_satellite"
-KIOSK_HOME_COMPONENT = "me.jxl.kiosk_satellite/.HomeAlias"
-KIOSK_PROVISION_COMPONENT = "me.jxl.kiosk_satellite/.ProvisionActivity"
-KIOSK_RELEASE_API = (
-    "https://api.github.com/repos/jxlarrea/kiosk-satellite/releases/latest"
-)
-KIOSK_RELEASE_DOWNLOAD_PREFIX = (
-    "https://github.com/jxlarrea/kiosk-satellite/releases/download/"
-)
-KIOSK_RELEASE_ABIS = ("arm64-v8a", "armeabi-v7a", "x86_64")
-KIOSK_RUNTIME_PERMISSIONS = (
-    "android.permission.RECORD_AUDIO",
-    "android.permission.CAMERA",
-    "android.permission.ACCESS_COARSE_LOCATION",
-    "android.permission.ACCESS_FINE_LOCATION",
-    "android.permission.READ_EXTERNAL_STORAGE",
-    "android.permission.WRITE_EXTERNAL_STORAGE",
-    "android.permission.READ_LOGS",
-)
-KIOSK_APP_OPS = (
-    "SYSTEM_ALERT_WINDOW",
-    "WRITE_SETTINGS",
-    "GET_USAGE_STATS",
-)
-KIOSK_OWNER_COMPONENTS = (
-    "admin=me.jxl.kiosk_satellite/.KioskAdminReceiver",
-    "admin=ComponentInfo{me.jxl.kiosk_satellite/"
-    "me.jxl.kiosk_satellite.KioskAdminReceiver}",
 )
 DEBLOAT_BACKUP_REMOTE = "/data/local/tmp/portal-debloat-backup-v1.tsv"
 DEBLOAT_COMPONENT_BACKUP_REMOTE = (
@@ -267,11 +237,6 @@ class PortalProvisioner:
         log_dir: pathlib.Path,
         audio: bool = False,
         restore_audio: bool = False,
-        install_kiosk_satellite: bool = False,
-        kiosk_permissions: bool = False,
-        device_owner: bool = False,
-        kiosk_home: bool = False,
-        restore_kiosk_home: bool = False,
         disable_updates: bool = False,
         enable_updates: bool = False,
         debloat: bool = False,
@@ -321,13 +286,6 @@ class PortalProvisioner:
         self.mha_tuning_stock_local: pathlib.Path | None = None
         self.mha_tuning_patched_local: pathlib.Path | None = None
         self.restore_audio = restore_audio
-        self.install_kiosk_satellite = install_kiosk_satellite
-        self.kiosk_apk: pathlib.Path | None = None
-        self.kiosk_permissions = kiosk_permissions
-        self.device_owner = device_owner
-        self.device_owner_already_configured = False
-        self.kiosk_home = kiosk_home
-        self.restore_kiosk_home = restore_kiosk_home
         self.disable_updates = disable_updates
         self.ota_already_configured = False
         self.enable_updates = enable_updates
@@ -969,11 +927,6 @@ class PortalProvisioner:
             "restore_adb_auth_timeout",
             "audio",
             "restore_audio",
-            "install_kiosk_satellite",
-            "kiosk_permissions",
-            "device_owner",
-            "kiosk_home",
-            "restore_kiosk_home",
             "disable_updates",
             "enable_updates",
             "debloat",
@@ -1033,8 +986,6 @@ class PortalProvisioner:
             )
             if self.target and self.target.audio_java_fallback:
                 candidates.append(AUDIO_CTL_LOCAL)
-        if self.kiosk_apk:
-            candidates.append(self.kiosk_apk)
         if self.remove_meta_accounts:
             candidates.append(ACCOUNT_CTL_LOCAL)
         if self.needs_component_ctl() or self.block_remote_wipe:
@@ -1176,19 +1127,6 @@ class PortalProvisioner:
             for line in installed_output.splitlines()
             if line.startswith("package:")
         }
-        policy = shell("dumpsys", "device_policy")
-        owner = "Device Owner:" in policy and any(
-            marker in policy for marker in KIOSK_OWNER_COMPONENTS
-        )
-        kiosk_dump = shell("dumpsys", "package", "me.jxl.kiosk_satellite")
-        kiosk_installed = KIOSK_PACKAGE in installed
-        kiosk_permissions = self.kiosk_permission_status(
-            package_dump=kiosk_dump,
-            installed=kiosk_installed,
-        )
-        default_home = self.current_default_home()
-        version_name = re.search(r"\bversionName=([^\s]+)", kiosk_dump)
-        version_code = re.search(r"\bversionCode=(\d+)", kiosk_dump)
         logs = shell(
             "logcat",
             "-d",
@@ -1464,16 +1402,6 @@ class PortalProvisioner:
                 ),
                 "cameras": 2 if "Number of camera devices: 2" in camera else None,
                 "webview_ready": "(com.facebook.portal.webview," in webview,
-            },
-            "kiosk_satellite": {
-                "installed": kiosk_installed,
-                "version_name": version_name.group(1) if version_name else None,
-                "version_code": int(version_code.group(1)) if version_code else None,
-                "admin_active": f"    {KIOSK_COMPONENT}:" in policy,
-                "device_owner": owner,
-                "default_home": default_home or None,
-                "home_screen": default_home == KIOSK_HOME_COMPONENT,
-                "permissions": kiosk_permissions,
             },
             "audio": {
                 "state": (
@@ -1788,7 +1716,6 @@ class PortalProvisioner:
                 self.adb_framework_only,
                 self.audio,
                 self.restore_audio,
-                self.device_owner,
                 self.disable_updates,
                 self.enable_updates,
                 self.debloat,
@@ -1814,7 +1741,6 @@ class PortalProvisioner:
 
     def dry_run_report(self, status: dict[str, object]) -> None:
         actions = self.requested_actions()
-        kiosk = status.get("kiosk_satellite", {})
         audio = status.get("audio", {})
         updates = status.get("updates", {})
         debloat = status.get("debloat", {})
@@ -1829,18 +1755,6 @@ class PortalProvisioner:
         runtime = status.get("runtime", {})
         current = {
             "audio": audio.get("state") if isinstance(audio, dict) else None,
-            "install_kiosk_satellite": (
-                kiosk.get("installed") if isinstance(kiosk, dict) else None
-            ),
-            "device_owner": (
-                kiosk.get("device_owner") if isinstance(kiosk, dict) else None
-            ),
-            "kiosk_home": (
-                kiosk.get("home_screen") if isinstance(kiosk, dict) else None
-            ),
-            "kiosk_permissions": (
-                kiosk.get("permissions") if isinstance(kiosk, dict) else None
-            ),
             "updates": updates.get("state") if isinstance(updates, dict) else None,
             "debloat": debloat.get("complete") if isinstance(debloat, dict) else None,
             "remote_wipe": (
@@ -1905,8 +1819,6 @@ class PortalProvisioner:
                 if self.privileged_requested()
                 else 0
                 if set(actions) <= {
-                    "install_kiosk_satellite",
-                    "kiosk_permissions",
                     "disable_adb_auth_timeout",
                     "restore_adb_auth_timeout",
                     "system_theme_control",
@@ -2446,408 +2358,6 @@ class PortalProvisioner:
             f"meta_verifier_disabled={int(package_disabled)}"
         )
 
-    def kiosk_permission_status(
-        self,
-        package_dump: str | None = None,
-        installed: bool | None = None,
-    ) -> dict[str, object]:
-        if installed is None:
-            installed = (
-                self.adb_run(
-                    ["shell", "pm", "path", KIOSK_PACKAGE], timeout=10
-                ).returncode
-                == 0
-            )
-        if package_dump is None:
-            package_dump = self.adb_run(
-                ["shell", "dumpsys", "package", KIOSK_PACKAGE], timeout=15
-            ).stdout
-
-        runtime = {
-            permission: bool(
-                installed
-                and re.search(
-                    rf"^\s*{re.escape(permission)}:\s+granted=true\b",
-                    package_dump,
-                    re.MULTILINE,
-                )
-            )
-            for permission in KIOSK_RUNTIME_PERMISSIONS
-        }
-        app_ops: dict[str, bool] = {}
-        for operation in KIOSK_APP_OPS:
-            output = self.adb_run(
-                ["shell", "appops", "get", KIOSK_PACKAGE, operation],
-                timeout=10,
-            ).stdout
-            app_ops[operation] = bool(
-                installed
-                and re.search(
-                    rf"(?:^|\s){re.escape(operation)}:\s*allow\b",
-                    output,
-                    re.MULTILINE,
-                )
-            )
-        whitelist = self.adb_run(
-            ["shell", "dumpsys", "deviceidle", "whitelist"], timeout=15
-        ).stdout
-        battery_exempt = bool(
-            installed
-            and any(
-                re.search(
-                    rf"(?:^|,){re.escape(KIOSK_PACKAGE)}(?:,|$)",
-                    line.strip(),
-                )
-                for line in whitelist.splitlines()
-            )
-        )
-        return {
-            "complete": bool(
-                installed
-                and all(runtime.values())
-                and all(app_ops.values())
-                and battery_exempt
-            ),
-            "runtime": runtime,
-            "app_ops": app_ops,
-            "battery_optimization_exempt": battery_exempt,
-        }
-
-    def apply_kiosk_permissions(self) -> None:
-        if self.adb_run(
-            ["shell", "pm", "path", KIOSK_PACKAGE], timeout=10
-        ).returncode != 0:
-            raise ProvisionError(
-                "Kiosk Satellite must be installed before applying its permissions"
-            )
-
-        for permission in KIOSK_RUNTIME_PERMISSIONS:
-            result = self.adb_run(
-                ["shell", "pm", "grant", KIOSK_PACKAGE, permission],
-                timeout=15,
-            )
-            if result.returncode != 0:
-                raise ProvisionError(
-                    f"failed to grant {permission} to Kiosk Satellite: "
-                    f"{result.stdout.strip()}"
-                )
-        for operation in KIOSK_APP_OPS:
-            result = self.adb_run(
-                [
-                    "shell",
-                    "appops",
-                    "set",
-                    KIOSK_PACKAGE,
-                    operation,
-                    "allow",
-                ],
-                timeout=15,
-            )
-            if result.returncode != 0:
-                raise ProvisionError(
-                    f"failed to allow {operation} for Kiosk Satellite: "
-                    f"{result.stdout.strip()}"
-                )
-        whitelist = self.adb_run(
-            [
-                "shell",
-                "dumpsys",
-                "deviceidle",
-                "whitelist",
-                f"+{KIOSK_PACKAGE}",
-            ],
-            timeout=15,
-        )
-        if whitelist.returncode != 0:
-            raise ProvisionError(
-                "failed to exempt Kiosk Satellite from battery optimization: "
-                + whitelist.stdout.strip()
-            )
-
-        self.adb_run(
-            ["shell", "am", "force-stop", KIOSK_PACKAGE], timeout=15, check=True
-        )
-        launch = self.adb_run(
-            [
-                "shell",
-                "monkey",
-                "-p",
-                KIOSK_PACKAGE,
-                "-c",
-                "android.intent.category.LAUNCHER",
-                "1",
-            ],
-            timeout=30,
-        )
-        if launch.returncode != 0 or "Events injected: 1" not in launch.stdout:
-            raise ProvisionError(
-                "Kiosk Satellite did not relaunch after READ_LOGS was granted: "
-                + launch.stdout[-2000:].strip()
-            )
-        self.verify_kiosk_permissions()
-        settle_seconds = (
-            self.target.kiosk_permission_settle_seconds
-            if self.target is not None
-            else 0
-        )
-        if settle_seconds:
-            print(
-                "KIOSK_PERMISSION_STATE_SETTLE "
-                f"seconds={settle_seconds}",
-                flush=True,
-            )
-            time.sleep(settle_seconds)
-            self.verify_kiosk_permissions()
-
-    def verify_kiosk_permissions(self) -> None:
-        status = self.kiosk_permission_status()
-        if not status["complete"]:
-            runtime = status["runtime"]
-            app_ops = status["app_ops"]
-            assert isinstance(runtime, dict)
-            assert isinstance(app_ops, dict)
-            missing_runtime = [
-                permission
-                for permission, granted in runtime.items()
-                if not granted
-            ]
-            missing_app_ops = [
-                operation
-                for operation, allowed in app_ops.items()
-                if not allowed
-            ]
-            raise ProvisionError(
-                "Kiosk Satellite permission verification failed: "
-                f"runtime={missing_runtime} app_ops={missing_app_ops} "
-                "battery_optimization_exempt="
-                f"{int(bool(status['battery_optimization_exempt']))}"
-            )
-        print(
-            "KIOSK_PERMISSIONS_OK runtime="
-            f"{len(KIOSK_RUNTIME_PERMISSIONS)} app_ops={len(KIOSK_APP_OPS)} "
-            "battery_optimization_exempt=1 accessibility=unchanged"
-        )
-
-    def kiosk_satellite_version(self) -> str | None:
-        if self.adb_run(
-            ["shell", "pm", "path", KIOSK_PACKAGE], timeout=10
-        ).returncode != 0:
-            return None
-        package_dump = self.adb_run(
-            ["shell", "dumpsys", "package", KIOSK_PACKAGE],
-            timeout=15,
-            check=True,
-        ).stdout
-        match = re.search(r"^\s*versionName=(\S+)", package_dump, re.MULTILINE)
-        return match.group(1) if match else "unknown"
-
-    @staticmethod
-    def select_kiosk_release_asset(
-        release: object, device_abis: tuple[str, ...]
-    ) -> tuple[str, str, int, str, str]:
-        if not isinstance(release, dict):
-            raise ProvisionError("invalid Kiosk Satellite release metadata")
-        tag = release.get("tag_name")
-        assets = release.get("assets")
-        if (
-            not isinstance(tag, str)
-            or not re.fullmatch(r"v?[0-9][0-9A-Za-z._-]*", tag)
-            or not isinstance(assets, list)
-        ):
-            raise ProvisionError("invalid Kiosk Satellite release metadata")
-        versions = (tag, tag[1:]) if tag.startswith("v") else (tag,)
-        preferred_abis = [abi for abi in device_abis if abi in KIOSK_RELEASE_ABIS]
-        expected_names = [
-            (f"kiosk-satellite-{version}.{abi}.apk", abi)
-            for abi in preferred_abis
-            for version in versions
-        ]
-        expected_names.extend(
-            (f"kiosk-satellite-{version}.apk", "universal")
-            for version in versions
-        )
-        by_name = {
-            asset.get("name"): asset
-            for asset in assets
-            if isinstance(asset, dict) and isinstance(asset.get("name"), str)
-        }
-        selected_name = ""
-        selected_abi = ""
-        selected: dict[str, object] | None = None
-        for name, abi in expected_names:
-            candidate = by_name.get(name)
-            if isinstance(candidate, dict):
-                selected_name, selected_abi, selected = name, abi, candidate
-                break
-        if selected is None:
-            raise ProvisionError(
-                "the latest Kiosk Satellite release has no APK for device ABIs: "
-                + (",".join(device_abis) or "unknown")
-            )
-        url = selected.get("browser_download_url")
-        digest_value = selected.get("digest")
-        size = selected.get("size")
-        expected_url = f"{KIOSK_RELEASE_DOWNLOAD_PREFIX}{tag}/{selected_name}"
-        if url != expected_url:
-            raise ProvisionError("unexpected Kiosk Satellite release download URL")
-        if (
-            not isinstance(digest_value, str)
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest_value)
-        ):
-            raise ProvisionError(
-                "the Kiosk Satellite release asset has no valid SHA-256 digest"
-            )
-        if not isinstance(size, int) or size <= 0:
-            raise ProvisionError("invalid Kiosk Satellite release asset size")
-        return (
-            tag,
-            selected_name,
-            size,
-            digest_value.removeprefix("sha256:"),
-            selected_abi,
-        )
-
-    def resolve_kiosk_satellite_apk(self) -> tuple[pathlib.Path, str, str]:
-        abi_list = self.adb_run(
-            ["shell", "getprop", "ro.product.cpu.abilist"],
-            timeout=5,
-            check=True,
-        ).stdout.strip()
-        device_abis = tuple(abi for abi in abi_list.split(",") if abi)
-        request = urllib.request.Request(
-            KIOSK_RELEASE_API,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "portal-root-kiosk-satellite",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw_metadata = response.read(2 * 1024 * 1024 + 1)
-        except OSError as exc:
-            raise ProvisionError(
-                f"Kiosk Satellite release lookup failed: {exc}"
-            ) from exc
-        if len(raw_metadata) > 2 * 1024 * 1024:
-            raise ProvisionError(
-                "Kiosk Satellite release metadata is unexpectedly large"
-            )
-        try:
-            release = json.loads(raw_metadata)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProvisionError(
-                f"invalid Kiosk Satellite release metadata: {exc}"
-            ) from exc
-        tag, name, expected_size, expected_digest, selected_abi = (
-            self.select_kiosk_release_asset(release, device_abis)
-        )
-        path = (
-            pathlib.Path.home()
-            / ".cache"
-            / "portal-root"
-            / "kiosk-satellite"
-            / name
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        def valid(candidate: pathlib.Path) -> bool:
-            if not candidate.is_file() or candidate.stat().st_size != expected_size:
-                return False
-            digest = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest() == expected_digest
-
-        if not valid(path):
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.unlink(missing_ok=True)
-            url = f"{KIOSK_RELEASE_DOWNLOAD_PREFIX}{tag}/{name}"
-            print(
-                f"KIOSK_DOWNLOAD version={tag} abi={selected_abi} source={url}",
-                flush=True,
-            )
-            download_request = urllib.request.Request(
-                url,
-                headers={"User-Agent": "portal-root-kiosk-satellite"},
-            )
-            try:
-                digest = hashlib.sha256()
-                downloaded = 0
-                with urllib.request.urlopen(
-                    download_request, timeout=60
-                ) as response:
-                    with temporary.open("wb") as output:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            output.write(chunk)
-                            digest.update(chunk)
-                            downloaded += len(chunk)
-            except OSError as exc:
-                temporary.unlink(missing_ok=True)
-                raise ProvisionError(
-                    f"Kiosk Satellite APK download failed: {exc}"
-                ) from exc
-            if downloaded != expected_size or digest.hexdigest() != expected_digest:
-                temporary.unlink(missing_ok=True)
-                raise ProvisionError(
-                    "Kiosk Satellite APK size or SHA-256 digest did not match "
-                    "GitHub release metadata"
-                )
-            temporary.replace(path)
-        try:
-            with zipfile.ZipFile(path) as archive:
-                if "AndroidManifest.xml" not in archive.namelist():
-                    raise ProvisionError(
-                        "Kiosk Satellite download is not a valid Android APK"
-                    )
-        except zipfile.BadZipFile as exc:
-            path.unlink(missing_ok=True)
-            raise ProvisionError(
-                "Kiosk Satellite download is not a valid APK"
-            ) from exc
-        self.kiosk_apk = path
-        return path, tag, selected_abi
-
-    def ensure_kiosk_satellite(self) -> None:
-        installed_version = self.kiosk_satellite_version()
-        if installed_version is not None:
-            print(
-                f"KIOSK_INSTALL_SKIP package={KIOSK_PACKAGE} "
-                f"version={installed_version} reason=already-installed"
-            )
-            return
-        apk, release, abi = self.resolve_kiosk_satellite_apk()
-        self.install_apk_preserving_verifier(apk, "kiosk-satellite")
-        self.settle_package_state()
-        self.verify_package_verifier_state()
-        installed_version = self.kiosk_satellite_version()
-        expected_version = release.removeprefix("v")
-        if installed_version not in (release, expected_version):
-            raise ProvisionError(
-                "Kiosk Satellite version verification failed after installation: "
-                f"installed={installed_version!r} release={release!r}"
-            )
-        launch = self.adb_run(
-            [
-                "shell", "monkey", "-p", KIOSK_PACKAGE, "-c",
-                "android.intent.category.LAUNCHER", "1",
-            ],
-            timeout=30,
-        )
-        if launch.returncode != 0 or "Events injected: 1" not in launch.stdout:
-            raise ProvisionError(
-                "Kiosk Satellite installed but could not be launched: "
-                + launch.stdout[-2000:].strip()
-            )
-        print(
-            f"KIOSK_INSTALL_OK package={KIOSK_PACKAGE} "
-            f"version={installed_version} abi={abi} source=github"
-        )
-
     def resolve_shizuku_apk(self) -> pathlib.Path:
         if self.shizuku_apk is not None:
             path = self.shizuku_apk.expanduser().resolve()
@@ -3001,7 +2511,7 @@ class PortalProvisioner:
         remote = f"/data/local/tmp/portal-{tag}-install.apk"
         # Remote support tunnels can sustain far less throughput than a local
         # USB or LAN ADB connection. Allow at least 32 KiB/s plus two minutes
-        # of protocol/setup overhead so large Kiosk Satellite releases are not
+        # of protocol/setup overhead so large APK releases are not
         # killed near the end of an otherwise healthy transfer.
         push_timeout = max(
             600,
@@ -3021,7 +2531,7 @@ class PortalProvisioner:
         verifier_was_disabled = "package:com.facebook.appverifier" in disabled
         # Record the state for this installation transaction. A profile can
         # intentionally change the durable verifier state between APKs (for
-        # example, install Kiosk Satellite and then apply --allow-app-updates)
+        # example, install an APK and then apply --allow-app-updates)
         # so an earlier transaction's baseline must not be reused here.
         self.package_verifier_before_install_disabled = verifier_was_disabled
         if verifier_was_disabled:
@@ -3508,11 +3018,6 @@ class PortalProvisioner:
             "restore_adb_auth_timeout",
             "audio",
             "restore_audio",
-            "install_kiosk_satellite",
-            "kiosk_permissions",
-            "device_owner",
-            "kiosk_home",
-            "restore_kiosk_home",
             "disable_updates",
             "enable_updates",
             "debloat",
@@ -3631,44 +3136,6 @@ class PortalProvisioner:
             f"already_clean={int(already_clean)} backup={META_ACCOUNT_BACKUP_REMOTE}"
         )
         return already_clean
-
-    def device_owner_preflight(self) -> bool:
-        policy = self.adb_run(
-            ["shell", "dumpsys", "device_policy"], timeout=15, check=True
-        ).stdout
-        component = KIOSK_COMPONENT
-        is_owner = "Device Owner:" in policy and any(
-            owner_component in policy for owner_component in KIOSK_OWNER_COMPONENTS
-        )
-        is_admin = (
-            "Enabled Device Admins (User 0" in policy
-            and f"    {component}:" in policy
-        )
-        if "Device Owner:" in policy and not is_owner:
-            raise ProvisionError("another Device Owner is already registered")
-        if not is_admin:
-            result = self.adb_run(
-                ["shell", "dpm", "set-active-admin", "--user", "0", component],
-                timeout=15,
-            )
-            policy = self.adb_run(
-                ["shell", "dumpsys", "device_policy"], timeout=15, check=True
-            ).stdout
-            is_admin = (
-                result.returncode == 0
-                and "Enabled Device Admins (User 0" in policy
-                and f"    {component}:" in policy
-            )
-            if not is_admin:
-                raise ProvisionError(
-                    f"Kiosk Satellite admin could not be activated: {component}: "
-                    f"{result.stdout.strip()}"
-                )
-        print(
-            f"DEVICE_OWNER_PREFLIGHT component={component} "
-            f"active_admin=1 already_owner={int(is_owner)}"
-        )
-        return is_owner
 
     def audio_preflight(self) -> bool:
         marker = "/data/local/tmp/portal-audio-backup/installed-v1"
@@ -4397,10 +3864,6 @@ class PortalProvisioner:
             and self.requested_actions()
             in ({"audio": True}, {"restore_audio": True})
         )
-        private_owner_action = (
-            self.target.device_owner_system_credentials
-            and self.requested_actions() == {"device_owner": True}
-        )
         private_ota_action = (
             (
                 self.target.ota_installer_credentials
@@ -4475,7 +3938,6 @@ class PortalProvisioner:
         )
         credential_action = (
             private_audio_action
-            or private_owner_action
             or private_ota_action
             or private_meta_action
             or private_presence_action
@@ -4533,8 +3995,6 @@ class PortalProvisioner:
                         "GHOSTLOCK_AUDIO_PRESERVE_METADATA": "1",
                     }
                 )
-            if private_owner_action:
-                environment["GHOSTLOCK_DEVICE_OWNER_PRIVATE_ONLY"] = "1"
             if private_ota_action:
                 environment["GHOSTLOCK_OTA_PRIVATE_ONLY"] = "1"
             if private_presence_action:
@@ -4547,8 +4007,6 @@ class PortalProvisioner:
             and self.meta_accounts_absent
         ):
             environment["GHOSTLOCK_META_ACCOUNTS_EMPTY"] = "1"
-        if self.device_owner and not self.device_owner_already_configured:
-            environment["GHOSTLOCK_KIOSK_DEVICE_OWNER"] = "1"
         if self.disable_updates and not self.ota_already_configured:
             environment["GHOSTLOCK_OTA_BLOCK"] = "1"
         if self.enable_updates:
@@ -4822,8 +4280,6 @@ class PortalProvisioner:
                     "MHA tuning restore",
                     True,
                 )
-        if self.device_owner and not self.device_owner_already_configured:
-            expected_markers["device_owner"] = ("kiosk device owner install", True)
         if self.disable_updates and not self.ota_already_configured:
             expected_markers["ota_block"] = ("OTA block file install", True)
         if self.enable_updates:
@@ -5697,177 +5153,6 @@ class PortalProvisioner:
                 f"{int('persistent audio watchdog started' in logs)}"
             )
         print(f"AUDIO_RESTORE_OK aiservice_pid={pid} watchdog=absent")
-
-    def verify_device_owner(self) -> None:
-        component = KIOSK_COMPONENT
-        policy = self.adb_run(
-            ["shell", "dumpsys", "device_policy"], timeout=15, check=True
-        ).stdout
-        owner_block = re.search(
-            r"Device Owner:\s+(.*?)(?:\n\s*Profile Owner|\n\S|\Z)",
-            policy,
-            re.DOTALL,
-        )
-        if (
-            owner_block is None
-            or not any(
-                owner_component in owner_block.group(1)
-                for owner_component in KIOSK_OWNER_COMPONENTS
-            )
-            or "User ID: 0" not in owner_block.group(1)
-        ):
-            raise ProvisionError(
-                "Kiosk Satellite is not the loaded Device Owner; "
-                "dumpsys excerpt follows:\n" + policy[:5000]
-            )
-        owner_property = self.adb_run(
-            ["shell", "getprop", "ro.device_owner"], timeout=5, check=True
-        ).stdout.strip()
-        if owner_property != "true":
-            raise ProvisionError(
-                f"Device Owner loaded but ro.device_owner={owner_property!r}"
-            )
-        print(
-            f"DEVICE_OWNER_OK component={component} user=0 "
-            f"ro.device_owner={owner_property}"
-        )
-
-    def current_default_home(self) -> str:
-        result = self.adb_run(
-            [
-                "shell",
-                "cmd",
-                "package",
-                "resolve-activity",
-                "--brief",
-                "-a",
-                "android.intent.action.MAIN",
-                "-c",
-                "android.intent.category.HOME",
-            ],
-            timeout=10,
-            check=True,
-        )
-        components = [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if "/" in line and not line.lstrip().startswith("priority=")
-        ]
-        return components[-1] if components else ""
-
-    def kiosk_home_alias_enabled(self) -> bool:
-        package = self.adb_run(
-            ["shell", "dumpsys", "package", "me.jxl.kiosk_satellite"],
-            timeout=15,
-            check=True,
-        ).stdout
-        enabled = re.search(
-            r"enabledComponents:\s*(.*?)(?:disabledComponents:|"
-            r"isSystemUserPackagesBlacklistSupported:|\Z)",
-            package,
-            re.DOTALL,
-        )
-        return (
-            enabled is not None
-            and "me.jxl.kiosk_satellite.HomeAlias" in enabled.group(1)
-        )
-
-    def configure_kiosk_home(self, enabled: bool) -> None:
-        if enabled:
-            self.verify_device_owner()
-        payload = shlex.quote(
-            json.dumps({"home.enabled": enabled}, separators=(",", ":"))
-        )
-        result = self.adb_run(
-            [
-                "shell",
-                "am",
-                "start",
-                "-W",
-                "-n",
-                KIOSK_PROVISION_COMPONENT,
-                "--es",
-                "ks.provision",
-                payload,
-            ],
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise ProvisionError(
-                "Kiosk Satellite rejected the home-screen setting:\n"
-                + result.stdout[-2000:]
-            )
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            held = self.current_default_home() == KIOSK_HOME_COMPONENT
-            alias_enabled = self.kiosk_home_alias_enabled()
-            if (enabled and held and alias_enabled) or (
-                not enabled and not held and not alias_enabled
-            ):
-                print(
-                    "KIOSK_HOME_CONFIGURED "
-                    f"enabled={int(enabled)} default={self.current_default_home() or 'none'}"
-                )
-                return
-            time.sleep(1)
-        raise ProvisionError(
-            "Kiosk Satellite did not apply the requested home-screen setting"
-        )
-
-    def verify_kiosk_home(self, enabled: bool) -> None:
-        default_home = self.current_default_home()
-        alias_enabled = self.kiosk_home_alias_enabled()
-        if enabled and (default_home != KIOSK_HOME_COMPONENT or not alias_enabled):
-            raise ProvisionError(
-                "Kiosk Satellite is not the persistent home screen: "
-                f"default={default_home!r} alias_enabled={int(alias_enabled)}"
-            )
-        if not enabled and (default_home == KIOSK_HOME_COMPONENT or alias_enabled):
-            raise ProvisionError(
-                "Kiosk Satellite remains registered as the home screen: "
-                f"default={default_home!r} alias_enabled={int(alias_enabled)}"
-            )
-        print(
-            "KIOSK_HOME_OK "
-            f"enabled={int(enabled)} default={default_home or 'none'}"
-        )
-
-    def ensure_kiosk_home(self) -> None:
-        default_home = self.current_default_home()
-        alias_enabled = self.kiosk_home_alias_enabled()
-        if default_home != KIOSK_HOME_COMPONENT or not alias_enabled:
-            print(
-                "KIOSK_HOME_REPAIR "
-                f"previous_default={default_home or 'none'} "
-                f"alias_enabled={int(alias_enabled)}",
-                flush=True,
-            )
-            self.configure_kiosk_home(enabled=True)
-        self.verify_kiosk_home(enabled=True)
-
-    def restore_existing_kiosk_home_before_bootstraps(self) -> bool:
-        """Restore an already provisioned kiosk before more root attempts."""
-        if not (self.kiosk_home and self.device_owner):
-            return False
-        installed = self.adb_run(
-            ["shell", "pm", "path", KIOSK_PACKAGE], timeout=10
-        )
-        if installed.returncode != 0 or "package:" not in installed.stdout:
-            return False
-        policy = self.adb_run(
-            ["shell", "dumpsys", "device_policy"], timeout=15, check=True
-        ).stdout
-        is_owner = "Device Owner:" in policy and any(
-            component in policy for component in KIOSK_OWNER_COMPONENTS
-        )
-        if not is_owner:
-            return False
-        print(
-            "KIOSK_HOME_EARLY_RESTORE reason=resume-privileged-bootstrap",
-            flush=True,
-        )
-        self.ensure_kiosk_home()
-        return True
 
     def disable_ota_packages(self) -> None:
         packages = (
@@ -7026,13 +6311,6 @@ class PortalProvisioner:
         )
 
     def verify_requested_state(self) -> None:
-        if self.install_kiosk_satellite:
-            version = self.kiosk_satellite_version()
-            if version is None:
-                raise ProvisionError("Kiosk Satellite is not installed")
-            print(
-                f"KIOSK_INSTALL_VERIFY_OK package={KIOSK_PACKAGE} version={version}"
-            )
         if self.persist_wireless_adb:
             property_name = (
                 self.target.wireless_adb_file_property
@@ -7075,14 +6353,6 @@ class PortalProvisioner:
             self.verify_watchdog()
         if self.restore_audio:
             self.verify_audio_restored()
-        if self.kiosk_permissions:
-            self.verify_kiosk_permissions()
-        if self.device_owner:
-            self.verify_device_owner()
-        if self.kiosk_home:
-            self.ensure_kiosk_home()
-        if self.restore_kiosk_home:
-            self.verify_kiosk_home(enabled=False)
         if self.disable_updates:
             self.disable_ota_packages()
             self.verify_ota_block()
@@ -7434,10 +6704,6 @@ class PortalProvisioner:
                     self.uninstall_shizuku_payload()
                 if self.presence_fps_action_requested():
                     self.uninstall_presence_helper()
-                if self.kiosk_home:
-                    self.ensure_kiosk_home()
-                if self.restore_kiosk_home:
-                    self.configure_kiosk_home(enabled=False)
                 if (
                     self.restore_camera_light
                     or self.restore_presence_fps
@@ -7651,7 +6917,6 @@ class PortalProvisioner:
                 raise ProvisionError(
                     "the dedicated ADB framework boot bootstrap did not verify"
                 )
-        self.restore_existing_kiosk_home_before_bootstraps()
         self.audio_already_configured = (
             self.audio_preflight() if self.audio else False
         )
@@ -7693,41 +6958,7 @@ class PortalProvisioner:
             print(f"PROVISION_ALREADY_COMPLETE actions=audio logs={self.log_dir}")
             self.report_deferred_failures()
             return
-        if self.install_kiosk_satellite:
-            self.ensure_kiosk_satellite()
         self.write_state("pending")
-        already_owner = self.device_owner_preflight() if self.device_owner else False
-        with self.bootstrap_guard("device_owner"):
-            if (
-                self.device_owner
-                and not already_owner
-                and self.target
-                and self.target.device_owner_system_credentials
-                and self.requested_actions() != {"device_owner": True}
-            ):
-                phase_logs = self.log_dir / "device-owner-bootstrap"
-                phase_logs.mkdir(parents=True, exist_ok=True)
-                print(
-                    "DEVICE_OWNER_BOOTSTRAP_PHASE action=install "
-                    "reason=system-server-credential",
-                    flush=True,
-                )
-                PortalProvisioner(
-                    self.serial,
-                    self.attempts,
-                    phase_logs,
-                    device_owner=True,
-                    skip_build=self.skip_build,
-                ).provision()
-                self.connect(wait_seconds=30)
-                self.verify_target()
-                already_owner = self.device_owner_preflight()
-                if not already_owner:
-                    raise ProvisionError(
-                        "the dedicated Aloha Device Owner bootstrap did not verify"
-                    )
-                self.write_state("pending")
-        self.device_owner_already_configured = already_owner
         self.ota_already_configured = (
             self.ota_preflight() if self.disable_updates else False
         )
@@ -8121,8 +7352,6 @@ class PortalProvisioner:
             self.allow_third_party_app_updates()
         if self.restore_app_verifier:
             self.restore_app_verifier_setting()
-        if self.kiosk_permissions:
-            self.apply_kiosk_permissions()
         if self.needs_component_ctl():
             self.prepare_component_actions()
 
@@ -8141,7 +7370,6 @@ class PortalProvisioner:
             or self.restore_presence_profile
             or self.presence_fps_action_requested()
             or self.restore_presence_fps
-            or (self.device_owner and not already_owner)
             or (self.remove_meta_accounts and not already_meta_clean)
             or self.shizuku
             or self.remove_shizuku
@@ -8151,13 +7379,7 @@ class PortalProvisioner:
             or self.system_theme_uid1000_action_requested()
         )
         if not privileged_action:
-            if self.kiosk_home:
-                self.ensure_kiosk_home()
-            if self.restore_kiosk_home:
-                self.configure_kiosk_home(enabled=False)
             if set(self.requested_actions()) <= {
-                "install_kiosk_satellite",
-                "kiosk_permissions",
                 "disable_adb_auth_timeout",
                 "restore_adb_auth_timeout",
                 "system_theme_control",
@@ -8443,11 +7665,6 @@ def parse_args() -> argparse.Namespace:
             "--disable-adb-auth-timeout run"
         ),
     )
-    parser.add_argument(
-        "--profile",
-        choices=("kiosk",),
-        help="select the complete, tested Kiosk Satellite provisioning profile",
-    )
     audio_group = parser.add_mutually_exclusive_group()
     audio_group.add_argument(
         "--audio",
@@ -8461,45 +7678,6 @@ def parse_args() -> argparse.Namespace:
         "--restore-audio",
         action="store_true",
         help="restore AIService's original native loader and remove the audio watchdog",
-    )
-    parser.add_argument(
-        "--install-kiosk-satellite",
-        action="store_true",
-        help=(
-            "install the latest compatible Kiosk Satellite release from "
-            "GitHub when the app is not already installed"
-        ),
-    )
-    parser.add_argument(
-        "--device-owner",
-        action="store_true",
-        help=(
-            "make Kiosk Satellite Device Owner and verify it "
-            "across both reboots"
-        ),
-    )
-    parser.add_argument(
-        "--kiosk-permissions",
-        action="store_true",
-        help=(
-            "grant Kiosk Satellite the Portal runtime permissions, special "
-            "app access, READ_LOGS, and battery exemption without changing "
-            "accessibility services"
-        ),
-    )
-    kiosk_home_group = parser.add_mutually_exclusive_group()
-    kiosk_home_group.add_argument(
-        "--kiosk-home",
-        action="store_true",
-        help=(
-            "make Kiosk Satellite the persistent HOME app through its Device "
-            "Owner API, preventing Meta's invalid-account home from taking focus"
-        ),
-    )
-    kiosk_home_group.add_argument(
-        "--restore-kiosk-home",
-        action="store_true",
-        help="release Kiosk Satellite's HOME role and restore Android home resolution",
     )
     parser.add_argument(
         "--skip-build", action="store_true", help="use existing build outputs"
@@ -8591,8 +7769,8 @@ def parse_args() -> argparse.Namespace:
         "--allow-app-updates",
         action="store_true",
         help=(
-            "persistently disable Meta's certificate allowlist so Kiosk "
-            "Satellite and other non-Meta apps can update"
+            "persistently disable Meta's certificate allowlist so "
+            "third-party and other non-Meta apps can update"
         ),
     )
     app_update_group.add_argument(
@@ -8688,8 +7866,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         metavar="FPS",
         help=(
-            "cap only AIService's presence-analysis rate (1-10 FPS); Kiosk "
-            "Satellite RTSP capture keeps its configured frame rate"
+            "cap only AIService's presence-analysis rate (1-10 FPS); "
+            "camera capture keeps its configured frame rate"
         ),
     )
     privacy_group = parser.add_mutually_exclusive_group()
@@ -8775,39 +7953,6 @@ def parse_args() -> argparse.Namespace:
         # The activation activity also applies Meta's other camera toggles.
         # Always pair the cap with the tested full-scene presence profile.
         args.optimize_presence = True
-    if args.profile == "kiosk":
-        conflicting = [
-            flag
-            for enabled, flag in (
-                (args.restore_audio, "--restore-audio"),
-                (args.restore_kiosk_home, "--restore-kiosk-home"),
-                (args.enable_updates, "--enable-updates"),
-                (args.restore_remote_wipe, "--restore-remote-wipe"),
-                (args.restore_bloat, "--restore-bloat"),
-                (args.restore_presence_profile, "--restore-presence-profile"),
-                (args.restore_presence_fps, "--restore-presence-fps"),
-                (args.restore_app_verifier, "--restore-app-verifier"),
-                (args.restore_adb_auth_timeout, "--restore-adb-auth-timeout"),
-            )
-            if enabled
-        ]
-        if conflicting:
-            parser.error(
-                "--profile kiosk cannot be combined with rollback actions: "
-                + ", ".join(conflicting)
-            )
-        args.audio = True
-        args.install_kiosk_satellite = True
-        args.kiosk_permissions = True
-        args.device_owner = True
-        args.kiosk_home = True
-        args.disable_updates = True
-        args.block_remote_wipe = True
-        args.debloat = True
-        args.remove_meta_accounts = True
-        args.optimize_presence = True
-        args.allow_app_updates = True
-        args.disable_adb_auth_timeout = True
     if args.persistent_wireless_adb:
         if args.restore_adb_auth_timeout:
             parser.error(
@@ -8835,11 +7980,6 @@ def parse_args() -> argparse.Namespace:
             args.restore_adb_auth_timeout,
             args.audio,
             args.restore_audio,
-            args.install_kiosk_satellite,
-            args.kiosk_permissions,
-            args.device_owner,
-            args.kiosk_home,
-            args.restore_kiosk_home,
             args.disable_updates,
             args.enable_updates,
             args.block_remote_wipe,
@@ -8871,7 +8011,7 @@ def parse_args() -> argparse.Namespace:
             "capture. Run --restore-camera-light on previously provisioned "
             "devices."
         )
-    if args.recover and (selected or args.profile):
+    if args.recover and selected:
         parser.error("--recover resumes its saved action set and cannot take action flags")
     if args.recover and args.backup:
         parser.error("--recover cannot be combined with --backup")
@@ -8900,11 +8040,6 @@ def main() -> int:
             log_dir,
             audio=args.audio,
             restore_audio=args.restore_audio,
-            install_kiosk_satellite=args.install_kiosk_satellite,
-            kiosk_permissions=args.kiosk_permissions,
-            device_owner=args.device_owner,
-            kiosk_home=args.kiosk_home,
-            restore_kiosk_home=args.restore_kiosk_home,
             disable_updates=args.disable_updates,
             enable_updates=args.enable_updates,
             block_remote_wipe=args.block_remote_wipe,

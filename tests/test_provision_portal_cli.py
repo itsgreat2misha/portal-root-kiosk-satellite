@@ -18,7 +18,6 @@ from provision_portal import (  # noqa: E402
     ADB_AUTH_TIMEOUT_BACKUP_REMOTE,
     ADB_ENABLED_SETTING,
     DEFAULT_CUSTOM_PAYLOAD_LOCAL,
-    KIOSK_RELEASE_DOWNLOAD_PREFIX,
     MHA_AUDIO_VERIFIED_LOG,
     REMOTE_WIPE_COMPONENTS,
     PortalProvisioner,
@@ -559,16 +558,6 @@ class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
         self.assertEqual(current[ADB_ENABLED_SETTING], "1")
         self.assertEqual(current["adb_allowed_connection_time"], "null")
 
-    def test_kiosk_profile_includes_non_expiring_adb_authorization(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["provision_portal.py", "--profile", "kiosk"],
-        ):
-            arguments = parse_args()
-
-        self.assertTrue(arguments.disable_adb_auth_timeout)
-
     def test_privileged_timeout_action_installs_boot_enforcement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             for target in TARGETS:
@@ -675,86 +664,6 @@ class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
                     ProvisionError, "authorization prompts cannot appear"
                 ):
                     provisioner.ensure_adb_framework_enabled()
-
-
-class KioskHomeResumeTest(unittest.TestCase):
-    def test_existing_device_owner_is_restored_as_home_before_bootstraps(
-        self,
-    ) -> None:
-        def adb_run(
-            arguments: list[str],
-            timeout: float | None = None,
-            check: bool = False,
-        ) -> subprocess.CompletedProcess[str]:
-            del timeout, check
-            if arguments[1:4] == ["pm", "path", "me.jxl.kiosk_satellite"]:
-                return subprocess.CompletedProcess(
-                    arguments,
-                    0,
-                    "package:/data/app/me.jxl.kiosk_satellite/base.apk\n",
-                )
-            if arguments[1:3] == ["dumpsys", "device_policy"]:
-                return subprocess.CompletedProcess(
-                    arguments,
-                    0,
-                    "Device Owner:\n"
-                    "  admin=ComponentInfo{"
-                    "me.jxl.kiosk_satellite/"
-                    "me.jxl.kiosk_satellite.KioskAdminReceiver}\n",
-                )
-            raise AssertionError(arguments)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                device_owner=True,
-                kiosk_home=True,
-            )
-            with (
-                mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
-                mock.patch.object(provisioner, "ensure_kiosk_home") as ensure,
-            ):
-                restored = (
-                    provisioner.restore_existing_kiosk_home_before_bootstraps()
-                )
-
-        self.assertTrue(restored)
-        ensure.assert_called_once_with()
-
-    def test_unowned_install_is_not_changed_before_bootstraps(self) -> None:
-        def adb_run(
-            arguments: list[str],
-            timeout: float | None = None,
-            check: bool = False,
-        ) -> subprocess.CompletedProcess[str]:
-            del timeout, check
-            output = (
-                "package:/data/app/me.jxl.kiosk_satellite/base.apk\n"
-                if arguments[1:3] == ["pm", "path"]
-                else "Device Owner: none\n"
-            )
-            return subprocess.CompletedProcess(arguments, 0, output)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                device_owner=True,
-                kiosk_home=True,
-            )
-            with (
-                mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
-                mock.patch.object(provisioner, "ensure_kiosk_home") as ensure,
-            ):
-                restored = (
-                    provisioner.restore_existing_kiosk_home_before_bootstraps()
-                )
-
-        self.assertFalse(restored)
-        ensure.assert_not_called()
 
 
 class ShizukuCliTest(unittest.TestCase):
@@ -1050,16 +959,6 @@ class RemoteWipeCliTest(unittest.TestCase):
             [f"disable\t{component}" for component in REMOTE_WIPE_COMPONENTS],
         )
 
-    def test_kiosk_profile_includes_remote_wipe_block(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["provision_portal.py", "--profile", "kiosk"],
-        ):
-            arguments = parse_args()
-
-        self.assertTrue(arguments.block_remote_wipe)
-
     def test_restore_preserves_each_saved_component_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             provisioner = PortalProvisioner(
@@ -1101,228 +1000,8 @@ class RemoteWipeCliTest(unittest.TestCase):
         )
 
 
-class KioskPermissionsCliTest(unittest.TestCase):
-    def test_standalone_permission_action_does_not_select_root_or_audio(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["provision_portal.py", "--kiosk-permissions"],
-        ):
-            arguments = parse_args()
 
-        self.assertTrue(arguments.kiosk_permissions)
-        self.assertFalse(arguments.audio)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                kiosk_permissions=True,
-            )
-            self.assertEqual(
-                provisioner.requested_actions(),
-                {"kiosk_permissions": True},
-            )
-            self.assertFalse(provisioner.privileged_requested())
-
-    def test_kiosk_profile_includes_permissions(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["provision_portal.py", "--profile", "kiosk"],
-        ):
-            arguments = parse_args()
-
-        self.assertTrue(arguments.kiosk_permissions)
-        self.assertTrue(arguments.install_kiosk_satellite)
-
-    def test_permission_action_never_changes_accessibility_services(self) -> None:
-        calls: list[list[str]] = []
-
-        def adb_run(
-            arguments: list[str],
-            timeout: float | None = None,
-            check: bool = False,
-        ) -> subprocess.CompletedProcess[str]:
-            del timeout, check
-            calls.append(arguments)
-            output = "Events injected: 1\n" if "monkey" in arguments else ""
-            return subprocess.CompletedProcess(arguments, 0, output)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                kiosk_permissions=True,
-            )
-            with (
-                mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
-                mock.patch.object(provisioner, "verify_kiosk_permissions"),
-            ):
-                provisioner.apply_kiosk_permissions()
-
-        rendered = [" ".join(command) for command in calls]
-        self.assertEqual(
-            sum(command.startswith("shell pm grant ") for command in rendered),
-            7,
-        )
-        self.assertEqual(
-            sum(command.startswith("shell appops set ") for command in rendered),
-            3,
-        )
-        self.assertTrue(
-            any("dumpsys deviceidle whitelist +me.jxl.kiosk_satellite" in command
-                for command in rendered)
-        )
-        self.assertFalse(
-            any("enabled_accessibility_services" in command for command in rendered)
-        )
-
-
-class KioskSatelliteInstallCliTest(unittest.TestCase):
-    def test_standalone_install_does_not_select_root_or_audio(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["provision_portal.py", "--install-kiosk-satellite"],
-        ):
-            arguments = parse_args()
-
-        self.assertTrue(arguments.install_kiosk_satellite)
-        self.assertFalse(arguments.audio)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                install_kiosk_satellite=True,
-            )
-            self.assertEqual(
-                provisioner.requested_actions(),
-                {"install_kiosk_satellite": True},
-            )
-            self.assertFalse(provisioner.privileged_requested())
-
-    def test_release_selection_prefers_first_supported_device_abi(self) -> None:
-        tag = "2026.10.23"
-        arm64_name = f"kiosk-satellite-{tag}.arm64-v8a.apk"
-        universal_name = f"kiosk-satellite-{tag}.apk"
-        release = {
-            "tag_name": tag,
-            "assets": [
-                {
-                    "name": universal_name,
-                    "browser_download_url": (
-                        f"{KIOSK_RELEASE_DOWNLOAD_PREFIX}{tag}/{universal_name}"
-                    ),
-                    "digest": "sha256:" + "a" * 64,
-                    "size": 200,
-                },
-                {
-                    "name": arm64_name,
-                    "browser_download_url": (
-                        f"{KIOSK_RELEASE_DOWNLOAD_PREFIX}{tag}/{arm64_name}"
-                    ),
-                    "digest": "sha256:" + "b" * 64,
-                    "size": 100,
-                },
-            ],
-        }
-
-        selected = PortalProvisioner.select_kiosk_release_asset(
-            release, ("arm64-v8a", "armeabi-v7a")
-        )
-
-        self.assertEqual(
-            selected,
-            (tag, arm64_name, 100, "b" * 64, "arm64-v8a"),
-        )
-
-    def test_release_selection_rejects_asset_without_github_digest(self) -> None:
-        tag = "2026.10.23"
-        name = f"kiosk-satellite-{tag}.arm64-v8a.apk"
-        release = {
-            "tag_name": tag,
-            "assets": [
-                {
-                    "name": name,
-                    "browser_download_url": (
-                        f"{KIOSK_RELEASE_DOWNLOAD_PREFIX}{tag}/{name}"
-                    ),
-                    "digest": None,
-                    "size": 100,
-                }
-            ],
-        }
-
-        with self.assertRaisesRegex(ProvisionError, "SHA-256"):
-            PortalProvisioner.select_kiosk_release_asset(
-                release, ("arm64-v8a",)
-            )
-
-    def test_existing_install_is_preserved_without_release_lookup(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                install_kiosk_satellite=True,
-            )
-            with (
-                mock.patch.object(
-                    provisioner,
-                    "kiosk_satellite_version",
-                    return_value="2026.10.22",
-                ),
-                mock.patch.object(
-                    provisioner, "resolve_kiosk_satellite_apk"
-                ) as resolve,
-            ):
-                provisioner.ensure_kiosk_satellite()
-
-        resolve.assert_not_called()
-
-    def test_missing_install_is_installed_and_launched(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            apk = pathlib.Path(temporary) / "kiosk-satellite.apk"
-            provisioner = PortalProvisioner(
-                "192.0.2.1:5555",
-                1,
-                pathlib.Path(temporary),
-                install_kiosk_satellite=True,
-            )
-            with (
-                mock.patch.object(
-                    provisioner,
-                    "kiosk_satellite_version",
-                    side_effect=(None, "2026.10.23"),
-                ),
-                mock.patch.object(
-                    provisioner,
-                    "resolve_kiosk_satellite_apk",
-                    return_value=(apk, "2026.10.23", "arm64-v8a"),
-                ),
-                mock.patch.object(
-                    provisioner, "install_apk_preserving_verifier"
-                ) as install,
-                mock.patch.object(provisioner, "settle_package_state"),
-                mock.patch.object(provisioner, "verify_package_verifier_state"),
-                mock.patch.object(
-                    provisioner,
-                    "adb_run",
-                    return_value=subprocess.CompletedProcess(
-                        [], 0, "Events injected: 1\n"
-                    ),
-                ) as adb_run,
-            ):
-                provisioner.ensure_kiosk_satellite()
-
-        install.assert_called_once_with(apk, "kiosk-satellite")
-        self.assertIn("monkey", adb_run.call_args.args[0])
-
+class ApkInstallVerifierBaselineTest(unittest.TestCase):
     def test_each_apk_install_records_its_own_verifier_baseline(self) -> None:
         verifier_states = iter(
             ("", "package:com.facebook.appverifier\n")
@@ -1357,6 +1036,76 @@ class KioskSatelliteInstallCliTest(unittest.TestCase):
                 self.assertTrue(
                     provisioner.package_verifier_before_install_disabled
                 )
+
+class DeKioskScrubTest(unittest.TestCase):
+    """The de-Kiosk scrub: removed flags are rejected, generic set parses."""
+
+    REMOVED = (
+        ["--profile", "kiosk"],
+        ["--install-kiosk-satellite"],
+        ["--kiosk-permissions"],
+        ["--kiosk-home"],
+        ["--restore-kiosk-home"],
+        ["--device-owner"],
+    )
+
+    def test_removed_flags_are_rejected(self) -> None:
+        for argv_tail in self.REMOVED:
+            with self.subTest(argv=argv_tail):
+                with mock.patch.object(
+                    sys, "argv", ["provision_portal.py", *argv_tail]
+                ), mock.patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_args()
+
+    def test_removed_attributes_are_gone(self) -> None:
+        with mock.patch.object(
+            sys, "argv", ["provision_portal.py", "--audio"]
+        ):
+            arguments = parse_args()
+        for name in (
+            "profile",
+            "install_kiosk_satellite",
+            "kiosk_permissions",
+            "device_owner",
+            "kiosk_home",
+            "restore_kiosk_home",
+        ):
+            self.assertFalse(hasattr(arguments, name), name)
+
+    def test_bootstrap_generic_flag_set_parses(self) -> None:
+        # The exact generic flag set bootstrap.sh passes for Portal
+        # devices after the scrub (replacing --profile kiosk).
+        argv = [
+            "provision_portal.py",
+            "--serial", "192.0.2.1:5555",
+            "--audio",
+            "--disable-updates",
+            "--block-remote-wipe",
+            "--debloat",
+            "--remove-meta-accounts",
+            "--optimize-presence",
+            "--allow-app-updates",
+            "--disable-adb-auth-timeout",
+            "--verify-boots", "1",
+            "--shizuku",
+            "--custom-payload",
+            "--autoroot",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            arguments = parse_args()
+        self.assertTrue(arguments.audio)
+        self.assertTrue(arguments.disable_updates)
+        self.assertTrue(arguments.block_remote_wipe)
+        self.assertTrue(arguments.debloat)
+        self.assertTrue(arguments.remove_meta_accounts)
+        self.assertTrue(arguments.optimize_presence)
+        self.assertTrue(arguments.allow_app_updates)
+        self.assertTrue(arguments.disable_adb_auth_timeout)
+        self.assertEqual(arguments.verify_boots, 1)
+        self.assertTrue(arguments.shizuku)
+        self.assertTrue(arguments.autoroot)
+        self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
 
 
 if __name__ == "__main__":

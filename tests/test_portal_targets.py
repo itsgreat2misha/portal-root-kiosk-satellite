@@ -187,8 +187,6 @@ class PortalTargetSelectionTest(unittest.TestCase):
             portal_plus.debloat_component_profile,
             "portal-plus-aloha-safe-v1",
         )
-        self.assertEqual(portal.kiosk_permission_settle_seconds, 30)
-        self.assertEqual(portal_plus.kiosk_permission_settle_seconds, 0)
 
         self.assertIs(
             find_target(portal.device, portal.fingerprint, "Portal"), portal
@@ -229,7 +227,6 @@ class PortalTargetSelectionTest(unittest.TestCase):
             "system_theme_uid1000_required",
             "audio_java_fallback",
             "audio_installer_credentials",
-            "device_owner_system_credentials",
             "ota_installer_credentials",
             "meta_accounts_system_credentials",
             "meta_accounts_skip_force_stop",
@@ -267,7 +264,6 @@ class PortalTargetSelectionTest(unittest.TestCase):
         self.assertEqual(ripley.post_boot_adb_settle_seconds, 5)
         self.assertTrue(ripley.audio_java_fallback)
         self.assertTrue(ripley.audio_installer_credentials)
-        self.assertTrue(ripley.device_owner_system_credentials)
         self.assertTrue(ripley.uid1000_embedded_helper)
         self.assertTrue(ripley.uid1000_installer_credentials)
         self.assertEqual(ripley.uid1000_helper_make_target, "aloha")

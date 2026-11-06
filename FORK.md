@@ -5,9 +5,9 @@ Fork of [jxlarrea/portal-root-kiosk-satellite](https://github.com/jxlarrea/porta
 points at this fork. All changes are in `tools/provision_portal.py`:
 
 1. **A failed bootstrap phase no longer starves the rest of the run.**
-   Each dedicated bootstrap phase (audio, device owner, OTA, Meta accounts,
+   Each dedicated bootstrap phase (audio, OTA, Meta accounts,
    debloat, remote-wipe, presence, presence FPS) is wrapped in
-   `bootstrap_guard()`. In a multi-action run (e.g. `--profile kiosk`) a
+   `bootstrap_guard()`. In a multi-action run a
    phase failure is recorded, `PHASE_FAILED` is printed, the remaining
    phases and the main pass still run, and the run fails at the end via
    `report_deferred_failures()` with the collected list. Previously, e.g.
@@ -236,12 +236,14 @@ name. Full plan: maintained with the goal workspace
   and its daemon-protocol client is deleted.
 - Audio tuning (--audio) is opt-in only, default off, never bundled
   into a profile - it serves voice flows, not root/debloat.
-- De-Kiosk (at the clean relaunch): the kiosk feature flags, the
-  kiosk profile bundle, the Kiosk framing in the README, and
-  "kiosk-satellite" in the name all go - this becomes a general
-  Portal root provisioner. One deliberate survivor: a credits line
-  in the README naming the original creator. The root stack itself
-  never referenced Kiosk and needs no changes for this.
+- De-Kiosk: the kiosk feature flags, the kiosk profile bundle,
+  and the Kiosk framing in the README all go - this becomes a
+  general Portal root provisioner. One deliberate survivor: a
+  credits line in the README naming the original creator. The root
+  stack itself never referenced Kiosk and needs no changes for
+  this. (Done early — see section 13; only dropping
+  "kiosk-satellite" from the repo name waits for the clean
+  relaunch.)
 
 ## 12. Adjusted plan: root adb removed, CLI streamlining (2026-11-05)
 
@@ -284,6 +286,61 @@ presented as equivalent to the default Shizuku-root configuration.
 - A standalone `--custom-payload` no longer falls through to the
   default audio action.
 
-Next, in order: the de-Kiosk scrub (section 11), then the release
+The de-Kiosk scrub followed (section 13). Next: the release
 polish. Live validation of this change is recorded in the goal
 workspace log.
+
+## 13. De-Kiosk scrub (2026-11-06)
+
+The provisioner is now a general Portal root provisioner. The whole
+Kiosk Satellite feature surface was removed from
+`tools/provision_portal.py`:
+
+- Flags gone: `--profile` (its only choice was `kiosk`),
+  `--install-kiosk-satellite`, `--kiosk-permissions`, `--kiosk-home`,
+  `--restore-kiosk-home`, and `--device-owner`.
+- Backing code gone: the KS package/component constants, the
+  Kiosk Satellite GitHub-release APK fetch/install, permission
+  apply/verify/status, home configure/verify, the device-owner flow
+  (preflight, verify, the exploit-environment promotion, and its
+  bootstrap-guard sub-run), and the `kiosk_satellite` section of
+  `--status` output. The two target fields that only served those
+  features (`kiosk_permission_settle_seconds`,
+  `device_owner_system_credentials`) were removed from
+  `tools/portal_targets.py` as well.
+- `PROJECT_URL` now points at this fork; the product banner reads
+  "Meta Portal Root Provisioner". (The only User-Agent strings in
+  the provisioner belonged to the deleted release fetch.)
+- README repositioned: no Kiosk framing in the title, intro, or
+  usage; the four Kiosk feature sections and the profile are gone.
+  One deliberate survivor, per the section 11 decision: the credits
+  line naming jxlarrea as the original creator this was forked
+  from. Apache-2.0 notices in modified files are unchanged.
+
+Everything generic is untouched: the standard install/exploit flow,
+lock repair, debloat, Meta-account removal, update blocking,
+remote-wipe blocking, presence optimization, app updates, ADB auth
+timeout, DNS, audio (still opt-in only, never bundled), Shizuku
+install/root, custom payload, autoroot, and verify reboots.
+
+The Kiosk steps the provisioner used to own now live in the owner's
+`bootstrap.sh`, next to its existing non-Portal flow: it passes the
+provisioner the explicit generic flag set the `kiosk` profile used
+to expand to (minus the Kiosk flags), and after the Portal kiosk
+setup it sets Kiosk Satellite as device owner (`dpm
+set-active-admin` + `dpm set-device-owner`, best-effort) and as the
+default launcher (`cmd package set-home-activity`).
+
+Deliberately kept, and why:
+
+- The repo name still contains "kiosk-satellite" (clone URL,
+  `PROJECT_URL`, the banner's URL line). The rename happens at the
+  Phase 5 clean relaunch, not now.
+- The exploit's native device-owner install branch
+  (`GHOSTLOCK_KIOSK_DEVICE_OWNER` in `exploit/src/fops.c` and its
+  per-target copy) is now unreachable — the provisioner no longer
+  sets that variable — but the native code is left in place:
+  removing it would mean rebuilding and re-validating the exploit
+  payloads for zero runtime effect.
+- `docs/` keeps its historical Kiosk references; those are dated
+  status/findings records, not product framing.
