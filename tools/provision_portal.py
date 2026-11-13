@@ -674,22 +674,29 @@ class PortalProvisioner:
         last_boot_id = ""
         while time.monotonic() < deadline:
             try:
-                self.run(["adb", "connect", self.serial], timeout=5)
-                state = self.adb_run(["get-state"], timeout=5)
-                completed = self.adb_run(
-                    ["shell", "getprop", "sys.boot_completed"], timeout=5
+                # One adb invocation per poll tick: a single shell call
+                # returns both the boot-completed flag and the boot ID.
+                # A failed shell call means the transport is down, which
+                # is the only case that needs an explicit reconnect.
+                probe = self.adb_run(
+                    [
+                        "shell",
+                        "getprop sys.boot_completed; "
+                        "cat /proc/sys/kernel/random/boot_id",
+                    ],
+                    timeout=5,
                 )
-                boot = self.adb_run(
-                    ["shell", "cat", "/proc/sys/kernel/random/boot_id"], timeout=5
-                )
-                observed_boot_id = boot.stdout.strip()
-                if boot.returncode == 0 and re.fullmatch(
-                    r"[0-9a-fA-F-]{36}", observed_boot_id
-                ):
+                if probe.returncode != 0:
+                    self.run(["adb", "connect", self.serial], timeout=5)
+                    time.sleep(3)
+                    continue
+                fields = probe.stdout.split()
+                completed = fields[0] if fields else ""
+                observed_boot_id = fields[1] if len(fields) > 1 else ""
+                if re.fullmatch(r"[0-9a-fA-F-]{36}", observed_boot_id):
                     last_boot_id = observed_boot_id
                 if (
-                    state.returncode == 0
-                    and completed.stdout.strip() == "1"
+                    completed == "1"
                     and last_boot_id
                     and last_boot_id != before
                 ):
@@ -700,7 +707,6 @@ class PortalProvisioner:
                     )
                     if settle_seconds:
                         time.sleep(settle_seconds)
-                        self.run(["adb", "connect", self.serial], timeout=5)
                         stable = self.adb_run(
                             ["shell", "getprop", "sys.boot_completed"],
                             timeout=5,
@@ -709,6 +715,9 @@ class PortalProvisioner:
                             stable.returncode != 0
                             or stable.stdout.strip() != "1"
                         ):
+                            self.run(
+                                ["adb", "connect", self.serial], timeout=5
+                            )
                             time.sleep(3)
                             continue
                     return last_boot_id
@@ -2839,6 +2848,7 @@ class PortalProvisioner:
                 print("SHIZUKU_HELPER_ACTIVATION_PENDING early_boot=1")
             print("SHIZUKU_HELPER_ACTIVATED first_install=1")
         deadline = time.monotonic() + wait_seconds
+        since = self.logcat_watermark()
         process = ""
         logs = ""
         while time.monotonic() < deadline:
@@ -2848,10 +2858,7 @@ class PortalProvisioner:
             process = self.adb_run(
                 ["shell", "ps", "-A"], timeout=10, check=True
             ).stdout
-            logs = self.adb_run(
-                ["shell", "logcat", "-d", "-s", "PortalShizuku:*"],
-                timeout=15,
-            ).stdout
+            logs = self.logcat_poll("PortalShizuku", since, timeout=15)
             process_line = next(
                 (line for line in process.splitlines() if "shizuku_server" in line),
                 "",
@@ -5166,15 +5173,44 @@ class PortalProvisioner:
         ns = re.search(r"param=4001 .*after=0 .*ok=1", logs)
         return bool(aec and ns)
 
+    def logcat_watermark(self) -> str | None:
+        """Current device wall-clock in logcat -t format, or None.
+
+        Verify loops poll logcat while waiting for a marker line. Each
+        poll used to dump the tag's whole retained buffer; capturing a
+        watermark when the wait starts lets each poll ask logcat only
+        for lines at or after the wait began (older lines can only be
+        stale markers from earlier phases of the same boot). Returns
+        None when the device clock cannot be read, in which case the
+        caller falls back to a plain full dump.
+        """
+        result = self.adb_run(
+            ["shell", "date '+%m-%d %H:%M:%S.000'"], timeout=5
+        )
+        stamp = result.stdout.strip()
+        if result.returncode == 0 and re.fullmatch(
+            r"\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000", stamp
+        ):
+            return stamp
+        return None
+
+    def logcat_poll(
+        self, tag: str, since: str | None, timeout: int = 10
+    ) -> str:
+        """Tag-filtered logcat dump, optionally only since a watermark."""
+        # Single-string shell command: the -t timestamp contains a
+        # space and adb's list-form shell joining would split it.
+        command = f"logcat -d -s {tag}:*"
+        if since is not None:
+            command = f"logcat -d -t '{since}' -s {tag}:*"
+        return self.adb_run(["shell", command], timeout=timeout).stdout
+
     def verify_watchdog(self, wait_seconds: int = 25) -> str:
         deadline = time.monotonic() + wait_seconds
+        since = self.logcat_watermark()
         last_log = ""
         while time.monotonic() < deadline:
-            result = self.adb_run(
-                ["shell", "logcat", "-d", "-s", "PortalAudioPersist:*"],
-                timeout=10,
-            )
-            last_log = result.stdout
+            last_log = self.logcat_poll("PortalAudioPersist", since)
             started = "persistent audio watchdog started" in last_log
             disabled = self.audio_processing_disabled_observed(
                 last_log, self.target
@@ -5220,23 +5256,19 @@ class PortalProvisioner:
         ).returncode != 0:
             raise ProvisionError("audio restore marker is absent")
         deadline = time.monotonic() + wait_seconds
+        since = self.logcat_watermark()
         logs = ""
         pid = ""
         while time.monotonic() < deadline:
             pid = self.adb_run(
                 ["shell", "pidof", "com.facebook.portal.aiservice"], timeout=5
             ).stdout.strip()
-            logs = self.adb_run(
-                ["shell", "logcat", "-d", "-s", "PortalAudioPersist:*"],
-                timeout=10,
-            ).stdout
+            logs = self.logcat_poll("PortalAudioPersist", since)
             if pid:
                 time.sleep(3)
                 break
             time.sleep(2)
-        logs = self.adb_run(
-            ["shell", "logcat", "-d", "-s", "PortalAudioPersist:*"], timeout=10
-        ).stdout
+        logs = self.logcat_poll("PortalAudioPersist", since)
         if not pid or "persistent audio watchdog started" in logs:
             raise ProvisionError(
                 "audio persistence restore did not verify: "
@@ -6563,6 +6595,7 @@ class PortalProvisioner:
             ).returncode != 0:
                 raise ProvisionError("camera-light watchdog executable is absent")
         deadline = time.monotonic() + wait_seconds
+        since = self.logcat_watermark()
         last_process = ""
         last_logs = ""
         while time.monotonic() < deadline:
@@ -6580,10 +6613,7 @@ class PortalProvisioner:
                 ),
                 "",
             )
-            last_logs = self.adb_run(
-                ["shell", "logcat", "-d", "-s", "PortalCameraLed:*"],
-                timeout=10,
-            ).stdout
+            last_logs = self.logcat_poll("PortalCameraLed", since)
             if last_process and "watchdog connected uid=1000" in last_logs:
                 selinux = self.adb_run(
                     ["shell", "getenforce"], timeout=5, check=True
