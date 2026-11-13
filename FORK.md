@@ -344,3 +344,29 @@ Deliberately kept, and why:
   payloads for zero runtime effect.
 - `docs/` keeps its historical Kiosk references; those are dated
   status/findings records, not product framing.
+
+## 14. Streamlining — safe bucket (2026-11-13)
+
+Five no-behavior-change (except defaults) cuts, each aimed at work the
+fleet runs showed being repeated needlessly:
+
+- `kaslr_base()` no longer re-pushes the bundled simpleperf binary on
+  every attempt: `simpleperf_push_needed()` hashes the on-device copy
+  and skips push+chmod when it matches the local binary. Any doubt
+  (missing file, no `sha256sum`, mismatch) still pushes. KASLR values
+  themselves remain per-boot, never cached.
+- `install_apk_preserving_verifier()` accepts an optional package
+  name; when given, `installed_apk_matches()` pulls the installed base
+  APK and skips the push+reinstall when it is byte-identical
+  (`APK_INSTALL_SKIP`). Wired for Shizuku, the Shizuku/autoroot/
+  presence helpers, the exploit sentinel, and the uid1000 runtime.
+- `write_state()` inputs are cached per provisioner instance: the git
+  tool revision is computed once, and artifact SHA-256 hashes are
+  recomputed only when a candidate file's size/mtime changes.
+- `--verify-boots` now defaults to 1 (was 2). Two-boot verification
+  remains available explicitly.
+- `settle_package_state()` no longer sleeps 15 s by default. The
+  PackageManager async-write settle only matters when a reboot
+  immediately follows, and no call site does that (intervening host
+  work always exceeds the window); the `sync` is kept. Call sites
+  whose next step is a reboot must pass `before_reboot=True`.

@@ -526,7 +526,7 @@ class VerifyBootsTests(unittest.TestCase):
 
     def test_verify_boots_cli(self):
         with mock.patch.object(sys, 'argv', ['provision_portal.py']):
-            self.assertEqual(parse_args().verify_boots, 2)
+            self.assertEqual(parse_args().verify_boots, 1)
         with mock.patch.object(
             sys, 'argv', ['provision_portal.py', '--verify-boots', '1']
         ):

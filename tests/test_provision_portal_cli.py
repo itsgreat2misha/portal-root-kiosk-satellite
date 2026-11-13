@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import pathlib
@@ -14,8 +15,11 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+import provision_portal as provision_portal_module  # noqa: E402
+
 from provision_portal import (  # noqa: E402
     ADB_AUTH_TIMEOUT_BACKUP_REMOTE,
+    PACKAGE_STATE_SETTLE_SECONDS,
     ADB_ENABLED_SETTING,
     DEFAULT_CUSTOM_PAYLOAD_LOCAL,
     MHA_AUDIO_VERIFIED_LOG,
@@ -1036,6 +1040,144 @@ class ApkInstallVerifierBaselineTest(unittest.TestCase):
                 self.assertTrue(
                     provisioner.package_verifier_before_install_disabled
                 )
+
+
+class StreamliningTest(unittest.TestCase):
+    """Safe-bucket streamlining: skip work already done, cache per run."""
+
+    def _provisioner(self, temporary: str) -> PortalProvisioner:
+        return PortalProvisioner(
+            "192.0.2.1:5555", 1, pathlib.Path(temporary)
+        )
+
+    def test_settle_skips_sleep_without_immediate_reboot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            sleeps: list[float] = []
+            with (
+                mock.patch.object(
+                    provision_portal_module, "time"
+                ) as fake_time,
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess([], 0, ""),
+                ),
+            ):
+                fake_time.sleep.side_effect = sleeps.append
+                provisioner.settle_package_state()
+                self.assertEqual(sleeps, [])
+                provisioner.settle_package_state(before_reboot=True)
+                self.assertEqual(sleeps, [PACKAGE_STATE_SETTLE_SECONDS])
+
+    def test_tool_revision_is_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            calls: list = []
+
+            def fake_run(arguments, timeout=None):
+                calls.append(arguments)
+                output = "" if "status" in arguments else "abc123\n"
+                return subprocess.CompletedProcess(arguments, 0, output)
+
+            with mock.patch.object(provisioner, "run", side_effect=fake_run):
+                self.assertEqual(provisioner.tool_revision(), "abc123")
+                self.assertEqual(provisioner.tool_revision(), "abc123")
+            self.assertEqual(len(calls), 2)
+
+    def test_artifact_hashes_are_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            real_read_bytes = pathlib.Path.read_bytes
+            reads: list[pathlib.Path] = []
+
+            def counting_read_bytes(self_path):
+                reads.append(self_path)
+                return real_read_bytes(self_path)
+
+            with mock.patch.object(
+                pathlib.Path, "read_bytes", counting_read_bytes
+            ):
+                first = provisioner.selected_artifact_hashes()
+                count_after_first = len(reads)
+                second = provisioner.selected_artifact_hashes()
+            self.assertGreater(count_after_first, 0)
+            self.assertEqual(len(reads), count_after_first)
+            self.assertEqual(first, second)
+
+    def test_simpleperf_push_needed(self) -> None:
+        import hashlib as _hashlib
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            local = pathlib.Path(temporary) / "simpleperf"
+            local.write_bytes(b"binary-bytes")
+            digest = _hashlib.sha256(b"binary-bytes").hexdigest()
+
+            def adb_with(stdout: str, returncode: int = 0):
+                return mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], returncode, stdout
+                    ),
+                )
+
+            with adb_with(f"{digest}  /data/local/tmp/portal-simpleperf\n"):
+                self.assertFalse(
+                    provisioner.simpleperf_push_needed(
+                        local, "/data/local/tmp/portal-simpleperf"
+                    )
+                )
+            with adb_with("0" * 64 + "  /data/local/tmp/portal-simpleperf\n"):
+                self.assertTrue(
+                    provisioner.simpleperf_push_needed(
+                        local, "/data/local/tmp/portal-simpleperf"
+                    )
+                )
+            with adb_with("", returncode=1):
+                self.assertTrue(
+                    provisioner.simpleperf_push_needed(
+                        local, "/data/local/tmp/portal-simpleperf"
+                    )
+                )
+
+    def test_apk_install_skipped_when_installed_copy_is_identical(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            apk = pathlib.Path(temporary) / "payload.apk"
+            apk.write_bytes(b"apk-bytes")
+            seen: list[list[str]] = []
+
+            def adb_run(arguments, timeout=None, check=False):
+                del timeout, check
+                seen.append(list(arguments))
+                if arguments[:4] == ["shell", "pm", "path", "com.example.x"]:
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        "package:/data/app/com.example.x/base.apk\n",
+                    )
+                if arguments[0] == "pull":
+                    pathlib.Path(arguments[2]).write_bytes(b"apk-bytes")
+                    return subprocess.CompletedProcess(arguments, 0, "")
+                raise AssertionError(f"unexpected adb call: {arguments}")
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                provisioner.install_apk_preserving_verifier(
+                    apk, "payload", "com.example.x"
+                )
+            self.assertIn("APK_INSTALL_SKIP", stdout.getvalue())
+            self.assertFalse(any(call[0] == "push" for call in seen))
+
 
 class DeKioskScrubTest(unittest.TestCase):
     """The de-Kiosk scrub: removed flags are rejected, generic set parses."""

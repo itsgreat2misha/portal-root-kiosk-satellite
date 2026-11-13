@@ -262,7 +262,7 @@ class PortalProvisioner:
         custom_payload: pathlib.Path | None = None,
         skip_shizuku_root: bool = False,
         autoroot: bool = False,
-        verify_boots: int = 2,
+        verify_boots: int = 1,
         status_only: bool = False,
         dry_run: bool = False,
         backup_path: pathlib.Path | None = None,
@@ -327,6 +327,9 @@ class PortalProvisioner:
         self.skip_shizuku_root = skip_shizuku_root
         self.autoroot = autoroot
         self.verify_boots = verify_boots
+        self._tool_revision_cache: str | None = None
+        self._artifact_hashes_cache: dict[str, str] | None = None
+        self._artifact_hashes_key: tuple | None = None
         if self.verify_boots not in (1, 2):
             raise ProvisionError('--verify-boots must be 1 or 2')
         self.shizuku_public_key: pathlib.Path | None = None
@@ -959,10 +962,13 @@ class PortalProvisioner:
         return actions
 
     def tool_revision(self) -> str:
+        if self._tool_revision_cache is not None:
+            return self._tool_revision_cache
         result = self.run(
             ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], timeout=5
         )
         if result.returncode != 0:
+            self._tool_revision_cache = "unknown"
             return "unknown"
         revision = result.stdout.strip()
         dirty = self.run(
@@ -970,6 +976,7 @@ class PortalProvisioner:
         )
         if dirty.returncode == 0 and dirty.stdout.strip():
             revision += "-dirty"
+        self._tool_revision_cache = revision
         return revision
 
     def selected_artifact_hashes(self) -> dict[str, str]:
@@ -1000,6 +1007,16 @@ class PortalProvisioner:
             )
             if self.target and self.target.uid1000_embedded_helper:
                 candidates.append(UID1000_RUNTIME_APK_LOCAL)
+        cache_key = tuple(
+            (str(path), path.stat().st_size, path.stat().st_mtime_ns)
+            if path.is_file()
+            else (str(path), -1, -1)
+            for path in candidates
+        )
+        if self._artifact_hashes_cache is not None and (
+            self._artifact_hashes_key == cache_key
+        ):
+            return dict(self._artifact_hashes_cache)
         hashes: dict[str, str] = {}
         for path in candidates:
             if path.is_file():
@@ -1008,6 +1025,8 @@ class PortalProvisioner:
                 except ValueError:
                     name = str(path)
                 hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        self._artifact_hashes_cache = dict(hashes)
+        self._artifact_hashes_key = cache_key
         return hashes
 
     def read_state(self) -> dict[str, object] | None:
@@ -2409,9 +2428,9 @@ class PortalProvisioner:
 
     def install_shizuku_payload(self) -> None:
         apk = self.resolve_shizuku_apk()
-        self.install_apk_preserving_verifier(apk, "shizuku")
+        self.install_apk_preserving_verifier(apk, "shizuku", SHIZUKU_PACKAGE)
         self.install_apk_preserving_verifier(
-            SHIZUKU_HELPER_LOCAL, "shizuku-helper"
+            SHIZUKU_HELPER_LOCAL, "shizuku-helper", SHIZUKU_HELPER_PACKAGE
         )
         self.settle_package_state()
         self.verify_package_verifier_state()
@@ -2506,8 +2525,53 @@ class PortalProvisioner:
             f"helper={SHIZUKU_HELPER_PACKAGE} key_reused={int(key_exists)}"
         )
 
-    def install_apk_preserving_verifier(self, apk: pathlib.Path, tag: str) -> None:
+    def installed_apk_matches(
+        self, apk: pathlib.Path, package: str, tag: str
+    ) -> bool:
+        """True when the installed base APK is byte-identical to apk.
+
+        Compares by hash: pulling the installed base APK back is far
+        cheaper than a push + reinstall + settle of the same bytes, and
+        needs no per-package version table that could drift from the
+        built artifacts.
+        """
+        path_result = self.adb_run(
+            ["shell", "pm", "path", package], timeout=15
+        )
+        if path_result.returncode != 0:
+            return False
+        match = re.search(
+            r"^package:(.+\.apk)$", path_result.stdout, re.MULTILINE
+        )
+        if not match:
+            return False
+        pulled = self.log_dir / f"portal-{tag}-installed.apk"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            pull = self.adb_run(
+                ["pull", match.group(1), str(pulled)], timeout=300
+            )
+            if pull.returncode != 0 or not pulled.is_file():
+                return False
+            return hashlib.sha256(pulled.read_bytes()).hexdigest() == (
+                hashlib.sha256(apk.read_bytes()).hexdigest()
+            )
+        finally:
+            pulled.unlink(missing_ok=True)
+
+    def install_apk_preserving_verifier(
+        self,
+        apk: pathlib.Path,
+        tag: str,
+        package: str | None = None,
+    ) -> None:
         """Install an APK while restoring Meta's certificate verifier state."""
+        if package is not None and self.installed_apk_matches(apk, package, tag):
+            print(
+                f"APK_INSTALL_SKIP package={package} reason=identical",
+                flush=True,
+            )
+            return
         remote = f"/data/local/tmp/portal-{tag}-install.apk"
         # Remote support tunnels can sustain far less throughput than a local
         # USB or LAN ADB connection. Allow at least 32 KiB/s plus two minutes
@@ -2701,7 +2765,7 @@ class PortalProvisioner:
 
     def install_uid1000_runtime_payload(self) -> None:
         self.install_apk_preserving_verifier(
-            UID1000_RUNTIME_APK_LOCAL, "uid1000-runtime"
+            UID1000_RUNTIME_APK_LOCAL, "uid1000-runtime", UID1000_RUNTIME_PACKAGE
         )
         package_path = self.adb_run(
             ["shell", "pm", "path", UID1000_RUNTIME_PACKAGE],
@@ -3293,6 +3357,25 @@ class PortalProvisioner:
         )
         return True
 
+    def simpleperf_push_needed(
+        self, local: pathlib.Path, remote: str
+    ) -> bool:
+        """True unless the on-device binary already hashes identically.
+
+        KASLR values are per-boot and can never be cached, but the
+        simpleperf binary itself does not change between attempts, so
+        re-pushing it on every attempt is pure transfer time. Any doubt
+        (missing file, no sha256sum, mismatch) falls back to pushing.
+        """
+        local_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+        result = self.adb_run(
+            ["shell", "sha256sum", remote], timeout=20
+        )
+        if result.returncode != 0:
+            return True
+        fields = result.stdout.split()
+        return not fields or fields[0].lower() != local_hash
+
     def kaslr_base(self, tag: str) -> int:
         if self.target is None:
             raise ProvisionError("target must be selected before KASLR discovery")
@@ -3341,14 +3424,20 @@ class PortalProvisioner:
                     "set ANDROID_NDK_HOME to the installed NDK directory"
                 )
             simpleperf = "/data/local/tmp/portal-simpleperf"
-            self.adb_run(
-                ["push", str(local_simpleperf), simpleperf],
-                timeout=120,
-                check=True,
-            )
-            self.adb_run(
-                ["shell", "chmod", "0755", simpleperf], timeout=20, check=True
-            )
+            if self.simpleperf_push_needed(local_simpleperf, simpleperf):
+                self.adb_run(
+                    ["push", str(local_simpleperf), simpleperf],
+                    timeout=120,
+                    check=True,
+                )
+                self.adb_run(
+                    ["shell", "chmod", "0755", simpleperf], timeout=20, check=True
+                )
+            else:
+                print(
+                    "SIMPLEPERF_PUSH_SKIP reason=on-device-hash-matches",
+                    flush=True,
+                )
         for sample_try in range(3):
             remote = f"/data/local/tmp/portal-perf-{tag}-{sample_try}.data"
             command = (
@@ -3389,7 +3478,7 @@ class PortalProvisioner:
 
     def prepare_presence_helper(self) -> None:
         self.install_apk_preserving_verifier(
-            PRESENCE_HELPER_LOCAL, "presence-helper"
+            PRESENCE_HELPER_LOCAL, "presence-helper", PRESENCE_HELPER_PACKAGE
         )
         self.settle_package_state()
         self.verify_package_verifier_state()
@@ -3530,7 +3619,9 @@ class PortalProvisioner:
             )
         try:
             self.install_apk_preserving_verifier(
-                EXPLOIT_SENTINEL_LOCAL, "exploit-sentinel"
+                EXPLOIT_SENTINEL_LOCAL,
+                "exploit-sentinel",
+                EXPLOIT_SENTINEL_PACKAGE,
             )
             self.settle_package_state()
             result = self.adb_run(
@@ -4885,7 +4976,7 @@ class PortalProvisioner:
                 "target pushes it during the custom-payload attempts"
             )
         self.install_apk_preserving_verifier(
-            AUTOROOT_HELPER_LOCAL, "autoroot-helper"
+            AUTOROOT_HELPER_LOCAL, "autoroot-helper", AUTOROOT_HELPER_PACKAGE
         )
         self.settle_package_state()
         self.verify_package_verifier_state()
@@ -5828,9 +5919,21 @@ class PortalProvisioner:
         self.settle_package_state()
         self.verify_debloat_restored(require_components=False)
 
-    def settle_package_state(self) -> None:
+    def settle_package_state(self, before_reboot: bool = False) -> None:
         # PackageManager writes package-restrictions.xml asynchronously. An
         # immediate reboot can discard a state that pm already reports live.
+        # No current call site is immediately followed by a reboot: the
+        # intervening host work (key reads, staging, exploit discovery)
+        # always exceeds the settle window, so the fixed sleep is pure
+        # latency there. Pass before_reboot=True at any future call site
+        # whose next step actually is a reboot.
+        if not before_reboot:
+            print(
+                "PACKAGE_STATE_SETTLE_SKIPPED reason=no-immediate-reboot",
+                flush=True,
+            )
+            self.adb_run(["shell", "sync"], timeout=60, check=True)
+            return
         print(
             f"PACKAGE_STATE_SETTLE seconds={PACKAGE_STATE_SETTLE_SECONDS}",
             flush=True,
@@ -7747,11 +7850,11 @@ def parse_args() -> argparse.Namespace:
         "--verify-boots",
         type=int,
         choices=(1, 2),
-        default=2,
+        default=1,
         metavar="{1,2}",
         help=(
             "number of boots to verify the requested state on before "
-            "PROVISION_OK (default: 2); 1 skips the second verification "
+            "PROVISION_OK (default: 1); 2 adds a second verification "
             "reboot"
         ),
     )
