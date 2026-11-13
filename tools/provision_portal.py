@@ -5174,25 +5174,54 @@ class PortalProvisioner:
         return bool(aec and ns)
 
     def logcat_watermark(self) -> str | None:
-        """Current device wall-clock in logcat -t format, or None.
+        """Start of the current boot in logcat -t format, or None.
 
-        Verify loops poll logcat while waiting for a marker line. Each
-        poll used to dump the tag's whole retained buffer; capturing a
-        watermark when the wait starts lets each poll ask logcat only
-        for lines at or after the wait began (older lines can only be
-        stale markers from earlier phases of the same boot). Returns
-        None when the device clock cannot be read, in which case the
-        caller falls back to a plain full dump.
+        Verify loops poll logcat while waiting for a marker line. The
+        markers they wait for are emitted during the current boot --
+        often before the loop itself is entered -- so the watermark
+        must be the boot's start, not the loop's: a loop-entry
+        watermark silently excludes the very lines being waited for
+        (caught live in Run 20, where the audio watchdog check failed
+        against an empty since-loop-entry dump). Each poll then asks
+        logcat only for lines from this boot, skipping earlier phases'
+        output. Computed host-side from the device's local clock minus
+        /proc/uptime (the device's toybox `date -d @epoch` renders UTC
+        regardless of timezone, so it cannot be used for this), with a
+        small safety margin. Returns None when the clock cannot be
+        read, in which case callers fall back to a plain full dump.
         """
         result = self.adb_run(
-            ["shell", "date '+%m-%d %H:%M:%S.000'"], timeout=5
+            ["shell", "date '+%m-%d %H:%M:%S'; cat /proc/uptime"],
+            timeout=5,
         )
-        stamp = result.stdout.strip()
-        if result.returncode == 0 and re.fullmatch(
-            r"\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000", stamp
-        ):
-            return stamp
-        return None
+        if result.returncode != 0:
+            return None
+        lines = result.stdout.splitlines()
+        if len(lines) < 2:
+            return None
+        stamp = lines[0].strip()
+        match = re.fullmatch(
+            r"(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", stamp
+        )
+        if not match:
+            return None
+        try:
+            uptime = float(lines[1].split()[0])
+        except (ValueError, IndexError):
+            return None
+        month, day, hour, minute, second = (
+            int(group) for group in match.groups()
+        )
+        now = dt.datetime(
+            dt.datetime.now().year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        )
+        boot = now - dt.timedelta(seconds=uptime + 2)
+        return boot.strftime("%m-%d %H:%M:%S.000")
 
     def logcat_poll(
         self, tag: str, since: str | None, timeout: int = 10
