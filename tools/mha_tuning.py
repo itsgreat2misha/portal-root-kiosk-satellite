@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 itsgreat2misha
+#
+# Part of the Meta Portal Root Provisioner fork; see LICENSE and NOTICE.
+
 """Validate and patch Omni dynamic MHA tuning blobs."""
 
 from __future__ import annotations

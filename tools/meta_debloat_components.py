@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Originally by Xavier Larrea (jxlarrea); modified by itsgreat2misha.
+# See LICENSE and NOTICE.
+
 """Manifest-derived cloud and background components disabled by --debloat.
 
 This list is intentionally component-scoped so the retained Meta packages can

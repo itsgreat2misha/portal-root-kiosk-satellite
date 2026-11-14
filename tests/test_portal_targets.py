@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Originally by Xavier Larrea (jxlarrea); modified by itsgreat2misha.
+# See LICENSE and NOTICE.
+
 
 import pathlib
 import sys

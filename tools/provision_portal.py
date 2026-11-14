@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Originally by Xavier Larrea (jxlarrea); modified by itsgreat2misha.
+# See LICENSE and NOTICE.
+
 """Inspect, provision, recover, and verify supported Meta Portal devices."""
 
 from __future__ import annotations

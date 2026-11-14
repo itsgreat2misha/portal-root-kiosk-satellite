@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Originally by Xavier Larrea (jxlarrea); modified by itsgreat2misha.
+// See LICENSE and NOTICE.
+
 #include <android/log.h>
 #include <dlfcn.h>
 #include <elf.h>

@@ -1,0 +1,15 @@
+Meta Portal Root Provisioner
+
+This product includes software originally developed by Xavier Larrea
+(jxlarrea, https://github.com/jxlarrea) and released as the Portal
+provisioner at https://github.com/jxlarrea/portal-root-kiosk-satellite
+under the Apache License, Version 2.0.
+
+Modifications and additions in this fork are Copyright 2026
+itsgreat2misha and are licensed under the Apache License, Version 2.0.
+A summary of the fork's changes is recorded in FORK.md.
+
+Third-party software note: Shizuku (by RikkaApps) is not distributed
+with this product. When the Shizuku feature is selected, the
+provisioner downloads the stock Shizuku APK from its upstream release
+at runtime and verifies it against a pinned SHA-256 before use.

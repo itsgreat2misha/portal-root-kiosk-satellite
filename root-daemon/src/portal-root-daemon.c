@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 itsgreat2misha
+//
+// Part of the Meta Portal Root Provisioner fork; see LICENSE and NOTICE.
+
 // portal-root-daemon: minimal per-boot root helper for Meta Portal (aloha).
 //
 // Intended to be started exactly once per boot by a uid-0 delegated child

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 itsgreat2misha
+//
+// Part of the Meta Portal Root Provisioner fork; see LICENSE and NOTICE.
+
 package dev.portal.autoroothelper;
 
 import android.content.BroadcastReceiver;

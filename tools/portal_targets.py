@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Originally by Xavier Larrea (jxlarrea); modified by itsgreat2misha.
+# See LICENSE and NOTICE.
+
 """Exact-build Portal targets supported by the host provisioner."""
 
 from __future__ import annotations
