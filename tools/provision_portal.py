@@ -7800,7 +7800,14 @@ def parse_args() -> argparse.Namespace:
             "Portal devices."
         )
     )
-    parser.add_argument("--serial", default="192.168.1.72:5555")
+    parser.add_argument(
+        "--serial",
+        default=None,
+        help=(
+            "adb serial of the target Portal (required), e.g. "
+            "192.0.2.1:5555 for wireless adb or a USB serial"
+        ),
+    )
     parser.add_argument("--attempts", type=int, default=12)
     parser.add_argument(
         "--persistent-wireless-adb",
@@ -8191,6 +8198,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not args.serial:
+        print(
+            "PROVISION_ERROR: --serial is required; pass the target Portal's "
+            "adb serial (e.g. --serial 192.0.2.1:5555)",
+            file=sys.stderr,
+        )
+        return 2
     print_banner()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = args.log_dir or pathlib.Path(f"/tmp/portal-provision-{stamp}")

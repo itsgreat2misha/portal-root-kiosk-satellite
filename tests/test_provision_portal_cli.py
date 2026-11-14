@@ -355,6 +355,19 @@ class CustomPayloadCliTest(unittest.TestCase):
         self.assertFalse(arguments.shizuku)
         self.assertFalse(arguments.autoroot)
 
+    def test_serial_has_no_default(self) -> None:
+        arguments = self.parse([])
+        self.assertIsNone(arguments.serial)
+
+    def test_main_rejects_missing_serial(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["provision_portal.py"]),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            result = provision_portal_module.main()
+        self.assertEqual(result, 2)
+        self.assertIn("--serial is required", stderr.getvalue())
+
     def test_bare_custom_payload_does_not_enable_default_audio(self) -> None:
         arguments = self.parse(["--custom-payload"])
 
