@@ -1,0 +1,117 @@
+name: Release
+
+# Tag-driven: pushing a tag like v1.0.0 builds every target's
+# binaries from a clean checkout and publishes them as a GitHub
+# release with SHA-256 checksums. The tag must match
+# PROVISIONER_VERSION in tools/provision_portal.py (with the leading
+# "v"); a "-dev" version can never be released.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches PROVISIONER_VERSION
+        run: |
+          VERSION="$(grep -oP 'PROVISIONER_VERSION = "\K[^"]+' tools/provision_portal.py)"
+          echo "PROVISIONER_VERSION=$VERSION, tag=${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match v${VERSION}" >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            *-dev*) echo "refusing to release a -dev version" >&2; exit 1 ;;
+          esac
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install pinned Android SDK components
+        run: |
+          sdkmanager "ndk;28.2.13676358" "build-tools;37.0.0" "platforms;android-36"
+
+      # The helper Makefiles sign APKs with the standard debug
+      # keystore, exactly as a local from-source build does today.
+      - name: Create debug keystore for APK signing
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      # Build through the provisioner's own build() so CI produces
+      # exactly what a local run produces: every target, every
+      # optional component on.
+      - name: Build all targets and helpers
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          sys.path.insert(0, "tools")
+          from portal_targets import TARGETS
+          from provision_portal import build
+
+          seen = set()
+          for target in TARGETS:
+              if target.key in seen:
+                  continue
+              seen.add(target.key)
+              build(
+                  target,
+                  build_audio=True,
+                  build_account=True,
+                  build_components=True,
+                  build_shizuku=True,
+                  build_autoroot=True,
+                  build_presence=True,
+                  build_uid1000=True,
+                  build_sentinel=True,
+                  build_daemon=True,
+              )
+          print(f"built {len(seen)} targets")
+          PYEOF
+
+      - name: Package binaries with SHA-256 checksums
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST="portal-root-provisioner-${VERSION}"
+          mkdir -p "dist/${DIST}"
+          # All build outputs (exploit libraries, helper APKs, the
+          # root daemon) land in per-component build/ directories.
+          find . -path ./dist -prune -o -type d -name build -print |
+          while read -r dir; do
+            mkdir -p "dist/${DIST}/${dir}"
+            cp -r "${dir}/." "dist/${DIST}/${dir}/"
+          done
+          cp -r tools dist/"${DIST}"/tools
+          cp README.md FORK.md CHANGELOG.md LICENSE NOTICE dist/"${DIST}"/
+          tar -czf "dist/${DIST}-binaries.tar.gz" -C dist "${DIST}"
+          (cd dist && sha256sum "${DIST}-binaries.tar.gz" > SHA256SUMS)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*-binaries.tar.gz dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

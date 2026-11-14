@@ -44,6 +44,11 @@ from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# Single source of truth for the provisioner version. Release tags must
+# read "v" + this string (the release workflow enforces the match).
+# The "-dev" suffix marks an untagged development state; it is dropped
+# in the commit that cuts a release.
+PROVISIONER_VERSION = "1.0.0-dev"
 PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
@@ -7803,6 +7808,11 @@ def parse_args() -> argparse.Namespace:
             "Inspect, back up, provision, recover, and verify supported Meta "
             "Portal devices."
         )
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {PROVISIONER_VERSION}",
     )
     parser.add_argument(
         "--serial",

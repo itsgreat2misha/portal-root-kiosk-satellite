@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The suite is hermetic by contract: it must pass with no adb
+      # binary present. GitHub runners ship none, so this job is the
+      # guard against tests leaking to a real device tool.
+      - name: Confirm adb is absent (hermetic-suite guard)
+        run: |
+          if command -v adb; then
+            echo "adb unexpectedly present; the hermetic check would be meaningless" >&2
+            exit 1
+          fi
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Byte-compile all Python sources
+        run: python3 -m compileall -q tools tests
