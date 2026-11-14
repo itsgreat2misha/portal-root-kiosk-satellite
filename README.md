@@ -11,7 +11,8 @@ root exploit. All changes are persistent and survive reboots.
 
 The provisioner checks that the connected Portal has an exact supported model
 and firmware build, briefly uses a root exploit during a controlled reboot,
-applies the features you select, then verifies them across two normal boots.
+applies the features you select, then verifies them on a following normal
+boot by default (`--verify-boots 2` verifies across two boots instead).
 Persistent features use focused configuration changes or small boot helpers.
 
 > [!NOTE]
@@ -80,13 +81,18 @@ needs to remain in view during the reboot sequence.
 
 | Model | Codename | Android | Supported firmware fingerprint | Kernel | Status |
 | --- | --- | --- | --- | --- | --- |
-| Meta Portal Go | `terry` | 10 | `Facebook/terry_prod/terry:10/QKQ1.210213.001/5051355900018050:user/prod-keys` | `4.9.227-perf+` | Tested |
-| Meta Portal 10-inch (1st generation) | `aloha` | 9 | `Facebook/aloha_prod/aloha:9/PKQ1.191202.001/1041515800015050:user/prod-keys` | `4.4.153+` | Tested |
-| Meta Portal+ (1st generation) | `aloha` | 9 | `Facebook/aloha_prod/aloha:9/PKQ1.191202.001/1041515800015050:user/prod-keys` | `4.4.153+` | Tested |
-| Meta Portal+ (2nd generation) | `cipher` | 10 | `Facebook/cipher_prod/cipher:10/QKQ1.210213.001/4051355900018050:user/prod-keys` | `4.9.227-perf+` | Tested |
-| Meta Portal 10-inch (2nd generation) | `omni` | 10 | `Facebook/omni_prod/omni:10/QKQ1.210213.001/3051355900018050:user/prod-keys` | `4.9.227-perf+` | Tested |
-| Meta Portal Mini | `omni` | 10 | `Facebook/omni_prod/omni:10/QKQ1.210213.001/3051355900018050:user/prod-keys` | `4.9.227-perf+` | Tested |
-| Meta Portal TV | `ripley` | 9 | `Facebook/ripley_prod/ripley:9/PKQ1.191202.001/2041515800015050:user/prod-keys` | `4.4.153+` | Tested |
+| Meta Portal Go | `terry` | 10 | `Facebook/terry_prod/terry:10/QKQ1.210213.001/5051355900018050:user/prod-keys` | `4.9.227-perf+` | Upstream-tested |
+| Meta Portal 10-inch (1st generation) | `aloha` | 9 | `Facebook/aloha_prod/aloha:9/PKQ1.191202.001/1041515800015050:user/prod-keys` | `4.4.153+` | Fork-validated |
+| Meta Portal+ (1st generation) | `aloha` | 9 | `Facebook/aloha_prod/aloha:9/PKQ1.191202.001/1041515800015050:user/prod-keys` | `4.4.153+` | Fork-validated |
+| Meta Portal+ (2nd generation) | `cipher` | 10 | `Facebook/cipher_prod/cipher:10/QKQ1.210213.001/4051355900018050:user/prod-keys` | `4.9.227-perf+` | Upstream-tested |
+| Meta Portal 10-inch (2nd generation) | `omni` | 10 | `Facebook/omni_prod/omni:10/QKQ1.210213.001/3051355900018050:user/prod-keys` | `4.9.227-perf+` | Upstream-tested |
+| Meta Portal Mini | `omni` | 10 | `Facebook/omni_prod/omni:10/QKQ1.210213.001/3051355900018050:user/prod-keys` | `4.9.227-perf+` | Upstream-tested |
+| Meta Portal TV | `ripley` | 9 | `Facebook/ripley_prod/ripley:9/PKQ1.191202.001/2041515800015050:user/prod-keys` | `4.4.153+` | Upstream-tested |
+
+**Fork-validated** means this fork's maintainers have run the full
+provisioning flow on that model and firmware build. **Upstream-tested**
+models are supported by the same exact-build targets inherited from the
+upstream project but have not yet been re-validated on the fork.
 
 Thank you to [@protocol113](https://github.com/protocol113) for providing
 Portal TV access and sharing the exploit timing observations that helped
@@ -400,6 +406,24 @@ Restore both receivers to their individually saved states with:
 ```sh
 python3 tools/provision_portal.py \
   --serial "$PORTAL_IP:5555" --restore-remote-wipe
+```
+
+</details>
+
+<details>
+<summary>Camera indicator light (retired action; cleanup only)</summary>
+<p></p>
+
+`--disable-camera-light` is a retired action and is not applied: Meta's
+camera provider rejects capture while its green indicator is cleared, so
+the provisioner refuses it. Devices that had the camera-light watchdog
+installed by an older version can remove it — the watchdog and boot hook
+are removed and the UID-1000 host app's original ART cache is restored —
+with:
+
+```sh
+python3 tools/provision_portal.py \
+  --serial "$PORTAL_IP:5555" --restore-camera-light
 ```
 
 </details>
@@ -1290,7 +1314,8 @@ The device then reboots normally with SELinux enforcing. In the default flow
 the exploit does not install `su`, a root shell or a root daemon. Features
 that must survive reboot use narrow configuration changes or dedicated
 helpers with only the privileges they need. The provisioner verifies the
-requested state on two normal boots.
+requested state on a following normal boot (two boots with
+`--verify-boots 2`).
 
 The `--custom-payload` mode is the deliberate exception: it starts the root
 daemon inside the privileged window instead of returning straight to a
@@ -1332,21 +1357,20 @@ option with:
 python3 tools/provision_portal.py --help
 ```
 
-Each successful run verifies the requested state on two distinct boots by
-default. `--verify-boots 1` verifies on a single boot instead, skipping the
-second verification reboot. Read
+Each successful run verifies the requested state on a following boot by
+default (`--verify-boots 1`); `--verify-boots 2` adds a second distinct
+verification boot. Attempt logs go to a timestamped directory under `/tmp`
+by default; pass `--log-dir DIR` to choose where they are written. Read
 the final `PROVISION_OK` line and keep the attempt directory when diagnosing a
 failure.
 
 </details>
 
-## Support the project
+## License
 
-If this project breathed new life into your Meta Portal, consider supporting
-my work through [Buy Me a Coffee](https://buymeacoffee.com/jxlarrea). Your
-support helps me obtain more Portal models, test additional firmware and keep
-improving the tools that make these devices useful again.
-
-<p align="center">
-  <a href="https://buymeacoffee.com/jxlarrea"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
-</p>
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE)
+and [NOTICE](NOTICE) for the full terms and attribution. This project is
+a fork of the original Portal provisioner created by
+[jxlarrea](https://github.com/jxlarrea); the exploit research and the
+original implementation are his, and the fork's changes are recorded in
+[FORK.md](FORK.md).
