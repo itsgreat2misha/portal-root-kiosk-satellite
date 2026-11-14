@@ -41,6 +41,7 @@ from meta_debloat_components import (
 )
 from portal_targets import PortalTarget, find_target
 from device_session import DeviceSession, ProvisionError, run_command
+from run_state import STATE_REMOTE, RunState
 from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
 
 
@@ -117,7 +118,6 @@ SHIZUKU_APK_URL = (
 SHIZUKU_APK_SHA256 = (
     "6e273ab0e991c4e79bc8b1bbb9b9dd739ccac1a8712a541a214078886b7b790f"
 )
-STATE_REMOTE = "/data/local/tmp/portal-provision-state-v1.json"
 PRIVACY_BACKUP_REMOTE = "/data/local/tmp/portal-private-dns-before-v1.json"
 ADB_ENABLED_SETTING = "adb_enabled"
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
@@ -333,9 +333,15 @@ class PortalProvisioner:
         self.skip_shizuku_root = skip_shizuku_root
         self.autoroot = autoroot
         self.verify_boots = verify_boots
-        self._tool_revision_cache: str | None = None
-        self._artifact_hashes_cache: dict[str, str] | None = None
-        self._artifact_hashes_key: tuple | None = None
+        self.run_state = RunState(
+            ROOT,
+            run=lambda args, timeout=None: self.run(args, timeout=timeout),
+            adb_run=lambda args, timeout=None, check=False: self.adb_run(
+                args, timeout=timeout, check=check
+            ),
+            serial=serial,
+            log_dir=log_dir,
+        )
         if self.verify_boots not in (1, 2):
             raise ProvisionError('--verify-boots must be 1 or 2')
         self.shizuku_public_key: pathlib.Path | None = None
@@ -869,24 +875,14 @@ class PortalProvisioner:
         return actions
 
     def tool_revision(self) -> str:
-        if self._tool_revision_cache is not None:
-            return self._tool_revision_cache
-        result = self.run(
-            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], timeout=5
-        )
-        if result.returncode != 0:
-            self._tool_revision_cache = "unknown"
-            return "unknown"
-        revision = result.stdout.strip()
-        dirty = self.run(
-            ["git", "-C", str(ROOT), "status", "--porcelain"], timeout=5
-        )
-        if dirty.returncode == 0 and dirty.stdout.strip():
-            revision += "-dirty"
-        self._tool_revision_cache = revision
-        return revision
+        return self.run_state.tool_revision()
 
     def selected_artifact_hashes(self) -> dict[str, str]:
+        return self.run_state.artifact_hashes(
+            self._selected_artifact_candidates()
+        )
+
+    def _selected_artifact_candidates(self) -> list[pathlib.Path]:
         candidates = [pathlib.Path(__file__).resolve(), ROOT / "tools/portal_targets.py"]
         if self.target:
             candidates.append(self.target.preload_path(ROOT))
@@ -914,39 +910,10 @@ class PortalProvisioner:
             )
             if self.target and self.target.uid1000_embedded_helper:
                 candidates.append(UID1000_RUNTIME_APK_LOCAL)
-        cache_key = tuple(
-            (str(path), path.stat().st_size, path.stat().st_mtime_ns)
-            if path.is_file()
-            else (str(path), -1, -1)
-            for path in candidates
-        )
-        if self._artifact_hashes_cache is not None and (
-            self._artifact_hashes_key == cache_key
-        ):
-            return dict(self._artifact_hashes_cache)
-        hashes: dict[str, str] = {}
-        for path in candidates:
-            if path.is_file():
-                try:
-                    name = str(path.relative_to(ROOT))
-                except ValueError:
-                    name = str(path)
-                hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        self._artifact_hashes_cache = dict(hashes)
-        self._artifact_hashes_key = cache_key
-        return hashes
+        return candidates
 
     def read_state(self) -> dict[str, object] | None:
-        result = self.adb_run(["shell", "cat", STATE_REMOTE], timeout=5)
-        if result.returncode != 0:
-            return None
-        try:
-            state = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise ProvisionError(f"invalid device state manifest: {exc}") from exc
-        if not isinstance(state, dict) or state.get("schema") != 1:
-            raise ProvisionError("unrecognized device state manifest")
-        return state
+        return self.run_state.read_state()
 
     def write_state(
         self,
@@ -957,37 +924,16 @@ class PortalProvisioner:
         fingerprint = self.adb_run(
             ["shell", "getprop", "ro.build.fingerprint"], timeout=5, check=True
         ).stdout.strip()
-        state = {
-            "schema": 1,
-            "status": state_status,
-            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "serial": self.serial,
-            "target": self.target.key if self.target else None,
-            "fingerprint": fingerprint,
-            "tool_revision": self.tool_revision(),
-            "artifact_sha256": self.selected_artifact_hashes(),
-            "actions": self.requested_actions(),
-            "verification": {
-                "first_boot": first_boot,
-                "second_boot": second_boot,
-            },
-        }
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        local = self.log_dir / "portal-provision-state-v1.json"
-        local.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-        local.chmod(0o600)
-        remote_tmp = STATE_REMOTE + ".tmp"
-        self.adb_run(["push", str(local), remote_tmp], timeout=15, check=True)
-        self.adb_run(
-            [
-                "shell",
-                f"chmod 0600 {shlex.quote(remote_tmp)} && "
-                f"mv {shlex.quote(remote_tmp)} {shlex.quote(STATE_REMOTE)}",
-            ],
-            timeout=10,
-            check=True,
+        self.run_state.write_state(
+            state_status,
+            fingerprint=fingerprint,
+            target_key=self.target.key if self.target else None,
+            tool_revision=self.tool_revision(),
+            artifact_sha256=self.selected_artifact_hashes(),
+            actions=self.requested_actions(),
+            first_boot=first_boot,
+            second_boot=second_boot,
         )
-        print(f"STATE_MANIFEST status={state_status} path={STATE_REMOTE}")
 
     @staticmethod
     def presence_full_scene_active(
