@@ -42,7 +42,16 @@ from meta_debloat_components import (
 from portal_targets import PortalTarget, find_target
 from device_session import DeviceSession, ProvisionError, run_command
 from run_state import STATE_REMOTE, RunState
-from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
+from features.audio import (
+    MHA_AUDIO_VERIFIED_LOG,
+    MHA_TUNING_BACKUP_REMOTE,
+    MHA_TUNING_DEVICE,
+    MHA_TUNING_PATCHED_REMOTE,
+    MHA_TUNING_STOCK_REMOTE,
+    VOICE_AUDIO_VERIFIED_LOG,
+    AudioFeature,
+    audio_processing_disabled_observed,
+)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -55,8 +64,6 @@ PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
 ANDROID_PLATFORM_VERSION = "android-36"
-MHA_AUDIO_VERIFIED_LOG = "mha audio processing verified aec=0 ns=0"
-VOICE_AUDIO_VERIFIED_LOG = "audio processing verified aec=0 ns=0"
 PROVISIONER_BANNER = rf"""
 +----------------------------------------------------------------+
 |                                                                |
@@ -77,12 +84,6 @@ CUSTOM_PAYLOAD_PORT = 37373
 HELPER_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
 AUDIO_CTL_LOCAL = ROOT / "exploit/build/portal-audio-ctl.jar"
 AUDIO_CTL_REMOTE = "/data/local/tmp/portal-audio-ctl.jar"
-MHA_TUNING_DEVICE = "/vendor/etc/audio/omni/mha_tuning_blobs.tub"
-MHA_TUNING_STOCK_REMOTE = "/data/local/tmp/portal-mha-tuning-stock.tub"
-MHA_TUNING_PATCHED_REMOTE = "/data/local/tmp/portal-mha-tuning-disabled.tub"
-MHA_TUNING_BACKUP_REMOTE = (
-    "/data/local/tmp/portal-audio-backup/mha_tuning_blobs.stock-v1.tub"
-)
 ACCOUNT_CTL_LOCAL = ROOT / "exploit/build/portal-account-ctl.jar"
 ACCOUNT_CTL_REMOTE = "/data/local/tmp/portal-account-ctl.jar"
 COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
@@ -333,6 +334,19 @@ class PortalProvisioner:
         self.skip_shizuku_root = skip_shizuku_root
         self.autoroot = autoroot
         self.verify_boots = verify_boots
+        self.audio_feature = AudioFeature(
+            adb_run=lambda args, timeout=None, check=False: self.adb_run(
+                args, timeout=timeout, check=check
+            ),
+            pull_file=lambda remote, local: self.pull_file(remote, local),
+            logcat_watermark=lambda: self.logcat_watermark(),
+            logcat_poll=lambda tag, since, timeout=10: self.logcat_poll(
+                tag, since, timeout=timeout
+            ),
+            log_dir=log_dir,
+            target=lambda: self.target,
+            restore_audio=lambda: self.restore_audio,
+        )
         self.run_state = RunState(
             ROOT,
             run=lambda args, timeout=None: self.run(args, timeout=timeout),
@@ -765,40 +779,9 @@ class PortalProvisioner:
         return local.read_bytes()
 
     def prepare_mha_tuning_payloads(self) -> None:
-        current_path = self.log_dir / "mha_tuning_blobs.device.tub"
-        stock_path = self.log_dir / "mha_tuning_blobs.stock.tub"
-        patched_path = self.log_dir / "mha_tuning_blobs.disabled.tub"
-        current = self.pull_file(MHA_TUNING_DEVICE, current_path)
-        current_hash = sha256(current)
-
-        if current_hash == OMNI_STOCK_SHA256:
-            stock = current
-        else:
-            backup_path = self.log_dir / "mha_tuning_blobs.backup.tub"
-            stock = self.pull_file(MHA_TUNING_BACKUP_REMOTE, backup_path)
-            if sha256(stock) != OMNI_STOCK_SHA256:
-                raise ProvisionError(
-                    "Omni MHA stock backup has an unexpected SHA-256; "
-                    "refusing to write /vendor"
-                )
-        patched, changes = patch_omni_tuning(stock)
-        patched_hash = sha256(patched)
-        if current_hash not in (OMNI_STOCK_SHA256, patched_hash):
-            raise ProvisionError(
-                "Omni MHA tuning blob has an unknown SHA-256; refusing to "
-                f"write /vendor: {current_hash}"
-            )
-        stock_path.write_bytes(stock)
-        patched_path.write_bytes(patched)
-        self.mha_tuning_stock_local = stock_path
-        self.mha_tuning_patched_local = patched_path
-        print(
-            "MHA_TUNING_PREPARED "
-            f"current={current_hash} stock={OMNI_STOCK_SHA256} "
-            f"patched={patched_hash} parameters={len(changes)} "
-            f"action={'restore' if self.restore_audio else 'disable'}",
-            flush=True,
-        )
+        stock, patched = self.audio_feature.prepare_mha_tuning_payloads()
+        self.mha_tuning_stock_local = stock
+        self.mha_tuning_patched_local = patched
 
     @contextlib.contextmanager
     def bootstrap_guard(self, label: str):
@@ -3053,30 +3036,7 @@ class PortalProvisioner:
         return already_clean
 
     def audio_preflight(self) -> bool:
-        marker = "/data/local/tmp/portal-audio-backup/installed-v1"
-        installed = self.adb_run(
-            ["shell", "test", "-f", marker], timeout=5
-        ).returncode == 0
-        if not installed and self.target and self.target.audio_installer_credentials:
-            try:
-                self.verify_watchdog(wait_seconds=5)
-            except ProvisionError:
-                print("AUDIO_PREFLIGHT installed=0 healthy=0 action=install")
-                return False
-            print(
-                "AUDIO_PREFLIGHT installed=private healthy=1 action=skip"
-            )
-            return True
-        if not installed:
-            print("AUDIO_PREFLIGHT installed=0 healthy=0 action=install")
-            return False
-        try:
-            self.verify_watchdog(wait_seconds=5)
-        except ProvisionError:
-            print("AUDIO_PREFLIGHT installed=1 healthy=0 action=repair")
-            return False
-        print("AUDIO_PREFLIGHT installed=1 healthy=1 action=skip")
-        return True
+        return self.audio_feature.audio_preflight()
 
     def ota_preflight(self) -> bool:
         disabled = self.adb_run(
@@ -5006,16 +4966,7 @@ class PortalProvisioner:
     def audio_processing_disabled_observed(
         logs: str, target: PortalTarget | None
     ) -> bool:
-        if target is not None and target.device == "omni":
-            # Omni's MHA backend rejects VoiceParam 3001/4001.  In
-            # particular, never let an old Java watchdog's synthetic 0.0
-            # readbacks satisfy the health check on this target.
-            return MHA_AUDIO_VERIFIED_LOG in logs
-        if VOICE_AUDIO_VERIFIED_LOG in logs:
-            return True
-        aec = re.search(r"param=3001 .*after=0 .*ok=1", logs)
-        ns = re.search(r"param=4001 .*after=0 .*ok=1", logs)
-        return bool(aec and ns)
+        return audio_processing_disabled_observed(logs, target)
 
     def logcat_watermark(self) -> str | None:
         """Start of the current boot in logcat -t format, or None.
@@ -5079,76 +5030,10 @@ class PortalProvisioner:
         return self.adb_run(["shell", command], timeout=timeout).stdout
 
     def verify_watchdog(self, wait_seconds: int = 25) -> str:
-        deadline = time.monotonic() + wait_seconds
-        since = self.logcat_watermark()
-        last_log = ""
-        while time.monotonic() < deadline:
-            last_log = self.logcat_poll("PortalAudioPersist", since)
-            started = "persistent audio watchdog started" in last_log
-            disabled = self.audio_processing_disabled_observed(
-                last_log, self.target
-            )
-            if started and disabled:
-                pid = self.adb_run(
-                    ["shell", "pidof", "com.facebook.portal.aiservice"],
-                    timeout=5,
-                    check=True,
-                ).stdout.strip()
-                boot_id = self.adb_run(
-                    ["shell", "cat", "/proc/sys/kernel/random/boot_id"],
-                    timeout=5,
-                    check=True,
-                ).stdout.strip()
-                print(f"WATCHDOG_OK boot_id={boot_id} aiservice_pid={pid}")
-                # Persist a durable install marker: the logcat-based
-                # check above rotates away on long uptimes, which made
-                # preflight/--status flap between installed and unknown.
-                self.adb_run(
-                    ["shell", "mkdir", "-p", "/data/local/tmp/portal-audio-backup"],
-                    timeout=5,
-                )
-                self.adb_run(
-                    ["shell", "touch", "/data/local/tmp/portal-audio-backup/installed-v1"],
-                    timeout=5,
-                )
-                print(last_log.rstrip())
-                return boot_id
-            time.sleep(2)
-        raise ProvisionError(
-            "watchdog did not verify after boot; recent log follows:\n"
-            + last_log[-4000:]
-        )
+        return self.audio_feature.verify_watchdog(wait_seconds)
 
     def verify_audio_restored(self, wait_seconds: int = 20) -> None:
-        marker = "/data/local/tmp/portal-audio-backup/restored-v1"
-        marker_required = not (
-            self.target and self.target.audio_installer_credentials
-        )
-        if marker_required and self.adb_run(
-            ["shell", "test", "-f", marker], timeout=5
-        ).returncode != 0:
-            raise ProvisionError("audio restore marker is absent")
-        deadline = time.monotonic() + wait_seconds
-        since = self.logcat_watermark()
-        logs = ""
-        pid = ""
-        while time.monotonic() < deadline:
-            pid = self.adb_run(
-                ["shell", "pidof", "com.facebook.portal.aiservice"], timeout=5
-            ).stdout.strip()
-            logs = self.logcat_poll("PortalAudioPersist", since)
-            if pid:
-                time.sleep(3)
-                break
-            time.sleep(2)
-        logs = self.logcat_poll("PortalAudioPersist", since)
-        if not pid or "persistent audio watchdog started" in logs:
-            raise ProvisionError(
-                "audio persistence restore did not verify: "
-                f"aiservice_pid={pid!r} watchdog_started="
-                f"{int('persistent audio watchdog started' in logs)}"
-            )
-        print(f"AUDIO_RESTORE_OK aiservice_pid={pid} watchdog=absent")
+        return self.audio_feature.verify_audio_restored(wait_seconds)
 
     def disable_ota_packages(self) -> None:
         packages = (
