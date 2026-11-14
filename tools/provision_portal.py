@@ -111,6 +111,23 @@ from features.shizuku import (
     SHIZUKU_VERSION,
     ShizukuFeature,
 )
+from features.payload import (
+    AUTOROOT_CONF_REMOTE,
+    AUTOROOT_HELPER_LOCAL,
+    AUTOROOT_HELPER_PACKAGE,
+    AUTOROOT_MAX_ATTEMPTS,
+    AUTOROOT_REMOTE_DIR,
+    AUTOROOT_RUNNER_LOCAL,
+    AUTOROOT_SESSION_WINDOW_SEC,
+    CUSTOM_PAYLOAD_DST_REMOTE,
+    CUSTOM_PAYLOAD_PORT,
+    EXPLOIT_SENTINEL_LOCAL,
+    EXPLOIT_SENTINEL_PACKAGE,
+    UID1000_RUNTIME_APK_LOCAL,
+    UID1000_RUNTIME_PACKAGE,
+    PayloadConfig,
+    PayloadFeature,
+)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -138,8 +155,6 @@ HELPER_JAVA_LOCAL = ROOT / "helper/build/libportal_audio_persist_java.so"
 PRELOAD_REMOTE = "/data/local/tmp/preload-portal.so"
 DEFAULT_CUSTOM_PAYLOAD_LOCAL = ROOT / "root-daemon" / "portal-root-daemon"
 CUSTOM_PAYLOAD_REMOTE = "/data/local/tmp/portal-root-daemon"
-CUSTOM_PAYLOAD_DST_REMOTE = "/data/local/tmp/portal-root-daemon"
-CUSTOM_PAYLOAD_PORT = 37373
 HELPER_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
 AUDIO_CTL_LOCAL = ROOT / "exploit/build/portal-audio-ctl.jar"
 AUDIO_CTL_REMOTE = "/data/local/tmp/portal-audio-ctl.jar"
@@ -147,17 +162,6 @@ ACCOUNT_CTL_LOCAL = ROOT / "exploit/build/portal-account-ctl.jar"
 ACCOUNT_CTL_REMOTE = "/data/local/tmp/portal-account-ctl.jar"
 COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
 COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
-EXPLOIT_SENTINEL_PACKAGE = "dev.portal.exploitsentinel"
-EXPLOIT_SENTINEL_LOCAL = (
-    ROOT / "exploit-sentinel/build/portal-exploit-sentinel.apk"
-)
-AUTOROOT_HELPER_PACKAGE = "dev.portal.autoroothelper"
-AUTOROOT_HELPER_LOCAL = ROOT / "autoroot-helper/build/portal-autoroot-helper.apk"
-AUTOROOT_RUNNER_LOCAL = ROOT / "autoroot-helper/run.sh"
-AUTOROOT_REMOTE_DIR = "/data/local/tmp/portal-autoroot"
-AUTOROOT_CONF_REMOTE = f"{AUTOROOT_REMOTE_DIR}/autoroot.conf"
-AUTOROOT_MAX_ATTEMPTS = 8
-AUTOROOT_SESSION_WINDOW_SEC = 3600
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
 APP_VERIFIER_PACKAGE = "com.facebook.appverifier"
 ADB_ENABLED_SETTING = "adb_enabled"
@@ -177,10 +181,6 @@ ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE = (
 )
 UID1000_HOOK_ACTIVE_REMOTE = (
     "/data/local/tmp/portal-uid1000-hook-active-v1"
-)
-UID1000_RUNTIME_PACKAGE = "dev.portal.uid1000runtime"
-UID1000_RUNTIME_APK_LOCAL = (
-    ROOT / "uid1000-helper/build/portal-uid1000-runtime.apk"
 )
 
 
@@ -298,6 +298,53 @@ class PortalProvisioner:
             log_dir=log_dir,
             target=lambda: self.target,
             restore_audio=lambda: self.restore_audio,
+        )
+        self.payload_feature = PayloadFeature(
+            config=lambda: PayloadConfig(
+                shizuku=self.shizuku,
+                skip_shizuku_root=self.skip_shizuku_root,
+                autoroot=self.autoroot,
+                disable_camera_light=self.disable_camera_light,
+                restore_camera_light=self.restore_camera_light,
+                restore_presence_fps=self.restore_presence_fps,
+                restore_presence_profile=self.restore_presence_profile,
+                presence_fps_cap=self.presence_fps_cap,
+            ),
+            adb_run=lambda *a, **k: self.adb_run(*a, **k),
+            target=lambda: self.target,
+            install_apk_preserving_verifier=(
+                lambda *a, **k: self.install_apk_preserving_verifier(*a, **k)
+            ),
+            verify_package_verifier_state=(
+                lambda *a, **k: self.verify_package_verifier_state(*a, **k)
+            ),
+            settle_package_state=lambda *a, **k: self.settle_package_state(
+                *a, **k
+            ),
+            package_sets=lambda *a, **k: self.package_sets(*a, **k),
+            push_text_atomic=lambda *a, **k: self.push_text_atomic(*a, **k),
+            build_exploit_environment=(
+                lambda *a, **k: self.build_exploit_environment(*a, **k)
+            ),
+            uid1000_path=lambda *a, **k: self.uid1000_path(*a, **k),
+            compile_camera_light_host_speed=(
+                lambda *a, **k: self.compile_camera_light_host_speed(*a, **k)
+            ),
+            start_shizuku_as_root=(
+                lambda *a, **k: self.start_shizuku_as_root(*a, **k)
+            ),
+            stage_autoroot_payload=(
+                lambda *a, **k: self.stage_autoroot_payload(*a, **k)
+            ),
+            presence_fps_action_requested=(
+                lambda: self.presence_fps_action_requested()
+            ),
+            stop_root_daemon=lambda *a, **k: self.stop_root_daemon(*a, **k),
+            autoroot_helper_local=lambda: AUTOROOT_HELPER_LOCAL,
+            autoroot_runner_local=lambda: AUTOROOT_RUNNER_LOCAL,
+            adb_framework_boot_installed_remote=(
+                ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE
+            ),
         )
         self.shizuku_feature = ShizukuFeature(
             adb_run=lambda *a, **k: self.adb_run(*a, **k),
@@ -2121,137 +2168,31 @@ class PortalProvisioner:
         return self.shizuku_feature.finalize_buffered_shizuku_key()
 
     def finalize_buffered_uid1000_markers(self) -> None:
-        if not self.target or not self.target.buffer_root_staged_sources:
-            return
-        if self.disable_camera_light:
-            self.adb_run(
-                [
-                    "shell", "mkdir", "-p",
-                    "/data/local/tmp/portal-camera-light-backup",
-                ],
-                timeout=5,
-                check=True,
-            )
-            self.push_text_atomic(
-                "Portal camera light watchdog installed\n",
-                CAMERA_LIGHT_INSTALLED_REMOTE,
-            )
-            self.adb_run(
-                ["shell", "rm", "-f", CAMERA_LIGHT_RESTORED_REMOTE],
-                timeout=5,
-                check=True,
-            )
-            print("CAMERA_LIGHT_MARKER_OK source=post-reboot")
-        if self.restore_camera_light:
-            self.adb_run(
-                [
-                    "shell",
-                    "mkdir",
-                    "-p",
-                    "/data/local/tmp/portal-camera-light-backup",
-                ],
-                timeout=5,
-                check=True,
-            )
-            self.adb_run(
-                ["shell", "rm", "-f", CAMERA_LIGHT_INSTALLED_REMOTE],
-                timeout=5,
-                check=True,
-            )
-            self.push_text_atomic(
-                "Portal camera light watchdog restored\n",
-                CAMERA_LIGHT_RESTORED_REMOTE,
-            )
-            print("CAMERA_LIGHT_RESTORE_MARKER_OK source=post-reboot")
-        if self.presence_fps_action_requested():
-            self.adb_run(
-                [
-                    "shell", "mkdir", "-p",
-                    "/data/local/tmp/portal-presence-backup",
-                ],
-                timeout=5,
-                check=True,
-            )
-            self.push_text_atomic(
-                f"{self.presence_fps_cap}\n",
-                "/data/local/tmp/portal-presence-backup/fps-cap-v1",
-            )
-            self.adb_run(
-                [
-                    "shell", "rm", "-f",
-                    "/data/local/tmp/portal-presence-backup/fps-restored-v1",
-                ],
-                timeout=5,
-                check=True,
-            )
-            print("PRESENCE_FPS_MARKER_OK source=post-reboot")
-        if self.restore_presence_fps or self.restore_presence_profile:
-            self.adb_run(
-                [
-                    "shell", "mkdir", "-p",
-                    "/data/local/tmp/portal-presence-backup",
-                ],
-                timeout=5,
-                check=True,
-            )
-            self.adb_run(
-                [
-                    "shell", "rm", "-f",
-                    "/data/local/tmp/portal-presence-backup/fps-cap-v1",
-                ],
-                timeout=5,
-                check=True,
-            )
-            self.push_text_atomic(
-                "Portal presence FPS cap restored\n",
-                "/data/local/tmp/portal-presence-backup/fps-restored-v1",
-            )
-            print("PRESENCE_FPS_RESTORE_MARKER_OK source=post-reboot")
+        return self.payload_feature.finalize_buffered_uid1000_markers()
 
     def install_uid1000_runtime_payload(self) -> None:
-        self.install_apk_preserving_verifier(
-            UID1000_RUNTIME_APK_LOCAL, "uid1000-runtime", UID1000_RUNTIME_PACKAGE
+        self.payload_feature.install_uid1000_runtime_payload()
+        self.uid1000_runtime_apk_remote = (
+            self.payload_feature.uid1000_runtime_apk_remote
         )
-        package_path = self.adb_run(
-            ["shell", "pm", "path", UID1000_RUNTIME_PACKAGE],
-            timeout=10,
-            check=True,
-        ).stdout.strip()
-        match = re.search(r"^package:(.+/base\.apk)$", package_path, re.MULTILINE)
-        if not match:
-            raise ProvisionError(
-                "could not resolve the installed UID-1000 runtime paths"
-            )
-        package_directory = match.group(1).rsplit("/", 1)[0]
-        library_path = (
-            package_directory
-            + "/lib/arm64/libportal_uid1000_watch.so"
+        self.uid1000_runtime_library_remote = (
+            self.payload_feature.uid1000_runtime_library_remote
         )
-        if self.adb_run(
-            ["shell", "test", "-f", library_path], timeout=5
-        ).returncode != 0:
-            raise ProvisionError(
-                "installed UID-1000 runtime native library is absent: "
-                + library_path
-            )
-        self.uid1000_runtime_apk_remote = match.group(1)
-        self.uid1000_runtime_library_remote = library_path
-        self.uid1000_runtime_package_installed = True
-        print("UID1000_RUNTIME_APK_OK package=installed native=extracted")
+        self.uid1000_runtime_package_installed = (
+            self.payload_feature.uid1000_runtime_package_installed
+        )
 
     def uninstall_uid1000_runtime_payload(self, best_effort: bool = False) -> None:
-        if not self.uid1000_runtime_package_installed:
-            return
-        result = self.adb_run(
-            ["uninstall", UID1000_RUNTIME_PACKAGE], timeout=30
+        self.payload_feature.uninstall_uid1000_runtime_payload()
+        self.uid1000_runtime_apk_remote = (
+            self.payload_feature.uid1000_runtime_apk_remote
         )
-        if not best_effort and result.returncode != 0:
-            raise ProvisionError(
-                "could not remove the temporary UID-1000 runtime package: "
-                + result.stdout
-            )
-        self.uid1000_runtime_package_installed = False
-        print("UID1000_RUNTIME_APK_REMOVE package=removed")
+        self.uid1000_runtime_library_remote = (
+            self.payload_feature.uid1000_runtime_library_remote
+        )
+        self.uid1000_runtime_package_installed = (
+            self.payload_feature.uid1000_runtime_package_installed
+        )
 
     def verify_shizuku(self, wait_seconds: int = 120) -> None:
         return self.shizuku_feature.verify_shizuku(wait_seconds)
@@ -2546,67 +2487,10 @@ class PortalProvisioner:
         return self.presence_feature.uninstall_presence_helper()
 
     def prepare_exploit_sentinel(self) -> None:
-        if not EXPLOIT_SENTINEL_LOCAL.is_file():
-            raise ProvisionError(
-                f"missing exploit sentinel build output: {EXPLOIT_SENTINEL_LOCAL}"
-            )
-        try:
-            self.install_apk_preserving_verifier(
-                EXPLOIT_SENTINEL_LOCAL,
-                "exploit-sentinel",
-                EXPLOIT_SENTINEL_PACKAGE,
-            )
-            self.settle_package_state()
-            result = self.adb_run(
-                [
-                    "shell",
-                    "run-as",
-                    EXPLOIT_SENTINEL_PACKAGE,
-                    "/system/bin/true",
-                ],
-                timeout=15,
-            )
-            if result.returncode != 0:
-                raise ProvisionError(
-                    "exploit sentinel run-as preflight failed: "
-                    + result.stdout.strip()
-                )
-            self.verify_package_verifier_state()
-        except ProvisionError:
-            self.uninstall_exploit_sentinel(best_effort=True)
-            raise
-        print(
-            f"EXPLOIT_SENTINEL_OK package={EXPLOIT_SENTINEL_PACKAGE} "
-            "run_as=verified"
-        )
+        return self.payload_feature.prepare_exploit_sentinel()
 
     def uninstall_exploit_sentinel(self, best_effort: bool = False) -> None:
-        try:
-            path = self.adb_run(
-                ["shell", "pm", "path", EXPLOIT_SENTINEL_PACKAGE], timeout=15
-            )
-            if path.returncode != 0 or not path.stdout.startswith("package:"):
-                print(
-                    f"EXPLOIT_SENTINEL_REMOVE package={EXPLOIT_SENTINEL_PACKAGE} "
-                    "already_absent=1"
-                )
-                return
-            result = self.adb_run(
-                ["uninstall", EXPLOIT_SENTINEL_PACKAGE], timeout=30
-            )
-            if result.returncode != 0 or "Success" not in result.stdout:
-                raise ProvisionError(
-                    "failed to remove exploit sentinel: "
-                    + result.stdout.strip()
-                )
-            print(
-                f"EXPLOIT_SENTINEL_REMOVE package={EXPLOIT_SENTINEL_PACKAGE} "
-                "already_absent=0"
-            )
-        except ProvisionError as exc:
-            if not best_effort:
-                raise
-            print(f"EXPLOIT_SENTINEL_REMOVE_DEFERRED error={exc}")
+        return self.payload_feature.uninstall_exploit_sentinel(best_effort)
 
     def memstart(self, tag: str) -> int:
         if self.target is None:
@@ -3638,348 +3522,22 @@ class PortalProvisioner:
             self._in_custom_payload_phase = False
 
     def verify_custom_payload(self, wait_seconds: int = 30) -> None:
-        """Require the started payload to answer ID as uid 0 on loopback."""
-        self.adb_run(
-            [
-                "forward",
-                f"tcp:{CUSTOM_PAYLOAD_PORT}",
-                f"tcp:{CUSTOM_PAYLOAD_PORT}",
-            ],
-            timeout=10,
-            check=True,
-        )
-        deadline = time.monotonic() + wait_seconds
-        last = ""
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=5
-                ) as sock:
-                    sock.sendall(b"ID\n")
-                    response = sock.recv(4096).decode(errors="replace")
-                last = response.strip()
-                if last.startswith("ID uid=0"):
-                    print(f"CUSTOM_PAYLOAD_ID {last}", flush=True)
-                    return
-            except OSError as exc:
-                last = str(exc)
-            time.sleep(2)
-        raise ProvisionError(f"custom payload did not answer as uid 0: {last}")
+        return self.payload_feature.verify_custom_payload(wait_seconds)
 
     def daemon_exec(self, command: str, timeout: int = 40) -> tuple[int, str]:
-        """Run one command through the custom payload's loopback EXEC.
-
-        The payload protocol answers every request with the command's
-        stdout+stderr, an ``EXIT <code>`` line and a terminating ``END``
-        line. Uses the adb forward set up by verify_custom_payload().
-        """
-        with socket.create_connection(
-            ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=10
-        ) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(f"EXEC {command}\n".encode())
-            data = b""
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-                lines = data.decode(errors="replace").splitlines()
-                if "END" in lines:
-                    break
-        lines = data.decode(errors="replace").splitlines()
-        exit_code = 1
-        output_lines: list[str] = []
-        for line in lines:
-            if line.startswith("EXIT "):
-                try:
-                    exit_code = int(line.split()[1])
-                except (IndexError, ValueError):
-                    exit_code = 1
-                break
-            if line == "END":
-                break
-            output_lines.append(line)
-        return exit_code, "\n".join(output_lines)
+        return self.payload_feature.daemon_exec(command, timeout)
 
     def stop_root_daemon(self) -> None:
-        """Ask the custom payload daemon to exit (the STOP verb).
-
-        The daemon answers "BYE" and closes as it exits; there is no
-        END line for this verb. Anything else means the listener on
-        CUSTOM_PAYLOAD_PORT is not our daemon.
-        """
-        with socket.create_connection(
-            ("127.0.0.1", CUSTOM_PAYLOAD_PORT), timeout=10
-        ) as sock:
-            sock.settimeout(10)
-            sock.sendall(b"STOP\n")
-            data = b""
-            try:
-                while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-            except (ConnectionResetError, socket.timeout):
-                pass
-        if b"BYE" not in data:
-            raise ProvisionError(
-                "root daemon did not acknowledge STOP: "
-                f"{data.decode(errors='replace')!r}"
-            )
+        return self.payload_feature.stop_root_daemon()
 
     def apply_post_payload_root_steps(self) -> None:
-        """Extra root-backed steps that need the payload serving first."""
-        shizuku_root_ok = False
-        if self.shizuku and not self.skip_shizuku_root:
-            self.start_shizuku_as_root()
-            shizuku_root_ok = True
-        if self.autoroot:
-            self.stage_autoroot_payload()
-        if shizuku_root_ok:
-            # The daemon was the bridge to root-mode Shizuku. With the
-            # server verified as uid 0 it has no further job this boot,
-            # and an unauthenticated root EXEC listener should not
-            # outlive the handoff. Autoroot boots re-create the daemon
-            # for their own handoff and stop it the same way. When
-            # root-mode Shizuku is not in play (--skip-shizuku-root or
-            # no --shizuku) the daemon is the run's root channel and
-            # stays up.
-            try:
-                self.stop_root_daemon()
-                print(
-                    "PAYLOAD_DAEMON_STOPPED reason=shizuku-root-ok",
-                    flush=True,
-                )
-            except (OSError, ProvisionError) as exc:
-                print(
-                    f"PAYLOAD_DAEMON_STOP_FAILED error={exc}",
-                    flush=True,
-                )
+        return self.payload_feature.apply_post_payload_root_steps()
 
     def start_shizuku_as_root(self) -> None:
         return self.shizuku_feature.start_shizuku_as_root()
 
     def stage_autoroot_payload(self) -> None:
-        """Stage the on-device autoroot runner and its boot helper.
-
-        After this, a reboot needs no host: the boot helper notices the
-        root payload is down, redoes the per-boot address discovery
-        on-device (bugreport + the staged simpleperf), and runs the
-        staged runner script, which replays the exploit environment
-        this provisioner generated for attempts 1 and 2 (parity picks
-        the geometry, exactly like host retries). The helper reuses the
-        Shizuku helper's already-authorized ADB key, and the exploit
-        sentinel app stays installed because every on-device attempt
-        needs it.
-        """
-        if self.target is None:
-            raise ProvisionError("target must be selected before autoroot")
-        if not self.shizuku:
-            raise ProvisionError(
-                "--autoroot requires --shizuku: the boot helper reuses "
-                "the Shizuku helper's authorized ADB key"
-            )
-        if not AUTOROOT_HELPER_LOCAL.is_file():
-            raise ProvisionError(
-                f"missing autoroot helper build output: {AUTOROOT_HELPER_LOCAL}"
-            )
-        if not AUTOROOT_RUNNER_LOCAL.is_file():
-            raise ProvisionError(
-                f"missing autoroot runner script: {AUTOROOT_RUNNER_LOCAL}"
-            )
-        sentinel_path = self.adb_run(
-            ["shell", "pm", "path", EXPLOIT_SENTINEL_PACKAGE], timeout=15
-        ).stdout
-        if not sentinel_path.startswith("package:"):
-            raise ProvisionError(
-                "exploit sentinel is not installed; autoroot attempts "
-                "need it on every boot"
-            )
-        simpleperf_remote = "/data/local/tmp/portal-simpleperf"
-        if self.adb_run(
-            ["shell", "test", "-f", simpleperf_remote], timeout=5
-        ).returncode != 0:
-            raise ProvisionError(
-                "staged simpleperf is absent; KASLR discovery for this "
-                "target pushes it during the custom-payload attempts"
-            )
-        self.install_apk_preserving_verifier(
-            AUTOROOT_HELPER_LOCAL, "autoroot-helper", AUTOROOT_HELPER_PACKAGE
-        )
-        self.settle_package_state()
-        self.verify_package_verifier_state()
-        # Give the boot helper the Shizuku helper's ADB keypair: that
-        # public key is already authorized on the device, so the helper
-        # can drive loopback ADB without another privileged grant.
-        for name in ("adbkey", "adbkey.pub"):
-            staged = f"/data/local/tmp/portal-autoroot-{name}.tmp"
-            self.adb_run(
-                [
-                    "shell",
-                    f"run-as {SHIZUKU_HELPER_PACKAGE} cat files/{name}"
-                    f" > {staged} && chmod 0644 {staged}",
-                ],
-                timeout=10,
-                check=True,
-            )
-            self.adb_run(
-                [
-                    "shell",
-                    "run-as",
-                    AUTOROOT_HELPER_PACKAGE,
-                    "mkdir",
-                    "-p",
-                    "files",
-                ],
-                timeout=10,
-                check=True,
-            )
-            self.adb_run(
-                [
-                    "shell",
-                    "run-as",
-                    AUTOROOT_HELPER_PACKAGE,
-                    "cp",
-                    staged,
-                    f"files/{name}",
-                ],
-                timeout=10,
-                check=True,
-            )
-            self.adb_run(
-                [
-                    "shell",
-                    "run-as",
-                    AUTOROOT_HELPER_PACKAGE,
-                    "chmod",
-                    "0600",
-                    f"files/{name}",
-                ],
-                timeout=10,
-                check=True,
-            )
-            self.adb_run(["shell", "rm", "-f", staged], timeout=5)
-        self.adb_run(
-            ["shell", "mkdir", "-p", AUTOROOT_REMOTE_DIR],
-            timeout=5,
-            check=True,
-        )
-        self.adb_run(
-            ["push", str(AUTOROOT_RUNNER_LOCAL), f"{AUTOROOT_REMOTE_DIR}/run.sh"],
-            timeout=15,
-            check=True,
-        )
-        self.adb_run(
-            ["shell", "chmod", "0755", f"{AUTOROOT_REMOTE_DIR}/run.sh"],
-            timeout=5,
-            check=True,
-        )
-        # Render the exploit environment for both attempt parities from
-        # the same builder exploit() uses, minus the per-boot addresses
-        # (the helper discovers those and passes them to run.sh).
-        with tempfile.TemporaryDirectory(prefix="portal-autoroot-env-") as temp:
-            for attempt, name in ((1, "env-odd.sh"), (2, "env-even.sh")):
-                environment = self.build_exploit_environment(0, 0, attempt)
-                environment.pop("GHOSTLOCK_KASLR_BASE", None)
-                environment.pop("GHOSTLOCK_P0_MEMSTART", None)
-                if "GHOSTLOCK_ACTION_CREDENTIAL_PID" in environment:
-                    raise ProvisionError(
-                        "autoroot cannot stage this run: its exploit "
-                        "environment carries a per-boot credential "
-                        "identity (pid/uid resolved live), which cannot "
-                        "be frozen into the on-device runner"
-                    )
-                rendered = "".join(
-                    f"export {key}={shlex.quote(value)}\n"
-                    for key, value in sorted(environment.items())
-                )
-                local = pathlib.Path(temp) / name
-                local.write_text(rendered, encoding="utf-8")
-                remote = f"{AUTOROOT_REMOTE_DIR}/{name}"
-                self.adb_run(["push", str(local), remote], timeout=15, check=True)
-                self.adb_run(
-                    ["shell", "chmod", "0644", remote], timeout=5, check=True
-                )
-            offsets = ",".join(
-                hex(offset) for offset in self.target.kaslr_pc_offsets
-            )
-            conf = (
-                f"MAX_ATTEMPTS={AUTOROOT_MAX_ATTEMPTS}\n"
-                f"SESSION_WINDOW_SEC={AUTOROOT_SESSION_WINDOW_SEC}\n"
-                f"SIMPLEPERF={simpleperf_remote}\n"
-                f"KASLR_OFFSETS={offsets}\n"
-            )
-            local_conf = pathlib.Path(temp) / "autoroot.conf"
-            local_conf.write_text(conf, encoding="utf-8")
-            self.adb_run(
-                ["push", str(local_conf), AUTOROOT_CONF_REMOTE],
-                timeout=15,
-                check=True,
-            )
-            self.adb_run(
-                ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
-                timeout=5,
-                check=True,
-            )
-        # A fresh provision starts a fresh autoroot session: drop any state
-        # an earlier staging left behind, so an exhausted attempt budget or
-        # a stale session window cannot block recovery after this run.
-        self.adb_run(
-            ["shell", "rm", "-f", f"{AUTOROOT_REMOTE_DIR}/state"],
-            timeout=5,
-            check=False,
-        )
-        # Android keeps freshly installed packages in the stopped state,
-        # which suppresses BOOT_COMPLETED delivery; launch the helper once
-        # now (mirrors the shizuku helper activation in verify_shizuku) so
-        # its boot receiver can fire on later reboots. The daemon is up at
-        # this point, so the service's first run just records this boot as
-        # done and exits.
-        try:
-            self.adb_run(
-                [
-                    "shell",
-                    "am",
-                    "broadcast",
-                    "-f",
-                    "0x20",
-                    "-a",
-                    "dev.portal.autoroothelper.START",
-                    "-p",
-                    AUTOROOT_HELPER_PACKAGE,
-                ],
-                timeout=15,
-                check=True,
-            )
-        except ProvisionError:
-            print("AUTOROOT_HELPER_ACTIVATION_PENDING early_boot=1")
-        print("AUTOROOT_HELPER_ACTIVATED first_install=1")
-        # The autoroot helper now holds its own copy of the loopback
-        # keypair (copied above) and runs its own ADB client, so the
-        # shizuku helper app has no remaining role in the autoroot
-        # flow: remove it so the deployed system is just the sentinel,
-        # Shizuku, and the autoroot helper. The authorized public key
-        # in adb_keys is a plain line in a file and is unaffected by
-        # removing the other app that happened to hold a copy.
-        installed, _ = self.package_sets()
-        if SHIZUKU_HELPER_PACKAGE in installed:
-            result = self.adb_run(
-                ["uninstall", SHIZUKU_HELPER_PACKAGE], timeout=60
-            )
-            if result.returncode != 0 or "Success" not in result.stdout:
-                raise ProvisionError(
-                    "failed to remove the shizuku helper after "
-                    f"autoroot staging: {result.stdout.strip()}"
-                )
-            print("SHIZUKU_HELPER_REMOVED reason=autoroot-keypair-merged")
-        print(
-            f"AUTOROOT_STAGED_OK dir={AUTOROOT_REMOTE_DIR} "
-            f"helper={AUTOROOT_HELPER_PACKAGE} "
-            f"max_attempts={AUTOROOT_MAX_ATTEMPTS}",
-            flush=True,
-        )
+        return self.payload_feature.stage_autoroot_payload()
 
     @staticmethod
     def audio_processing_disabled_observed(
@@ -4187,62 +3745,7 @@ class PortalProvisioner:
         return self.presence_feature.prepare_camera_light_install()
 
     def restore_uid1000_package_state_if_unused(self) -> None:
-        if self.target and self.target.uid1000_embedded_helper:
-            retained = []
-            for path, label in (
-                (CAMERA_LIGHT_INSTALLED_REMOTE, "camera-light"),
-                (
-                    "/data/local/tmp/portal-presence-backup/fps-cap-v1",
-                    "presence-fps",
-                ),
-                (
-                    ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE,
-                    "adb-framework",
-                ),
-            ):
-                if self.adb_run(
-                    ["shell", "test", "-f", path], timeout=5
-                ).returncode == 0:
-                    retained.append(label)
-            if retained:
-                if self.uid1000_runtime_package_installed:
-                    self.uid1000_runtime_package_installed = False
-                    print("UID1000_RUNTIME_APK_RETAIN package=installed")
-                print("UID1000_BOOT_HOOK_RETAINED features=" + ",".join(retained))
-                return
-            self.compile_camera_light_host_speed()
-            if self.uid1000_runtime_package_installed:
-                self.uninstall_uid1000_runtime_payload()
-            print(
-                f"UID1000_BOOT_HOOK_RESTORED host={self.target.uid1000_host_label}"
-            )
-            return
-        retained = [
-            path
-            for path in (
-                self.uid1000_path("camera-led-enabled"),
-                self.uid1000_path("presence-fps"),
-                self.uid1000_path("wireless-adb-enabled"),
-                self.uid1000_path("adb-framework-enabled"),
-                self.uid1000_path(SYSTEM_THEME_CONTROL_MARKER),
-            )
-            if self.adb_run(
-                ["shell", "test", "-e", path], timeout=5
-            ).returncode == 0
-        ]
-        if retained:
-            print(
-                "UID1000_BOOT_HOOK_RETAINED features="
-                + ",".join(path.rsplit("/", 1)[-1] for path in retained)
-            )
-            return
-        self.compile_camera_light_host_speed()
-        host_label = (
-            self.target.uid1000_host_label
-            if self.target
-            else DEFAULT_UID1000_HOST_PACKAGE.rsplit(".", 1)[-1]
-        )
-        print(f"UID1000_BOOT_HOOK_RESTORED host={host_label}")
+        return self.payload_feature.restore_uid1000_package_state_if_unused()
 
     def package_sets(self) -> tuple[set[str], set[str]]:
         return self.settings_feature.package_sets()
