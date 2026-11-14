@@ -694,6 +694,16 @@ class ShizukuCliTest(unittest.TestCase):
             )
             with (
                 mock.patch.object(provisioner, "connect"),
+                # Keep the suite hermetic: without this fake the boot
+                # preflight shells out to a real adb binary, which errors
+                # on hosts that do not have adb installed. A real adb
+                # against an unconfigured device reports "not installed",
+                # i.e. False.
+                mock.patch.object(
+                    provisioner,
+                    "adb_framework_boot_preflight",
+                    return_value=False,
+                ),
                 mock.patch(
                     "provision_portal.android_build_environment",
                     return_value={},
