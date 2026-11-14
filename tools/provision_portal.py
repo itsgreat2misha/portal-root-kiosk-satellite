@@ -40,6 +40,7 @@ from meta_debloat_components import (
     DEBLOAT_COMPONENT_NAMES,
 )
 from portal_targets import PortalTarget, find_target
+from device_session import DeviceSession, ProvisionError, run_command
 from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
 
 
@@ -230,10 +231,6 @@ UID1000_RUNTIME_APK_LOCAL = (
 )
 
 
-class ProvisionError(RuntimeError):
-    pass
-
-
 def print_banner() -> None:
     print(PROVISIONER_BANNER, file=sys.stderr, flush=True)
 
@@ -362,7 +359,13 @@ class PortalProvisioner:
         self.meta_accounts_local_only = meta_accounts_local_only
         self.meta_accounts_auth_only = meta_accounts_auth_only
         self.meta_accounts_finalize_only = meta_accounts_finalize_only
-        self.adb = ["adb", "-s", serial]
+        self.session = DeviceSession(
+            serial,
+            post_boot_settle_seconds=lambda: (
+                self.target.post_boot_adb_settle_seconds if self.target else 0
+            ),
+        )
+        self.adb = self.session.adb
         self.target: PortalTarget | None = None
         self.persist_wireless_adb = False
         self.adb_framework_boot_configured = False
@@ -615,135 +618,21 @@ class PortalProvisioner:
     def run(
         args: list[str], timeout: float | None = None, check: bool = False
     ) -> subprocess.CompletedProcess[str]:
-        try:
-            result = subprocess.run(
-                args,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ProvisionError(f"command timed out: {shlex.join(args)}") from exc
-        if check and result.returncode != 0:
-            raise ProvisionError(
-                f"command failed ({result.returncode}): {shlex.join(args)}\n"
-                f"{result.stdout[-2000:]}"
-            )
-        return result
+        return run_command(args, timeout=timeout, check=check)
 
     def adb_run(
         self, args: list[str], timeout: float | None = None, check: bool = False
     ) -> subprocess.CompletedProcess[str]:
-        return self.run(self.adb + args, timeout=timeout, check=check)
+        return self.session.adb_run(args, timeout=timeout, check=check)
 
     def connect(self, wait_seconds: int = 150) -> None:
-        try:
-            self.run(["adb", "disconnect", self.serial], timeout=5)
-        except ProvisionError:
-            pass
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            try:
-                self.run(["adb", "connect", self.serial], timeout=5)
-                state = self.adb_run(["get-state"], timeout=5)
-                completed = self.adb_run(
-                    ["shell", "getprop", "sys.boot_completed"], timeout=5
-                )
-                if state.returncode == 0 and completed.stdout.strip() == "1":
-                    return
-            except ProvisionError:
-                pass
-            time.sleep(3)
-        raise ProvisionError(f"{self.serial} did not reconnect after {wait_seconds}s")
+        return self.session.connect(wait_seconds)
 
     def reboot(self) -> tuple[str, str]:
-        before = self.adb_run(
-            ["shell", "cat", "/proc/sys/kernel/random/boot_id"],
-            timeout=5,
-            check=True,
-        ).stdout.strip()
-        try:
-            self.adb_run(["reboot"], timeout=8)
-        except ProvisionError:
-            # adbd can disappear before acknowledging a successful reboot.
-            pass
-        after = self.connect_after_reboot(before)
-        return before, after
+        return self.session.reboot()
 
     def connect_after_reboot(self, before: str, wait_seconds: int = 600) -> str:
-        try:
-            self.run(["adb", "disconnect", self.serial], timeout=5)
-        except ProvisionError:
-            pass
-        deadline = time.monotonic() + wait_seconds
-        last_boot_id = ""
-        while time.monotonic() < deadline:
-            try:
-                # One adb invocation per poll tick: a single shell call
-                # returns both the boot-completed flag and the boot ID.
-                # A failed shell call means the transport is down, which
-                # is the only case that needs an explicit reconnect.
-                probe = self.adb_run(
-                    [
-                        "shell",
-                        "getprop sys.boot_completed; "
-                        "cat /proc/sys/kernel/random/boot_id",
-                    ],
-                    timeout=5,
-                )
-                if probe.returncode != 0:
-                    self.run(["adb", "connect", self.serial], timeout=5)
-                    time.sleep(3)
-                    continue
-                fields = probe.stdout.split()
-                completed = fields[0] if fields else ""
-                observed_boot_id = fields[1] if len(fields) > 1 else ""
-                if re.fullmatch(r"[0-9a-fA-F-]{36}", observed_boot_id):
-                    last_boot_id = observed_boot_id
-                if (
-                    completed == "1"
-                    and last_boot_id
-                    and last_boot_id != before
-                ):
-                    settle_seconds = (
-                        self.target.post_boot_adb_settle_seconds
-                        if self.target
-                        else 0
-                    )
-                    if settle_seconds:
-                        time.sleep(settle_seconds)
-                        stable = self.adb_run(
-                            ["shell", "getprop", "sys.boot_completed"],
-                            timeout=5,
-                        )
-                        if (
-                            stable.returncode != 0
-                            or stable.stdout.strip() != "1"
-                        ):
-                            self.run(
-                                ["adb", "connect", self.serial], timeout=5
-                            )
-                            time.sleep(3)
-                            continue
-                    return last_boot_id
-            except ProvisionError:
-                pass
-            time.sleep(3)
-        adb_hint = ""
-        if not last_boot_id:
-            adb_hint = (
-                "; ADB did not return. If WIRELESS_ADB_OK has not appeared yet, "
-                "enable ADB in the Portal Debug menu and run "
-                "`adb -d tcpip 5555`, then rerun the same provisioner command"
-            )
-        raise ProvisionError(
-            f"{self.serial} did not complete a new boot after {before}; "
-            f"last valid boot ID was {last_boot_id!r}{adb_hint}"
-        )
+        return self.session.connect_after_reboot(before, wait_seconds)
 
     def verify_target(self, require_supported: bool = True) -> PortalTarget | None:
         fingerprint = self.adb_run(
