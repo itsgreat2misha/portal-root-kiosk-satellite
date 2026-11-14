@@ -342,8 +342,11 @@ Deliberately kept, and why:
   sets that variable — but the native code is left in place:
   removing it would mean rebuilding and re-validating the exploit
   payloads for zero runtime effect.
-- `docs/` keeps its historical Kiosk references; those are dated
-  status/findings records, not product framing.
+- `docs/` was removed in the pre-release hygiene pass: the upstream
+  status/findings journals described removed Kiosk features as current
+  behavior and carried a personal LAN address and a device session
+  UUID. They remain in this repo's history; the live record is the
+  project test log, not `docs/`.
 
 ## 14. Streamlining — safe bucket (2026-11-13)
 
