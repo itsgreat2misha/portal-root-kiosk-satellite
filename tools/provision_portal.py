@@ -64,6 +64,31 @@ from features.settings import (
     parse_remote_wipe_backup,
     restore_component_action,
 )
+from features.presence import (
+    CAMERA_LIGHT_HELPER_REMOTE,
+    CAMERA_LIGHT_HOOK_REMOTE,
+    CAMERA_LIGHT_INSTALLED_REMOTE,
+    CAMERA_LIGHT_RESTORED_REMOTE,
+    CAMERA_SERVICE_COMPONENT,
+    PRESENCE_ANALYSIS_FRAME_MARKER,
+    PRESENCE_HELPER_LOCAL,
+    PRESENCE_HELPER_PACKAGE,
+    PRESENCE_INSTALLED_REMOTE,
+    PRESENCE_KEY_REMOTE,
+    PRESENCE_LOGCAT_REGEX,
+    PRESENCE_LOG_MARKER,
+    PRESENCE_PROFILE_KEYS,
+    PRESENCE_PROFILE_SETTINGS,
+    PRESENCE_ROI_FRAME_MARKER,
+    PRESENCE_SAVED_KEY_REMOTE,
+    PRESENCE_WIDE_FRAME_MARKER,
+    SYSTEM_THEME_CONTROL_MARKER,
+    SYSTEM_THEME_PROPERTY,
+    SYSTEM_THEME_SETTING,
+    PresenceConfig,
+    PresenceFeature,
+    presence_full_scene_active,
+)
 from features.audio import (
     MHA_AUDIO_VERIFIED_LOG,
     MHA_TUNING_BACKUP_REMOTE,
@@ -110,14 +135,10 @@ ACCOUNT_CTL_LOCAL = ROOT / "exploit/build/portal-account-ctl.jar"
 ACCOUNT_CTL_REMOTE = "/data/local/tmp/portal-account-ctl.jar"
 COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
 COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
-PRESENCE_HELPER_PACKAGE = "dev.portal.presencehelper"
-PRESENCE_HELPER_LOCAL = ROOT / "presence-helper/build/portal-presence-helper.apk"
 EXPLOIT_SENTINEL_PACKAGE = "dev.portal.exploitsentinel"
 EXPLOIT_SENTINEL_LOCAL = (
     ROOT / "exploit-sentinel/build/portal-exploit-sentinel.apk"
 )
-PRESENCE_KEY_REMOTE = "/data/local/tmp/portal-presence-adbkey.pub"
-PRESENCE_SAVED_KEY_REMOTE = "/data/local/tmp/portal-presence-adbkey-v1.pub"
 SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
 SHIZUKU_HELPER_PACKAGE = "dev.portal.shizukuhelper"
 SHIZUKU_HELPER_LOCAL = ROOT / "shizuku-helper/build/portal-shizuku-helper.apk"
@@ -147,45 +168,9 @@ ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
 )
 PACKAGE_STATE_SETTLE_SECONDS = 15
-PRESENCE_PROFILE_SETTINGS = {
-    "enable_cv_background_detector_v2": False,
-    "enable_hardware_cropping": False,
-    "enable_liveness_metric": False,
-    "enable_color_based_reid": False,
-    "enable_face_rec_based_reid_v3": False,
-}
-PRESENCE_PROFILE_KEYS = tuple(PRESENCE_PROFILE_SETTINGS)
-PRESENCE_LOG_MARKER = "Notify people presence"
-PRESENCE_ANALYSIS_FRAME_MARKER = "Frame available for analysis stream"
-PRESENCE_ROI_FRAME_MARKER = "Frame available for roi stream"
-PRESENCE_WIDE_FRAME_MARKER = "Disabled hardware cropping"
-PRESENCE_INSTALLED_REMOTE = (
-    "/data/local/tmp/portal-presence-backup/installed-v1"
-)
-PRESENCE_LOGCAT_REGEX = (
-    "settings_config.xml\\|"
-    "Frame.available.for.analysis.stream\\|"
-    "Frame.available.for.roi.stream\\|"
-    "Disabled.hardware.cropping\\|"
-    "Notify.people.presence\\|"
-    "Setting.AI.Processing.FPS\\|presence.FPS.activation\\|"
-    "CAMERA_SERVICE.not.running\\|privacy.mode"
-)
-CAMERA_SERVICE_COMPONENT = (
-    "com.facebook.portal.aiservice/"
-    "com.facebook.alohaapp.app.services.CameraService"
-)
 OTA_UI_PACKAGE = "com.facebook.aloha.otaui"
 OTA_SETUP_PACKAGE = "com.facebook.aloha.alohaotasetup"
 DEFAULT_UID1000_HOST_PACKAGE = "com.facebook.alohasdk.platformbatterystate"
-CAMERA_LIGHT_HELPER_REMOTE = "/data/local/tmp/portal-camera-led-watch"
-CAMERA_LIGHT_HOOK_REMOTE = "/data/local/tmp/portal-uid1000-hook.bin"
-CAMERA_LIGHT_INSTALLED_REMOTE = (
-    "/data/local/tmp/portal-camera-light-backup/installed-v1"
-)
-CAMERA_LIGHT_RESTORED_REMOTE = (
-    "/data/local/tmp/portal-camera-light-backup/restored-v1"
-)
 WIRELESS_ADB_INSTALLED_REMOTE = (
     "/data/local/tmp/portal-wireless-adb-installed-v1"
 )
@@ -195,9 +180,6 @@ ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE = (
 UID1000_HOOK_ACTIVE_REMOTE = (
     "/data/local/tmp/portal-uid1000-hook-active-v1"
 )
-SYSTEM_THEME_PROPERTY = "debug.portal.system_theme"
-SYSTEM_THEME_SETTING = "ui_night_mode"
-SYSTEM_THEME_CONTROL_MARKER = "system-theme-control-enabled"
 UID1000_RUNTIME_PACKAGE = "dev.portal.uid1000runtime"
 UID1000_RUNTIME_APK_LOCAL = (
     ROOT / "uid1000-helper/build/portal-uid1000-runtime.apk"
@@ -318,6 +300,33 @@ class PortalProvisioner:
             log_dir=log_dir,
             target=lambda: self.target,
             restore_audio=lambda: self.restore_audio,
+        )
+        self.presence_feature = PresenceFeature(
+            config=lambda: PresenceConfig(
+                system_theme_control=self.system_theme_control,
+                presence_fps_cap=self.presence_fps_cap,
+            ),
+            adb_run=lambda *a, **k: self.adb_run(*a, **k),
+            run=lambda *a, **k: self.run(*a, **k),
+            target=lambda: self.target,
+            log_dir=lambda: self.log_dir,
+            uid1000_path=lambda *a, **k: self.uid1000_path(*a, **k),
+            install_apk_preserving_verifier=(
+                lambda *a, **k: self.install_apk_preserving_verifier(*a, **k)
+            ),
+            verify_package_verifier_state=(
+                lambda *a, **k: self.verify_package_verifier_state(*a, **k)
+            ),
+            settle_package_state=lambda *a, **k: self.settle_package_state(
+                *a, **k
+            ),
+            push_text_atomic=lambda *a, **k: self.push_text_atomic(*a, **k),
+            package_sets=lambda *a, **k: self.package_sets(*a, **k),
+            logcat_watermark=lambda *a, **k: self.logcat_watermark(*a, **k),
+            logcat_poll=lambda *a, **k: self.logcat_poll(*a, **k),
+            adb_framework_boot_installed_remote=(
+                ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE
+            ),
         )
         self.settings_feature = SettingsFeature(
             adb_run=lambda args, timeout=None, check=False: self.adb_run(
@@ -924,28 +933,7 @@ class PortalProvisioner:
     def presence_full_scene_active(
         logs: str, camera: str, target: PortalTarget | None
     ) -> bool:
-        active_request = camera.split("Tag monitoring disabled", 1)[0]
-        full_sensor_frame = (
-            "com.facebook.alohasdk.dewarp_crop_rect.width"
-            not in active_request
-        )
-        if target and target.presence_full_sensor_width:
-            crop_values: dict[str, float] = {}
-            for coordinate in ("x_start", "y_start", "width"):
-                match = re.search(
-                    rf"dewarp_crop_rect\.{coordinate}[^\n]*\n\s*"
-                    r"\[([0-9.]+)",
-                    active_request,
-                )
-                if match:
-                    crop_values[coordinate] = float(match.group(1))
-            full_sensor_frame = (
-                crop_values.get("x_start") == 0.0
-                and crop_values.get("y_start") == 0.0
-                and crop_values.get("width", 0.0)
-                >= target.presence_full_sensor_width
-            )
-        return PRESENCE_WIDE_FRAME_MARKER in logs and full_sensor_frame
+        return presence_full_scene_active(logs, camera, target)
 
     def collect_status(self) -> dict[str, object]:
         def shell(*arguments: str, timeout: int = 15) -> str:
@@ -2589,157 +2577,13 @@ class PortalProvisioner:
         print("SHIZUKU_REMOVED_OK packages=absent server=absent")
 
     def apply_system_theme_request(self) -> None:
-        if self.system_theme_control not in {"light", "dark"}:
-            raise ProvisionError("system theme must be light or dark")
-        if self.target and self.target.system_theme_uid1000_required:
-            expected_log = (
-                "system theme request "
-                f"mode={self.system_theme_control} uid=1000 status=0"
-            )
-            prior_logs = self.adb_run(
-                ["shell", "logcat", "-d", "-s", "PortalSystemTheme:*"],
-                timeout=10,
-            ).stdout
-            self.system_theme_control_log_count_before = prior_logs.count(
-                expected_log
-            )
-            self.adb_run(
-                ["shell", "setprop", SYSTEM_THEME_PROPERTY, "none"],
-                timeout=5,
-                check=True,
-            )
-            # Ensure the 250 ms worker observes an ignored edge even when the
-            # requested value is the same as its preceding request.
-            time.sleep(1)
-            self.adb_run(
-                [
-                    "shell",
-                    "setprop",
-                    SYSTEM_THEME_PROPERTY,
-                    self.system_theme_control,
-                ],
-                timeout=5,
-                check=True,
-            )
-            transport = "uid1000-property"
-        else:
-            night_mode = "yes" if self.system_theme_control == "dark" else "no"
-            self.adb_run(
-                ["shell", "cmd", "uimode", "night", night_mode],
-                timeout=10,
-                check=True,
-            )
-            transport = "shell-uimode"
-        print(
-            "SYSTEM_THEME_REQUEST "
-            f"mode={self.system_theme_control} transport={transport}",
-            flush=True,
-        )
+        return self.presence_feature.apply_system_theme_request()
 
     def verify_system_theme_control(self, wait_seconds: int = 20) -> None:
-        if self.system_theme_control not in {"light", "dark"}:
-            raise ProvisionError("system theme must be light or dark")
-        uid1000_required = bool(
-            self.target and self.target.system_theme_uid1000_required
-        )
-        if uid1000_required and self.adb_run(
-            [
-                "shell",
-                "test",
-                "-f",
-                self.uid1000_path(SYSTEM_THEME_CONTROL_MARKER),
-            ],
-            timeout=5,
-        ).returncode != 0:
-            raise ProvisionError("UID-1000 system theme control is not installed")
-
-        expected = "2" if self.system_theme_control == "dark" else "1"
-        deadline = time.monotonic() + wait_seconds
-        observed = ""
-        process = ""
-        helper_log = ""
-        while time.monotonic() < deadline:
-            observed = self.adb_run(
-                ["shell", "settings", "get", "secure", SYSTEM_THEME_SETTING],
-                timeout=5,
-            ).stdout.strip()
-            if uid1000_required:
-                processes = self.adb_run(
-                    ["shell", "ps", "-A", "-o", "USER,PID,PPID,NAME,ARGS"],
-                    timeout=10,
-                    check=True,
-                ).stdout
-                process = next(
-                    (
-                        line
-                        for line in processes.splitlines()
-                        if "portal-camera-led-watch" in line
-                        or "portal-led-watc" in line
-                    ),
-                    "",
-                )
-                helper_log = self.adb_run(
-                    ["shell", "logcat", "-d", "-s", "PortalSystemTheme:*"],
-                    timeout=10,
-                ).stdout
-                expected_log = (
-                    "system theme request "
-                    f"mode={self.system_theme_control} uid=1000 status=0"
-                )
-                if helper_log.count(expected_log) > (
-                    self.system_theme_control_log_count_before
-                ):
-                    self.system_theme_control_runtime_verified = True
-            runtime_verified = (
-                self.system_theme_control_runtime_verified
-                or not uid1000_required
-            )
-            if (
-                observed == expected
-                and (process or not uid1000_required)
-                and runtime_verified
-            ):
-                print(
-                    "SYSTEM_THEME_CONTROL_OK "
-                    f"mode={self.system_theme_control} "
-                    f"transport={'uid1000' if uid1000_required else 'shell'}"
-                )
-                return
-            time.sleep(1)
-        raise ProvisionError(
-            "system theme request did not apply: "
-            f"expected={expected} observed={observed!r} process={process!r} "
-            f"helper_log={helper_log[-1000:]!r}"
-        )
+        return self.presence_feature.verify_system_theme_control(wait_seconds)
 
     def system_theme_control_preflight(self) -> bool:
-        if self.system_theme_control is None:
-            return False
-        uid1000_required = bool(
-            self.target and self.target.system_theme_uid1000_required
-        )
-        if uid1000_required and self.adb_run(
-            [
-                "shell",
-                "test",
-                "-f",
-                self.uid1000_path(SYSTEM_THEME_CONTROL_MARKER),
-            ],
-            timeout=5,
-        ).returncode != 0:
-            print("SYSTEM_THEME_PREFLIGHT action=install control=absent")
-            return False
-        self.apply_system_theme_request()
-        try:
-            self.verify_system_theme_control(wait_seconds=10)
-        except ProvisionError as exc:
-            print(f"SYSTEM_THEME_PREFLIGHT action=install reason={exc}")
-            return False
-        print(
-            "SYSTEM_THEME_PREFLIGHT action=skip "
-            f"mode={self.system_theme_control} capability=ready"
-        )
-        return True
+        return self.presence_feature.system_theme_control_preflight()
 
     def recover_actions(self) -> bool:
         state = self.read_state()
@@ -2885,55 +2729,10 @@ class PortalProvisioner:
         return complete
 
     def presence_preflight(self) -> bool:
-        marker_present = self.adb_run(
-            ["shell", "test", "-f", PRESENCE_INSTALLED_REMOTE], timeout=5
-        ).returncode == 0
-        try:
-            self.verify_presence_runtime(
-                require_profile=not marker_present, wait_seconds=90
-            )
-        except ProvisionError as exc:
-            print(f"PRESENCE_PREFLIGHT action=install reason={exc}")
-            return False
-        print(
-            "PRESENCE_PREFLIGHT action=skip profile=active "
-            f"verified_marker={int(marker_present)}"
-        )
-        return True
+        return self.presence_feature.presence_preflight()
 
     def presence_fps_preflight(self) -> bool:
-        if self.presence_fps_cap is None:
-            return False
-        marker = self.adb_run(
-            [
-                "shell", "cat",
-                "/data/local/tmp/portal-presence-backup/fps-cap-v1",
-            ],
-            timeout=5,
-        )
-        if (
-            marker.returncode != 0
-            or marker.stdout.strip() != str(self.presence_fps_cap)
-        ):
-            print(
-                "PRESENCE_FPS_PREFLIGHT action=install "
-                f"expected={self.presence_fps_cap} marker=absent-or-mismatched"
-            )
-            return False
-        try:
-            self.verify_presence_runtime(
-                require_profile=True,
-                expected_analysis_fps=self.presence_fps_cap,
-                wait_seconds=90,
-            )
-        except ProvisionError as exc:
-            print(f"PRESENCE_FPS_PREFLIGHT action=install reason={exc}")
-            return False
-        print(
-            "PRESENCE_FPS_PREFLIGHT action=skip "
-            f"fps={self.presence_fps_cap} activation=uid1000"
-        )
-        return True
+        return self.presence_feature.presence_fps_preflight()
 
     def simpleperf_push_needed(
         self, local: pathlib.Path, remote: str
@@ -3055,140 +2854,13 @@ class PortalProvisioner:
         raise ProvisionError("simpleperf did not expose a recognized kernel PC")
 
     def prepare_presence_helper(self) -> None:
-        self.install_apk_preserving_verifier(
-            PRESENCE_HELPER_LOCAL, "presence-helper", PRESENCE_HELPER_PACKAGE
-        )
-        self.settle_package_state()
-        self.verify_package_verifier_state()
-        private_key = self.adb_run(
-            ["exec-out", "run-as", PRESENCE_HELPER_PACKAGE, "cat", "files/adbkey"],
-            timeout=10,
-        ).stdout
-        existing_public = self.adb_run(
-            [
-                "exec-out",
-                "run-as",
-                PRESENCE_HELPER_PACKAGE,
-                "cat",
-                "files/adbkey.pub",
-            ],
-            timeout=10,
-        ).stdout.strip()
-        key_exists = (
-            "-----BEGIN PRIVATE KEY-----" in private_key
-            and "-----END PRIVATE KEY-----" in private_key
-            and re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", existing_public)
-            is not None
-        )
-        if not key_exists:
-            with tempfile.TemporaryDirectory(prefix="portal-presence-key-") as temp:
-                key = pathlib.Path(temp) / "adbkey"
-                self.run(["adb", "keygen", str(key)], timeout=30, check=True)
-                for source, remote, destination in (
-                    (key, "/data/local/tmp/portal-presence-key.tmp", "files/adbkey"),
-                    (
-                        pathlib.Path(str(key) + ".pub"),
-                        "/data/local/tmp/portal-presence-key.pub.tmp",
-                        "files/adbkey.pub",
-                    ),
-                ):
-                    self.adb_run(["push", str(source), remote], timeout=15, check=True)
-                    self.adb_run(["shell", "chmod", "0644", remote], timeout=5, check=True)
-                    self.adb_run(
-                        ["shell", "run-as", PRESENCE_HELPER_PACKAGE, "mkdir", "-p", "files"],
-                        timeout=10,
-                        check=True,
-                    )
-                    self.adb_run(
-                        ["shell", "run-as", PRESENCE_HELPER_PACKAGE, "cp", remote, destination],
-                        timeout=10,
-                        check=True,
-                    )
-                    self.adb_run(
-                        ["shell", "run-as", PRESENCE_HELPER_PACKAGE, "chmod", "0600", destination],
-                        timeout=10,
-                        check=True,
-                    )
-                    self.adb_run(["shell", "rm", "-f", remote], timeout=5)
-        public = self.adb_run(
-            [
-                "exec-out",
-                "run-as",
-                PRESENCE_HELPER_PACKAGE,
-                "cat",
-                "files/adbkey.pub",
-            ],
-            timeout=10,
-            check=True,
-        ).stdout.strip()
-        if not re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", public):
-            raise ProvisionError("Portal presence helper returned an invalid ADB public key")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.presence_public_key = self.log_dir / "portal-presence-adbkey.pub"
-        self.presence_public_key.write_text(public + "\n", encoding="ascii")
-        self.presence_public_key.chmod(0o600)
-        print(
-            f"PRESENCE_HELPER_PAYLOAD_OK package={PRESENCE_HELPER_PACKAGE} "
-            f"key_reused={int(key_exists)}"
-        )
+        return self.presence_feature.prepare_presence_helper()
 
     def activate_presence_helper(self) -> None:
-        if self.presence_fps_cap is None:
-            raise ProvisionError("presence helper requires an FPS cap")
-        result = self.adb_run(
-            [
-                "shell",
-                "am",
-                "broadcast",
-                "--include-stopped-packages",
-                "-a",
-                "dev.portal.presencehelper.CONFIG",
-                "-n",
-                f"{PRESENCE_HELPER_PACKAGE}/.BootReceiver",
-                "--ei",
-                "fps",
-                str(self.presence_fps_cap),
-            ],
-            timeout=20,
-            check=True,
-        )
-        if "result=0" not in result.stdout:
-            raise ProvisionError(
-                "presence helper configuration broadcast failed: "
-                + result.stdout.strip()
-            )
-        self.adb_run(
-            [
-                "shell",
-                "am",
-                "broadcast",
-                "--include-stopped-packages",
-                "-a",
-                "dev.portal.presencehelper.START",
-                "-n",
-                f"{PRESENCE_HELPER_PACKAGE}/.BootReceiver",
-            ],
-            timeout=20,
-            check=True,
-        )
-        print(
-            f"PRESENCE_HELPER_OK package={PRESENCE_HELPER_PACKAGE} "
-            f"fps={self.presence_fps_cap}"
-        )
+        return self.presence_feature.activate_presence_helper()
 
     def uninstall_presence_helper(self) -> None:
-        installed, _ = self.package_sets()
-        if PRESENCE_HELPER_PACKAGE not in installed:
-            print("PRESENCE_HELPER_REMOVE already_absent=1")
-            return
-        result = self.adb_run(
-            ["uninstall", PRESENCE_HELPER_PACKAGE], timeout=30
-        )
-        if result.returncode != 0 or "Success" not in result.stdout:
-            raise ProvisionError(
-                "failed to remove presence helper: " + result.stdout.strip()
-            )
-        print(f"PRESENCE_HELPER_REMOVE package={PRESENCE_HELPER_PACKAGE}")
+        return self.presence_feature.uninstall_presence_helper()
 
     def prepare_exploit_sentinel(self) -> None:
         if not EXPLOIT_SENTINEL_LOCAL.is_file():
@@ -4926,71 +4598,13 @@ class PortalProvisioner:
         )
 
     def compile_camera_light_host_speed(self) -> None:
-        if self.target is None:
-            raise ProvisionError("target must be selected before preparing UID 1000")
-        host_package = self.target.uid1000_host_package
-        self.adb_run(
-            ["shell", "am", "force-stop", "--user", "0", host_package],
-            timeout=10,
-        )
-        result = self.adb_run(
-            [
-                "shell",
-                "cmd",
-                "package",
-                "compile",
-                "-f",
-                "-m",
-                "speed",
-                host_package,
-            ],
-            timeout=120,
-        )
-        if result.returncode != 0 or "Success" not in result.stdout:
-            raise ProvisionError(
-                "could not generate the guarded UID-1000 host ART cache: "
-                + result.stdout
-            )
-        print(
-            f"CAMERA_LIGHT_ART_CACHE_OK host={self.target.uid1000_host_label} "
-            "compiler_filter=speed"
-        )
+        return self.presence_feature.compile_camera_light_host_speed()
 
     def uid1000_boot_hook_active(self) -> bool:
-        result = self.adb_run(
-            ["shell", "ps", "-A", "-o", "USER,PID,ARGS"],
-            timeout=10,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
-            fields = line.split(maxsplit=2)
-            if (
-                fields
-                and fields[0] == "system"
-                and "portal-camera-led-watch" in line
-            ):
-                return True
-        return False
+        return self.presence_feature.uid1000_boot_hook_active()
 
     def prepare_camera_light_install(self) -> None:
-        if self.target is None:
-            raise ProvisionError("target must be selected before preparing UID 1000")
-        installed, _ = self.package_sets()
-        host_package = self.target.uid1000_host_package
-        if host_package not in installed:
-            raise ProvisionError(
-                f"required persistent system package is absent: {host_package}"
-            )
-        if (
-            self.uid1000_boot_hook_active()
-            and not self.target.uid1000_embedded_helper
-        ):
-            print(
-                "UID1000_BOOT_HOOK_RETAINED source=running-system-helper",
-                flush=True,
-            )
-            return
-        self.compile_camera_light_host_speed()
+        return self.presence_feature.prepare_camera_light_install()
 
     def restore_uid1000_package_state_if_unused(self) -> None:
         if self.target and self.target.uid1000_embedded_helper:
@@ -5168,243 +4782,7 @@ class PortalProvisioner:
         expected_analysis_fps: int | None = None,
         wait_seconds: int = 90,
     ) -> None:
-        deadline = time.monotonic() + wait_seconds
-        pid = ""
-        camera_active = False
-        camera_allowed = False
-        camera_appop = ""
-        presence_no_users = False
-        privacy_blocked = False
-        presence_event = False
-        analysis_frames = False
-        roi_frames = False
-        pose_metrics = False
-        frame_processor_loaded = False
-        wide_frame = False
-        loaded_keys: set[str] = set()
-        analysis_fps_applied = False
-        helper_activation = False
-        uid1000_configured = expected_analysis_fps is None
-        required_profile_keys = set(
-            self.target.presence_runtime_keys
-            if self.target and self.target.presence_runtime_keys
-            else PRESENCE_PROFILE_KEYS
-        )
-        if expected_analysis_fps is not None:
-            configured_path = (
-                "/data/local/tmp/portal-presence-backup/fps-cap-v1"
-                if self.target and self.target.uid1000_embedded_helper
-                else self.uid1000_path("presence-fps")
-            )
-            configured = self.adb_run(
-                ["shell", "cat", configured_path], timeout=5
-            )
-            uid1000_configured = (
-                configured.returncode == 0
-                and configured.stdout.strip() == str(expected_analysis_fps)
-            )
-        threads = ""
-        while time.monotonic() < deadline:
-            pid = self.adb_run(
-                ["shell", "pidof", "com.facebook.portal.aiservice"], timeout=5
-            ).stdout.strip()
-            camera = self.adb_run(
-                ["shell", "dumpsys", "media.camera"], timeout=15
-            ).stdout
-            camera_active = (
-                "Active Camera Clients:" in camera
-                and "Client Package Name: com.facebook.portal.aiservice" in camera
-            )
-            appops = self.adb_run(
-                [
-                    "shell",
-                    "cmd",
-                    "appops",
-                    "get",
-                    "com.facebook.portal.aiservice",
-                    "CAMERA",
-                ],
-                timeout=10,
-            ).stdout
-            camera_appop = " ".join(appops.split()) or "no-operation-recorded"
-            camera_allowed = "CAMERA: allow" in appops
-            logs = self.adb_run(
-                [
-                    "shell",
-                    "logcat",
-                    "-d",
-                    "-v",
-                    "brief",
-                    "-e",
-                    PRESENCE_LOGCAT_REGEX,
-                ],
-                timeout=20,
-            ).stdout
-            presence_event = presence_event or PRESENCE_LOG_MARKER in logs
-            presence_no_users = presence_no_users or (
-                "CAMERA_SERVICE not running, but no users found yet" in logs
-            )
-            privacy_blocked = privacy_blocked or any(
-                marker in logs.lower()
-                for marker in (
-                    "cannot start privacy mode on",
-                    "privacy mode is on",
-                )
-            )
-            analysis_frames = (
-                analysis_frames or PRESENCE_ANALYSIS_FRAME_MARKER in logs
-            )
-            roi_frames = roi_frames or PRESENCE_ROI_FRAME_MARKER in logs
-            wide_frame = wide_frame or self.presence_full_scene_active(
-                logs, camera, self.target
-            )
-            loaded_keys.update({
-                key
-                for key, expected in PRESENCE_PROFILE_SETTINGS.items()
-                if any(
-                    "settings_config.xml" in line
-                    and key in line
-                    and re.search(
-                        rf"\b{str(expected).lower()}\b", line, re.IGNORECASE
-                    )
-                    for line in logs.splitlines()
-                )
-            })
-            analysis_fps_applied = analysis_fps_applied or (
-                expected_analysis_fps is not None
-                and any(
-                    "Setting AI Processing FPS" in line
-                    and re.search(
-                        rf"\b{expected_analysis_fps}(?:\.0+)?\b", line
-                    )
-                    for line in logs.splitlines()
-                )
-            )
-            helper_activation = helper_activation or (
-                expected_analysis_fps is not None
-                and any(
-                    "PortalPresence" in line
-                    and f"presence FPS activation complete fps={expected_analysis_fps}"
-                    in line
-                    and "uid=1000" in line
-                    for line in logs.splitlines()
-                )
-            )
-            config_ready = not require_profile or required_profile_keys.issubset(
-                loaded_keys
-            )
-            fps_ready = expected_analysis_fps is None or (
-                analysis_fps_applied
-                and helper_activation
-                and uid1000_configured
-            )
-            metrics = self.adb_run(
-                [
-                    "shell",
-                    "dumpsys",
-                    "activity",
-                    "service",
-                    CAMERA_SERVICE_COMPONENT,
-                ],
-                timeout=20,
-            ).stdout
-            pose_section = ""
-            frame_section = ""
-            if "[ PoseEstimatorManagerMetrics ]" in metrics:
-                pose_section = metrics.split(
-                    "[ PoseEstimatorManagerMetrics ]", 1
-                )[1].split("[ AlohaFrameProcessor ]", 1)[0]
-            if "[ AlohaFrameProcessor ]" in metrics:
-                frame_section = metrics.split(
-                    "[ AlohaFrameProcessor ]", 1
-                )[1].split("[ AiCameramanController ]", 1)[0]
-                frame_processor_loaded = bool(frame_section)
-            latency_bucket = re.compile(r"\b\d+ ms - \d+ ms:\s+\d+\b")
-            pose_metrics = bool(latency_bucket.search(pose_section))
-            if (
-                pid
-                and camera_active
-                and camera_allowed
-                and analysis_frames
-                and roi_frames
-                and pose_metrics
-                and frame_processor_loaded
-                and (not require_profile or wide_frame)
-                and config_ready
-                and fps_ready
-            ):
-                threads = self.adb_run(
-                    ["shell", "ps", "-T", "-p", pid.split()[0]], timeout=10
-                ).stdout
-                disabled_workers = [
-                    name
-                    for name in ("BackgroundDetec", "alohaLivenessMa")
-                    if name not in threads
-                ]
-                if require_profile:
-                    self.adb_run(
-                        [
-                            "shell",
-                            "mkdir",
-                            "-p",
-                            "/data/local/tmp/portal-presence-backup",
-                        ],
-                        timeout=5,
-                        check=True,
-                    )
-                    self.push_text_atomic(
-                        "Portal presence profile verified\n",
-                        PRESENCE_INSTALLED_REMOTE,
-                    )
-                    self.adb_run(
-                        [
-                            "shell",
-                            "rm",
-                            "-f",
-                            "/data/local/tmp/portal-presence-backup/restored-v1",
-                        ],
-                        timeout=5,
-                    )
-                print(
-                    "PRESENCE_RUNTIME_OK "
-                    f"pid={pid.split()[0]} camera=active appop=allow "
-                    "pipeline=active analysis_frames=observed "
-                    "roi_frames=observed pose_metrics=populated "
-                    "frame_processor=loaded "
-                    f"field_of_view={'full' if wide_frame else 'firmware_default'} "
-                    f"presence_event={'observed' if presence_event else 'not_observed'} "
-                    f"profile_keys={len(loaded_keys)} "
-                    f"analysis_fps={expected_analysis_fps or 'unlimited'} "
-                    f"activation_host={'uid1000' if expected_analysis_fps else 'none'} "
-                    f"workers_absent={','.join(disabled_workers) or 'none'}"
-                )
-                return
-            time.sleep(2)
-        camera_hint = (
-            " Check that the Portal's physical camera cover is open and its "
-            "camera/microphone privacy control is off."
-            if not camera_active
-            else ""
-        )
-        raise ProvisionError(
-            "presence pipeline did not pass its live compatibility check: "
-            f"pid={pid!r} camera_active={int(camera_active)} "
-            f"camera_allowed={int(camera_allowed)} "
-            f"camera_appop={camera_appop!r} "
-            f"analysis_frames={int(analysis_frames)} "
-            f"roi_frames={int(roi_frames)} "
-            f"pose_metrics={int(pose_metrics)} "
-            f"frame_processor_loaded={int(frame_processor_loaded)} "
-            f"wide_frame={int(wide_frame)} "
-            f"presence_event={int(presence_event)} "
-            f"analysis_fps_applied={int(analysis_fps_applied)} "
-            f"helper_activation={int(helper_activation)} "
-            f"uid1000_configured={int(uid1000_configured)} "
-            f"presence_no_users={int(presence_no_users)} "
-            f"privacy_blocked={int(privacy_blocked)} "
-            f"profile_keys={','.join(sorted(loaded_keys)) or 'none'}."
-            f"{camera_hint}"
-        )
+        return self.presence_feature.verify_presence_runtime(require_profile, expected_analysis_fps, wait_seconds)
 
     def verify_meta_accounts_removed(self) -> None:
         return self.settings_feature.verify_meta_accounts_removed()
@@ -5532,132 +4910,10 @@ class PortalProvisioner:
             self.verify_camera_light_restored()
 
     def verify_camera_light_disabled(self, wait_seconds: int = 35) -> None:
-        if self.adb_run(
-            ["shell", "test", "-f", CAMERA_LIGHT_INSTALLED_REMOTE], timeout=5
-        ).returncode != 0:
-            raise ProvisionError("camera-light install marker is absent")
-        private_runtime = bool(
-            self.target and self.target.uid1000_embedded_helper
-        )
-        if not private_runtime:
-            if self.adb_run(
-                [
-                    "shell", "test", "-f",
-                    self.uid1000_path("camera-led-enabled"),
-                ],
-                timeout=5,
-            ).returncode != 0:
-                raise ProvisionError(
-                    "camera-light UID-1000 configuration is absent"
-                )
-            if self.adb_run(
-                [
-                    "shell", "test", "-x",
-                    self.uid1000_path("portal-camera-led-watch"),
-                ],
-                timeout=5,
-            ).returncode != 0:
-                raise ProvisionError("camera-light watchdog executable is absent")
-        deadline = time.monotonic() + wait_seconds
-        since = self.logcat_watermark()
-        last_process = ""
-        last_logs = ""
-        while time.monotonic() < deadline:
-            processes = self.adb_run(
-                ["shell", "ps", "-A", "-o", "USER,PID,PPID,NAME,ARGS"],
-                timeout=10,
-                check=True,
-            ).stdout
-            last_process = next(
-                (
-                    line
-                    for line in processes.splitlines()
-                    if "portal-camera-led-watch" in line
-                    or "portal-led-watc" in line
-                ),
-                "",
-            )
-            last_logs = self.logcat_poll("PortalCameraLed", since)
-            if last_process and "watchdog connected uid=1000" in last_logs:
-                selinux = self.adb_run(
-                    ["shell", "getenforce"], timeout=5, check=True
-                ).stdout.strip()
-                if selinux != "Enforcing":
-                    raise ProvisionError(f"SELinux is not enforcing: {selinux!r}")
-                print(
-                    "CAMERA_LIGHT_OK watchdog_uid=1000 "
-                    f"host={self.target.uid1000_host_label if self.target else 'unknown'} "
-                    "trigger=persistent_app "
-                    "selinux=Enforcing"
-                )
-                return
-            time.sleep(2)
-        raise ProvisionError(
-            "camera-light UID-1000 watchdog did not start and connect; "
-            f"process={last_process!r} logs={last_logs[-2000:]!r}"
-        )
+        return self.presence_feature.verify_camera_light_disabled(wait_seconds)
 
     def verify_camera_light_restored(self) -> None:
-        if self.adb_run(
-            ["shell", "test", "-f", CAMERA_LIGHT_RESTORED_REMOTE], timeout=5
-        ).returncode != 0:
-            raise ProvisionError("camera-light restore marker is absent")
-        if (
-            not (self.target and self.target.uid1000_embedded_helper)
-            and self.adb_run(
-                ["shell", "test", "-e", self.uid1000_path("camera-led-enabled")],
-                timeout=5,
-            ).returncode == 0
-        ):
-            raise ProvisionError("camera-light UID-1000 configuration remains")
-        if self.target and self.target.uid1000_embedded_helper:
-            retained = any(
-                self.adb_run(
-                    ["shell", "test", "-f", path], timeout=5
-                ).returncode == 0
-                for path in (
-                    "/data/local/tmp/portal-presence-backup/fps-cap-v1",
-                    ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE,
-                )
-            )
-            helper_present = retained
-        else:
-            retained = any(
-                self.adb_run(["shell", "test", "-e", path], timeout=5).returncode
-                == 0
-                for path in (
-                    self.uid1000_path("presence-fps"),
-                    self.uid1000_path("wireless-adb-enabled"),
-                    self.uid1000_path("adb-framework-enabled"),
-                    self.uid1000_path(SYSTEM_THEME_CONTROL_MARKER),
-                )
-            )
-            helper_present = self.adb_run(
-                [
-                    "shell", "test", "-e",
-                    self.uid1000_path("portal-camera-led-watch"),
-                ],
-                timeout=5,
-            ).returncode == 0
-        if retained != helper_present:
-            raise ProvisionError(
-                "UID-1000 helper retention does not match remaining features: "
-                f"retained_features={int(retained)} helper={int(helper_present)}"
-            )
-        processes = self.adb_run(
-            ["shell", "ps", "-A", "-o", "USER,PID,PPID,NAME,ARGS"],
-            timeout=10,
-            check=True,
-        ).stdout
-        camera_logs = self.adb_run(
-            ["shell", "logcat", "-d", "-s", "PortalCameraLed:*"], timeout=10
-        ).stdout
-        if "watchdog connected uid=1000" in camera_logs:
-            raise ProvisionError("camera-light watchdog remains active")
-        print(
-            "CAMERA_LIGHT_RESTORE_OK camera_watchdog=disabled "
-            f"uid1000_helper={'retained' if retained else 'absent'}"
-        )
+        return self.presence_feature.verify_camera_light_restored()
 
     def verify_across_two_reboots(self, first_boot: str | None = None) -> None:
         if first_boot is None:
