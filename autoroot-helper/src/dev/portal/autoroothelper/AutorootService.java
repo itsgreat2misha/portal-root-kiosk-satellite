@@ -249,9 +249,13 @@ public final class AutorootService extends Service {
         // race verdict. An attempt with NO verdict after
         // AttemptWatchdog.CUTOFF_MS is cut by closing the tracked
         // client - the same teardown the stop path uses - instead
-        // of riding to the 600 s timeout. An attempt whose verdict
-        // HAS appeared is never cut: wins write their verdict
-        // early and conclude at the timeout edge by design.
+        // of riding to the 600 s timeout. A WIN verdict is never
+        // cut: wins write their verdict early and conclude at the
+        // timeout edge by design. Post-verdict extension
+        // (2026-11-15): a FAIL verdict followed by a runner hang
+        // is cut too, but only after the watchdog's grace period
+        // and only while the root daemon is known-absent (see
+        // AttemptWatchdog).
         long attemptLogOffset = attemptLogSize();
         runAttemptWithWatchdog(kaslr, memstart, attempts, attemptLogOffset);
         if (stopRequested) {
@@ -296,9 +300,10 @@ public final class AutorootService extends Service {
      * Runs one attempt via the tracked foreground shell call on a
      * launch thread, polling attempt.log for the verdict marker in
      * the meantime. Cuts the attempt at the watchdog cutoff when no
-     * verdict has appeared; otherwise lets the launch ride to its
-     * own completion or the 600 s shell timeout, exactly as the
-     * pre-watchdog code did.
+     * verdict has appeared, and cuts a fail-verdict attempt after
+     * the grace period while the root daemon is known-absent;
+     * otherwise lets the launch ride to its own completion or the
+     * 600 s shell timeout, exactly as the pre-watchdog code did.
      */
     private void runAttemptWithWatchdog(String kaslr, String memstart,
             int attempts, long attemptLogOffset) {
@@ -313,24 +318,56 @@ public final class AutorootService extends Service {
         }, "portal-autoroot-attempt");
         long startedMs = System.currentTimeMillis();
         launch.start();
-        boolean verdictSeen = false;
+        int verdict = AttemptWatchdog.VERDICT_NONE;
+        long failVerdictAtMs = 0;
+        boolean daemonPresent = false;
         while (launch.isAlive()) {
             if (stopRequested) {
                 break;
             }
-            if (!verdictSeen) {
-                verdictSeen = attemptVerdictSeen(attemptLogOffset);
+            if (verdict == AttemptWatchdog.VERDICT_NONE) {
+                verdict = attemptVerdict(attemptLogOffset);
+                if (verdict == AttemptWatchdog.VERDICT_FAIL) {
+                    failVerdictAtMs = System.currentTimeMillis();
+                }
             }
-            if (AttemptWatchdog.shouldCut(
-                    System.currentTimeMillis() - startedMs, verdictSeen)) {
+            long nowMs = System.currentTimeMillis();
+            boolean cut = false;
+            String cutLog = null;
+            if (verdict == AttemptWatchdog.VERDICT_FAIL && !daemonPresent) {
+                // Post-verdict hang: the race is lost, but the
+                // runner may still be bringing the daemon up in
+                // its final steps. Give it the grace window (the
+                // same 30 s the post-attempt path waits for the
+                // daemon), then cut only while the daemon is
+                // known-absent. If the daemon IS serving, this
+                // attempt is never cut - the post-attempt daemon
+                // check owns its handoff.
+                long sinceFailMs = nowMs - failVerdictAtMs;
+                if (sinceFailMs >= AttemptWatchdog.FAIL_GRACE_MS) {
+                    if (daemonServingRoot()) {
+                        daemonPresent = true;
+                        logFile("fail verdict attempt=" + attempts
+                                + " but daemon present; not cutting");
+                    } else if (AttemptWatchdog.shouldCutFailVerdict(
+                            sinceFailMs, true)) {
+                        cut = true;
+                        cutLog = "fail-fast cutoff attempt=" + attempts
+                                + " fail verdict, daemon absent";
+                    }
+                }
+            } else if (AttemptWatchdog.shouldCut(
+                    nowMs - startedMs, verdict != AttemptWatchdog.VERDICT_NONE)) {
+                cut = true;
+                cutLog = "fail-fast cutoff attempt=" + attempts
+                        + " no verdict after "
+                        + (AttemptWatchdog.CUTOFF_MS / 1000) + "s";
+            }
+            if (cut) {
                 AdbClient client = activeClient;
                 if (client != null) {
-                    Log.w(TAG, "fail-fast: no verdict after "
-                            + (AttemptWatchdog.CUTOFF_MS / 1000)
-                            + "s, cutting attempt " + attempts);
-                    logFile("fail-fast cutoff attempt=" + attempts
-                            + " no verdict after "
-                            + (AttemptWatchdog.CUTOFF_MS / 1000) + "s");
+                    Log.w(TAG, cutLog + ", cutting attempt " + attempts);
+                    logFile(cutLog);
                     try {
                         client.close();
                     } catch (Exception ignored) {
@@ -364,13 +401,13 @@ public final class AutorootService extends Service {
      * byte this attempt can write. A shrunken log (fresh staging)
      * yields an empty tail, never a stale verdict.
      */
-    private boolean attemptVerdictSeen(long attemptLogOffset) {
+    private int attemptVerdict(long attemptLogOffset) {
         try {
             String tail = shell("tail -c +" + (attemptLogOffset + 1)
                     + " " + ATTEMPT_LOG + " 2>/dev/null");
-            return AttemptWatchdog.verdictIn(tail);
+            return AttemptWatchdog.verdictValue(tail);
         } catch (Exception ignored) {
-            return false;
+            return AttemptWatchdog.VERDICT_NONE;
         }
     }
 
