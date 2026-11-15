@@ -3,15 +3,20 @@
 #
 # Part of the Meta Portal Root Provisioner fork; see LICENSE and NOTICE.
 
-"""Recovery fail-fast watchdog (2026-11-14).
+"""Recovery fail-fast watchdog (2026-11-14; post-verdict 2026-11-15).
 
 Timeout-class recovery attempts (no race verdict, hanging to the
 600 s runner timeout) were ~47% of recovery wall-clock in Runs
 21-27. The watchdog in AutorootService cuts an attempt at 300 s
-when no WATCH_CFI_OK verdict has appeared in attempt.log; an
-attempt whose verdict HAS appeared is never cut, however long
-its collection runs (wins conclude at the timeout edge by
-design).
+when no WATCH_CFI_OK verdict has appeared in attempt.log; a WIN
+verdict is never cut, however long its collection runs (wins
+conclude at the timeout edge by design).
+
+Post-verdict extension (Run 30 evidence): an attempt can write a
+FAIL verdict (~55 s in) and then hang to the full 600 s anyway.
+A fail-verdict attempt may be cut once the grace period since
+the verdict has elapsed AND the root daemon is known-absent; a
+fail verdict with the daemon present is never cut.
 
 The policy itself is pure Java (AttemptWatchdog). When a JDK is
 available these tests compile and execute the real decision
@@ -65,6 +70,32 @@ public final class WatchdogHarness {
         check(!AttemptWatchdog.verdictIn(""), "empty log mistaken for verdict");
         check(!AttemptWatchdog.verdictIn(null), "null log mistaken for verdict");
         check(AttemptWatchdog.CUTOFF_MS == 300_000L, "cutoff is not 300 s");
+        // Verdict values: win = 1, fail = 0, absent = -1; last wins.
+        check(AttemptWatchdog.verdictValue("WATCH_CFI_OK=1 STEP=0") == 1,
+                "win verdict value wrong");
+        check(AttemptWatchdog.verdictValue("WATCH_CFI_OK=0 STEP=151") == 0,
+                "fail verdict value wrong");
+        check(AttemptWatchdog.verdictValue("no verdict here") == -1,
+                "missing verdict value wrong");
+        check(AttemptWatchdog.verdictValue(null) == -1,
+                "null log verdict value wrong");
+        check(AttemptWatchdog.verdictValue("WATCH_CFI_OK=0 x WATCH_CFI_OK=1") == 1,
+                "last verdict should govern");
+        // Post-verdict policy: fail verdict + daemon absent cuts
+        // only at/after the grace period; daemon present never cuts.
+        check(!AttemptWatchdog.shouldCutFailVerdict(0L, true),
+                "fail cut at verdict instant");
+        check(!AttemptWatchdog.shouldCutFailVerdict(29_999L, true),
+                "fail cut inside grace");
+        check(AttemptWatchdog.shouldCutFailVerdict(30_000L, true),
+                "no fail cut at grace end, daemon absent");
+        check(AttemptWatchdog.shouldCutFailVerdict(549_000L, true),
+                "no fail cut late, daemon absent");
+        check(!AttemptWatchdog.shouldCutFailVerdict(30_000L, false),
+                "fail cut with daemon present");
+        check(!AttemptWatchdog.shouldCutFailVerdict(900_000L, false),
+                "fail cut late with daemon present");
+        check(AttemptWatchdog.FAIL_GRACE_MS == 30_000L, "grace is not 30 s");
         System.out.println("WATCHDOG_HARNESS_OK");
     }
 }
@@ -118,6 +149,20 @@ class WatchdogWiringTest(unittest.TestCase):
         self.assertIn("CUTOFF_MS = 300_000L", self.watchdog)
         self.assertIn('VERDICT_MARKER = "WATCH_CFI_OK="', self.watchdog)
         self.assertIn("!verdictSeen && elapsedMs >= CUTOFF_MS", self.watchdog)
+
+    def test_post_verdict_policy_shape(self) -> None:
+        # Grace period and the daemon-absence condition are part
+        # of the policy, and the service only consults the
+        # post-verdict cut on a FAIL verdict, reusing the existing
+        # daemon check (daemonServingRoot) for known-absence.
+        self.assertIn("FAIL_GRACE_MS = 30_000L", self.watchdog)
+        self.assertIn("daemonAbsent && sinceFailVerdictMs >= FAIL_GRACE_MS",
+                      self.watchdog)
+        self.assertIn("AttemptWatchdog.shouldCutFailVerdict", self.service)
+        self.assertIn("AttemptWatchdog.VERDICT_FAIL", self.service)
+        self.assertIn("daemonServingRoot()", self.service)
+        self.assertIn("fail verdict, daemon absent", self.service)
+        self.assertIn("but daemon present; not cutting", self.service)
 
     def test_service_polls_attempt_log_and_cuts_via_tracked_client(self) -> None:
         self.assertIn("runAttemptWithWatchdog", self.service)
