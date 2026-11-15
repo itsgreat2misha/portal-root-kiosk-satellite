@@ -373,3 +373,42 @@ fleet runs showed being repeated needlessly:
   immediately follows, and no call site does that (intervening host
   work always exceeds the window); the `sync` is kept. Call sites
   whose next step is a reboot must pass `before_reboot=True`.
+
+## 15. Re-run guard: the provisioner pauses autoroot itself (2026-11-15)
+
+Re-running the provisioner on an already-provisioned device used to
+fail destructively (Run 32): the device's live autoroot woke during
+the run and its recovery session race-rebooted the device under the
+host's own address discovery, starving the host's attempts and
+finally wedging the device dark. Every gate run had silently covered
+this by setting `/data/local/tmp/portal-autoroot.disable` by hand
+before starting — a step no user could be expected to know about.
+
+The provisioner now owns that lifecycle. `provision()` sets the
+disable flag itself, right after connecting and before any phase
+that can reboot or race (the `--recover` flow is covered too: it
+falls through into the same phases; the read-only `--status` path
+never engages the guard). The flag's prior state is recorded and
+restored on every exit path — success, provision failure, and error
+exits alike: absent before the run means absent after; a flag a user
+deliberately set (for example via the helper app's Stop control)
+stays set, its content untouched. When the provisioner creates the
+flag it writes a marker token as the file content, so if a run dies
+before restoring (host process hard-killed, or the device went dark
+mid-run), the next run recognises the leftover as its own rather
+than as a user's setting and still restores to absent at its end.
+Bootstrap phases run nested `provision()` calls against the same
+device; a process-wide depth counter makes only the outermost run
+own the flag. Log markers: `AUTOROOT_GUARD_ENGAGED prior=absent|
+present [leftover=1]`, `AUTOROOT_GUARD_RESTORED prior=...`, and
+`AUTOROOT_GUARD_RESTORE_FAILED ...` when the recorded state could
+not be put back (a warning on failure exits; on a successful run it
+fails the run, because leaving autoroot off silently would strand
+the device without root persistence). The guard refuses to start
+provisioning if the flag cannot be set at all. Nothing on-device
+changes: the autoroot service, the exploit payload, and the attempt
+loops are untouched.
+
+Consequence: re-running the documented command on a provisioned
+device — including retrying after a failed attempt — is supported
+and needs no manual preparation.

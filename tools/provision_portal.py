@@ -183,6 +183,15 @@ ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE = (
 UID1000_HOOK_ACTIVE_REMOTE = (
     "/data/local/tmp/portal-uid1000-hook-active-v1"
 )
+AUTOROOT_DISABLE_FLAG_REMOTE = "/data/local/tmp/portal-autoroot.disable"
+# Written into the disable flag when the provisioner itself sets it, so a
+# later run can tell its own leftover (a run that died before restoring)
+# from a flag a user set deliberately, whose content is left untouched.
+AUTOROOT_GUARD_TOKEN = "portal-provisioner-guard-v1"
+# Nesting depth of the autoroot guard across PortalProvisioner instances
+# in this process: bootstrap phases run nested provision() calls against
+# the same device, and only the outermost run owns the flag lifecycle.
+_autoroot_guard_depth = 0
 
 
 def print_banner() -> None:
@@ -282,6 +291,8 @@ class PortalProvisioner:
         self.system_theme_control_already_configured = False
         self.system_theme_control_runtime_verified = False
         self.system_theme_control_log_count_before = 0
+        self._autoroot_guard_prior: str | None = None
+        self._autoroot_guard_nested = False
         self.shizuku_apk = shizuku_apk
         self.custom_payload = custom_payload
         self.skip_shizuku_root = skip_shizuku_root
@@ -862,6 +873,126 @@ class PortalProvisioner:
         stock, patched = self.audio_feature.prepare_mha_tuning_payloads()
         self.mha_tuning_stock_local = stock
         self.mha_tuning_patched_local = patched
+
+    # ---- autoroot re-run guard -------------------------------------
+    #
+    # A device that already carries the staged autoroot wakes it on
+    # boots and helper events during a later provision run, and the
+    # on-device session then race-reboots the device under the host's
+    # own discovery (Run 32). Gate runs used to set the autoroot
+    # disable flag by hand before starting; the provisioner now owns
+    # that lifecycle itself so a plain re-run is safe: the flag is set
+    # before any phase that can reboot or race (the --recover flow
+    # included, since it falls through into the same phases), and the
+    # state it found is restored on every exit path.
+
+    def _autoroot_flag_present(self) -> bool:
+        result = self.adb_run(
+            ["shell", "test", "-f", AUTOROOT_DISABLE_FLAG_REMOTE],
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return True
+        if result.stdout.strip().startswith("error:"):
+            raise ProvisionError(
+                "adb transport error checking the autoroot disable "
+                f"flag: {result.stdout.strip()}"
+            )
+        return False
+
+    def _engage_autoroot_guard(self) -> None:
+        global _autoroot_guard_depth
+        if _autoroot_guard_depth:
+            # A bootstrap phase's nested provision() on the same
+            # device: the outermost run owns the flag lifecycle.
+            _autoroot_guard_depth += 1
+            self._autoroot_guard_nested = True
+            return
+        prior = "present"
+        leftover = False
+        if not self._autoroot_flag_present():
+            prior = "absent"
+        else:
+            content = self.adb_run(
+                ["shell", "cat", AUTOROOT_DISABLE_FLAG_REMOTE],
+                timeout=15,
+            ).stdout.strip()
+            if content == AUTOROOT_GUARD_TOKEN:
+                # A previous run died before restoring (host process
+                # killed, or the device went dark): the flag is the
+                # provisioner's own, not a user's deliberate setting.
+                prior = "absent"
+                leftover = True
+        if prior == "absent":
+            self.adb_run(
+                [
+                    "shell",
+                    f"echo {AUTOROOT_GUARD_TOKEN} > "
+                    f"{AUTOROOT_DISABLE_FLAG_REMOTE}",
+                ],
+                timeout=15,
+            )
+            if not self._autoroot_flag_present():
+                raise ProvisionError(
+                    "could not set the autoroot disable flag "
+                    f"({AUTOROOT_DISABLE_FLAG_REMOTE}); refusing to "
+                    "provision because a live autoroot session could "
+                    "race this run"
+                )
+        self._autoroot_guard_prior = prior
+        _autoroot_guard_depth = 1
+        print(
+            f"AUTOROOT_GUARD_ENGAGED prior={prior}"
+            + (" leftover=1" if leftover else ""),
+            flush=True,
+        )
+
+    def _release_autoroot_guard(self, succeeded: bool) -> None:
+        global _autoroot_guard_depth
+        if self._autoroot_guard_nested:
+            self._autoroot_guard_nested = False
+            _autoroot_guard_depth -= 1
+            return
+        prior = self._autoroot_guard_prior
+        if prior is None:
+            return
+        self._autoroot_guard_prior = None
+        _autoroot_guard_depth -= 1
+        problem: str | None = None
+        try:
+            if prior == "absent":
+                self.adb_run(
+                    ["shell", "rm", "-f", AUTOROOT_DISABLE_FLAG_REMOTE],
+                    timeout=15,
+                )
+                if self._autoroot_flag_present():
+                    problem = "the disable flag is still present"
+            else:
+                if not self._autoroot_flag_present():
+                    self.adb_run(
+                        ["shell", "touch", AUTOROOT_DISABLE_FLAG_REMOTE],
+                        timeout=15,
+                    )
+                if not self._autoroot_flag_present():
+                    problem = (
+                        "the pre-existing disable flag could not be "
+                        "restored"
+                    )
+        except (ProvisionError, OSError) as exc:
+            problem = f"device unreachable during restore ({exc})"
+        if problem is None:
+            print(f"AUTOROOT_GUARD_RESTORED prior={prior}", flush=True)
+            return
+        detail = (
+            f"AUTOROOT_GUARD_RESTORE_FAILED prior={prior} "
+            f"problem={problem}; the flag state the run found could "
+            f"not be restored. If autoroot should be active, remove "
+            f"{AUTOROOT_DISABLE_FLAG_REMOTE} on the device; if it "
+            f"should stay off, create it."
+        )
+        if succeeded:
+            raise ProvisionError(detail)
+        print(detail, flush=True)
 
     @contextlib.contextmanager
     def bootstrap_guard(self, label: str):
@@ -4161,13 +4292,24 @@ class PortalProvisioner:
 
     def provision(self) -> None:
         self.connect(wait_seconds=30)
-        resumed_pending = False
         if self.status_only:
+            # Read-only path: nothing reboots or races, so the
+            # autoroot guard does not engage.
             self.verify_target(require_supported=False)
             self.print_status()
             if self.backup_path:
                 self.create_backup_bundle(self.backup_path)
             return
+        self._engage_autoroot_guard()
+        try:
+            self._provision_stages()
+        except BaseException:
+            self._release_autoroot_guard(succeeded=False)
+            raise
+        self._release_autoroot_guard(succeeded=True)
+
+    def _provision_stages(self) -> None:
+        resumed_pending = False
         if self.recover:
             self.verify_target(require_supported=False)
             if not self.recover_actions():

@@ -96,6 +96,47 @@ def make_provisioner(temporary: str, **kwargs) -> PortalProvisioner:
     return PortalProvisioner(SERIAL, 1, pathlib.Path(temporary), **kwargs)
 
 
+def flag_aware_adb_run(state: dict | None = None, fallback_returncode: int = 1):
+    """adb_run fake modelling the autoroot disable flag on a device
+    whose /data/local/tmp is writable. provision() sets and restores
+    that flag on every run (the re-run guard), so fakes that drive
+    provision() must answer its commands; every other command gets
+    fallback_returncode, matching the flat fakes used before."""
+    if state is None:
+        state = {"present": False, "content": ""}
+
+    def adb_run(arguments, timeout=None, check=False):
+        del timeout, check
+        arguments = [str(argument) for argument in arguments]
+        joined = " ".join(arguments)
+        if "portal-autoroot.disable" not in joined:
+            return subprocess.CompletedProcess(
+                arguments, fallback_returncode, ""
+            )
+        if "test" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0 if state["present"] else 1, ""
+            )
+        if "cat" in arguments:
+            if not state["present"]:
+                return subprocess.CompletedProcess(arguments, 1, "")
+            return subprocess.CompletedProcess(
+                arguments, 0, state["content"]
+            )
+        if "rm" in arguments:
+            state["present"] = False
+            state["content"] = ""
+            return subprocess.CompletedProcess(arguments, 0, "")
+        # echo <token> > flag / touch flag: create it.
+        state["present"] = True
+        parts = joined.split()
+        if "echo" in parts:
+            state["content"] = parts[parts.index("echo") + 1]
+        return subprocess.CompletedProcess(arguments, 0, "")
+
+    return adb_run
+
+
 class FakeRemoteFiles:
     """In-memory stand-in for the device's /data/local/tmp files.
 
@@ -1459,6 +1500,9 @@ class ProvisionOkMarkerTest(unittest.TestCase):
                 ),
                 mock.patch.object(provisioner, "write_state") as write_state,
                 mock.patch.object(provisioner, "reboot") as reboot,
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=flag_aware_adb_run()
+                ),
             ):
                 _, lines = stdout_lines(provisioner.provision)
             reboot.assert_not_called()
@@ -1466,8 +1510,10 @@ class ProvisionOkMarkerTest(unittest.TestCase):
             self.assertEqual(
                 lines,
                 [
+                    "AUTOROOT_GUARD_ENGAGED prior=absent",
                     "PROVISION_OK reboots=0 system_theme=dark "
-                    f"logs={provisioner.log_dir}"
+                    f"logs={provisioner.log_dir}",
+                    "AUTOROOT_GUARD_RESTORED prior=absent",
                 ],
             )
 
@@ -2003,7 +2049,7 @@ class FailureBeforeRebootTest(unittest.TestCase):
             mock.patch.object(
                 provisioner,
                 "adb_run",
-                return_value=subprocess.CompletedProcess([], 1, ""),
+                side_effect=flag_aware_adb_run(),
             ),
             mock.patch.object(provisioner, "reboot", reboot),
             mock.patch.object(provisioner, "write_state", write_state),
@@ -2052,6 +2098,9 @@ class FailureBeforeRebootTest(unittest.TestCase):
                 ),
                 mock.patch.object(provisioner, "reboot", reboot),
                 mock.patch.object(provisioner, "write_state", write_state),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=flag_aware_adb_run()
+                ),
                 mock.patch(
                     "provision_portal.urllib.request.urlretrieve",
                     side_effect=OSError("host is offline"),
@@ -2096,6 +2145,9 @@ class FailureBeforeRebootTest(unittest.TestCase):
                 ),
                 mock.patch.object(provisioner, "reboot", reboot),
                 mock.patch.object(provisioner, "write_state", write_state),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=flag_aware_adb_run()
+                ),
                 mock.patch(
                     "provision_portal.urllib.request.urlretrieve",
                     side_effect=fake_download,
@@ -2148,6 +2200,9 @@ class FailureBeforeRebootTest(unittest.TestCase):
                     ),
                 ),
                 mock.patch.object(provisioner, "reboot", reboot),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=flag_aware_adb_run()
+                ),
                 mock.patch.object(
                     provisioner, "resolve_shizuku_apk"
                 ) as resolve,
