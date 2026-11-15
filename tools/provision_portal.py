@@ -2253,12 +2253,22 @@ class PortalProvisioner:
         self, action: str = "verified", wait_seconds: int = 0
     ) -> None:
         deadline = time.monotonic() + wait_seconds
+        actual = ""
         while True:
-            actual = self.adb_run(
-                ["shell", "settings", "get", "global", ADB_ENABLED_SETTING],
-                timeout=5,
-                check=True,
-            ).stdout.strip()
+            try:
+                actual = self.adb_run(
+                    ["shell", "settings", "get", "global", ADB_ENABLED_SETTING],
+                    timeout=5,
+                    check=True,
+                ).stdout.strip()
+            except ProvisionError:
+                if not wait_seconds:
+                    raise
+                # Writing adb_enabled restarts adbd on some builds; while
+                # it is down the read fails at the transport level instead
+                # of returning a value. That is the expected restart
+                # window, not a verdict: keep polling until the deadline.
+                actual = ""
             if actual == "1" or time.monotonic() >= deadline:
                 break
             time.sleep(3)
@@ -2292,8 +2302,15 @@ class PortalProvisioner:
                 timeout=10,
                 check=True,
             )
+            print(
+                "ADB_FRAMEWORK_RESTART_EXPECTED "
+                f"reason={ADB_ENABLED_SETTING}-write "
+                "detail=adbd-may-restart settle=45s",
+                flush=True,
+            )
         self.verify_adb_framework_enabled(
-            action="already-enabled" if before == "1" else "enabled"
+            action="already-enabled" if before == "1" else "enabled",
+            wait_seconds=0 if before == "1" else 45,
         )
 
     def backup_adb_auth_timeout(self) -> None:
