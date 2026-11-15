@@ -41,6 +41,19 @@ from meta_debloat_components import (  # noqa: E402
 from portal_targets import TARGETS  # noqa: E402
 
 
+class _FakeClock:
+    """monotonic()/sleep() stand-in: sleep advances the clock instantly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class AudioWatchdogVerificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.omni = next(target for target in TARGETS if target.device == "omni")
@@ -680,11 +693,84 @@ class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
             provisioner = PortalProvisioner(
                 "192.0.2.1:5555", 1, pathlib.Path(temporary)
             )
-            with mock.patch.object(provisioner, "adb_run", side_effect=adb_run):
+            with (
+                mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+                mock.patch.object(
+                    provision_portal_module, "time", _FakeClock()
+                ),
+            ):
                 with self.assertRaisesRegex(
                     ProvisionError, "authorization prompts cannot appear"
                 ):
                     provisioner.ensure_adb_framework_enabled()
+
+    def test_framework_enable_survives_adbd_restart_window(self) -> None:
+        # Run 34 (Portal Mini, Android 10): writing adb_enabled restarts
+        # adbd; reads through the restart window first fail at the
+        # transport level, then return '', then the written value.
+        get_results: list[object] = [
+            "\n",
+            ProvisionError("error: device offline"),
+            "\n",
+            "1\n",
+        ]
+
+        def adb_run(
+            arguments: list[str],
+            timeout: float | None = None,
+            check: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout, check
+            if arguments[1:4] == ["settings", "get", "global"]:
+                result = get_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return subprocess.CompletedProcess(arguments, 0, result)
+            return subprocess.CompletedProcess(arguments, 0, "")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555", 1, pathlib.Path(temporary)
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+                mock.patch.object(
+                    provision_portal_module, "time", _FakeClock()
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                provisioner.ensure_adb_framework_enabled()
+
+        lines = output.getvalue().splitlines()
+        self.assertIn(
+            "ADB_FRAMEWORK_RESTART_EXPECTED "
+            f"reason={ADB_ENABLED_SETTING}-write "
+            "detail=adbd-may-restart settle=45s",
+            lines,
+        )
+        self.assertIn(
+            f"ADB_FRAMEWORK_OK action=enabled {ADB_ENABLED_SETTING}=1 "
+            "prompts=enabled",
+            lines,
+        )
+
+    def test_framework_verify_zero_wait_keeps_transport_errors(self) -> None:
+        def adb_run(
+            arguments: list[str],
+            timeout: float | None = None,
+            check: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            del arguments, timeout, check
+            raise ProvisionError("error: device offline")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555", 1, pathlib.Path(temporary)
+            )
+            with mock.patch.object(provisioner, "adb_run", side_effect=adb_run):
+                with self.assertRaisesRegex(ProvisionError, "device offline"):
+                    provisioner.verify_adb_framework_enabled()
 
 
 def flag_aware_adb_run(state: dict | None = None):
