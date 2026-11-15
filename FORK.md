@@ -412,3 +412,56 @@ loops are untouched.
 Consequence: re-running the documented command on a provisioned
 device — including retrying after a failed attempt — is supported
 and needs no manual preparation.
+
+## 16. Re-run fast paths: no-op exit and root-channel apply (2026-11-15)
+
+On top of the guard, a re-run now short-circuits before racing when
+it provably has nothing (or only a little) to do. The decision runs
+in the outermost `provision()` call, after target verification and
+the framework-boot preflight, and reads the on-device state manifest
+(`/data/local/tmp/portal-provision-state-v1.json`).
+
+**No-op exit** (`PROVISION_NOOP`) when ALL hold: the manifest status
+is `complete`; the recorded tool revision equals the running build's;
+the recorded target and build fingerprint match; every requested
+action equals the recorded applied value (the requested set may be a
+SUBSET of the applied set — the provisioner has no un-apply
+semantics, so asking for less is still "nothing to do"); every
+artifact hash the manifest records matches the current artifact; and
+cheap live spot-checks pass (root-mode Shizuku answering on this
+boot, exploit sentinel and autoroot helper packages present). The
+run exits successfully without touching the device further. A
+pending, missing, or corrupt manifest never no-ops.
+
+**Root-channel apply** (`PROVISION_CHANNEL_ENGAGED` /
+`PROVISION_CHANNEL_OK`): when the no-op check fails but the recorded
+state is `complete` and the existing root setup verifies live (the
+same spot-checks — root Shizuku on this boot is itself the proof
+that the helper's loopback-ADB key is authorized, since only the
+autoroot handoff or a provision run produces it), the drifted delta
+is applied through the provisioner's existing shell-level applies,
+package installs, and autoroot staging — the same code the race run
+uses after its races — and the manifest is rewritten `complete`. No
+races run and the device does not reboot. No new on-device
+root-execution machinery is introduced: the channel is the host's
+ordinary shell channel plus the already-established root state, and
+every apply is verify-before/after via the existing requested-state
+verification. Eligibility excludes anything race-owned: an action
+whose apply mechanism is a credential bootstrap (audio, OTA,
+meta-accounts, presence, system theme, shell-root debloat/wipe), the
+wireless-ADB or framework-boot bootstraps, a missing staged
+simpleperf, and the restore/remove actions whose apply points live
+inside the race flow. If a channel step fails mid-apply, the run
+logs `PROVISION_CHANNEL_FALLBACK` with the reason and continues into
+the normal guarded race run — every channel apply is idempotent, so
+nothing is ever half-applied silently.
+
+**`--force`** bypasses both fast paths: a full race-based run that
+re-installs the provisioner's own packages even when byte-identical
+(the `APK_INSTALL_SKIP` comparison is skipped), re-executes the
+selected actions, and fully restages autoroot. The re-run guard is
+NOT bypassed — autoroot is still paused before racing and the prior
+flag state is restored at exit. Credential bootstraps under
+`--force` still only fire when their preflight reports the target
+unconfigured: they are install mechanisms, not action applies. On a
+never-provisioned device `--force` behaves as a normal run.

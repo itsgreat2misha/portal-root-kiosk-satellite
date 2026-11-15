@@ -1348,7 +1348,12 @@ repeatable. Re-running on an already provisioned Portal is supported as-is:
 the provisioner automatically pauses the on-device autoroot for the duration
 of the run (a live autoroot session would otherwise race the run's own
 reboots) and restores it when the run ends, so no manual preparation is
-needed — just rerun the same command.
+needed — just rerun the same command. If nothing has changed since the
+recorded provisioning completed, the rerun exits immediately as a no-op;
+if only settings or artifacts drifted, it applies just the difference
+through the device's existing root setup without re-running the exploit
+races. Use `--force` to bypass both shortcuts and redo the full
+race-based provisioning, re-installing everything.
 
 Use `--skip-build` only when the required outputs have already been built and
 have not changed. Every root-backed action requires both the selected exploit
