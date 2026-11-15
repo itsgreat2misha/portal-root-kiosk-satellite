@@ -490,10 +490,12 @@ class PortalProvisioner:
             post_boot_settle_seconds=lambda: (
                 self.target.post_boot_adb_settle_seconds if self.target else 0
             ),
+            wait_notice=lambda: self._adb_wait_notice(),
         )
         self.adb = self.session.adb
         self.target: PortalTarget | None = None
         self.persist_wireless_adb = False
+        self._wireless_adb_verified = False
         self.adb_framework_boot_configured = False
         self._bugreport_cache: dict[str, str] = {}
         self.exploit_user_ids_runtime: tuple[int, ...] = ()
@@ -746,6 +748,21 @@ class PortalProvisioner:
 
     def connect_after_reboot(self, before: str, wait_seconds: int = 600) -> str:
         return self.session.connect_after_reboot(before, wait_seconds)
+
+    def _adb_wait_notice(self) -> str | None:
+        # While a reboot wait runs on a Portal whose wireless ADB is not
+        # persistent yet, the device only comes back when the user
+        # re-enables ADB by hand; DeviceSession prints this during long
+        # unanswered waits. Once persistence is installed (or verified)
+        # the device returns on its own and no prompt may appear.
+        if not self.persist_wireless_adb or self._wireless_adb_verified:
+            return None
+        return (
+            "WAITING_FOR_ADB the Portal has not reconnected since the "
+            "reboot. If WIRELESS_ADB_OK has not appeared yet, enable ADB "
+            "in the Portal's Debug menu and run `adb -d tcpip 5555` from "
+            "another terminal; the provisioner keeps waiting."
+        )
 
     def verify_target(self, require_supported: bool = True) -> PortalTarget | None:
         fingerprint = self.adb_run(
@@ -4365,6 +4382,7 @@ class PortalProvisioner:
                     "wireless ADB did not persist on TCP port 5555: "
                     f"{property_name}={persistent_port!r}"
                 )
+            self._wireless_adb_verified = True
             print(
                 "WIRELESS_ADB_OK persistent_port=5555 "
                 f"property={property_name}"
