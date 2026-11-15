@@ -1030,7 +1030,11 @@ class PortalProvisioner:
             return "artifacts-unrecorded"
         current_hashes = self.selected_artifact_hashes()
         for name, digest in recorded_hashes.items():
-            if current_hashes.get(name) != digest:
+            # Only artifacts this run also selects can be compared: a
+            # subset run does not select (and must not be blocked by)
+            # artifacts belonging to actions it did not request.
+            current = current_hashes.get(name)
+            if current is not None and current != digest:
                 return f"artifact-{name}"
         return None
 
