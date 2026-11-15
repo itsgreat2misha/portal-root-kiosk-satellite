@@ -2631,6 +2631,20 @@ class PortalProvisioner:
     def verify_shizuku(self, wait_seconds: int = 120) -> None:
         return self.shizuku_feature.verify_shizuku(wait_seconds)
 
+    def verify_shizuku_channel(self) -> None:
+        """Channel-path Shizuku verification: the end-state check
+        (package installed, server live as uid 0, package-verifier
+        state restored) plus the channel eligibility gate's own
+        identity conditions re-asserted — root setup intact means
+        the sentinel and autoroot helper packages are present."""
+        self.shizuku_feature.verify_shizuku_channel()
+        blocker = self._root_setup_blocker()
+        if blocker is not None:
+            raise ProvisionError(
+                "root setup did not survive the channel apply: "
+                f"{blocker}"
+            )
+
     def verify_shizuku_removed(self) -> None:
         return self.shizuku_feature.verify_shizuku_removed()
 
@@ -4304,6 +4318,16 @@ class PortalProvisioner:
     ) -> None:
         return self.presence_feature.verify_presence_runtime(require_profile, expected_analysis_fps, wait_seconds)
 
+    def verify_presence_runtime_channel(
+        self,
+        expected_analysis_fps: int | None = None,
+        require_marker: bool = True,
+        wait_seconds: int = 90,
+    ) -> None:
+        return self.presence_feature.verify_presence_runtime_channel(
+            expected_analysis_fps, require_marker, wait_seconds
+        )
+
     def verify_meta_accounts_removed(self) -> None:
         return self.settings_feature.verify_meta_accounts_removed()
 
@@ -4410,7 +4434,14 @@ class PortalProvisioner:
         # checks. Android keeps freshly installed packages stopped until their
         # first explicit launch, so its BOOT_COMPLETED receiver cannot run yet.
         if self.shizuku:
-            self.verify_shizuku()
+            if via_channel:
+                # The channel verifies on the finished autoroot
+                # state, where the install-phase startup check
+                # (standalone helper present, server as shell) is
+                # unsatisfiable by design; use the end-state check.
+                self.verify_shizuku_channel()
+            else:
+                self.verify_shizuku()
         if self.remove_shizuku:
             self.verify_shizuku_removed()
         if (
@@ -4418,10 +4449,24 @@ class PortalProvisioner:
             or self.presence_fps_cap is not None
             or self.restore_presence_fps
         ):
-            self.verify_presence_runtime(
-                require_profile=True,
-                expected_analysis_fps=self.presence_fps_cap,
-            )
+            if via_channel:
+                # The race verify proves the profile from logcat
+                # lines emitted at config-load/activation time,
+                # which rotate away on the current boot; the
+                # channel verifies durable markers + the live
+                # pipeline subset instead.
+                self.verify_presence_runtime_channel(
+                    expected_analysis_fps=self.presence_fps_cap,
+                    require_marker=bool(
+                        self.optimize_presence
+                        or self.presence_fps_cap is not None
+                    ),
+                )
+            else:
+                self.verify_presence_runtime(
+                    require_profile=True,
+                    expected_analysis_fps=self.presence_fps_cap,
+                )
         if self.restore_presence_profile:
             self.verify_presence_runtime(require_profile=False)
         if self.restore_presence_fps or self.restore_presence_profile:

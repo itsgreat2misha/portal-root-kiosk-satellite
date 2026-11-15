@@ -484,3 +484,39 @@ verification uses the same signal for audio
 device's current boot, so the logcat probe would fail there for
 the same reason. The race path's own fresh-boot verification is
 unchanged.
+
+**Channel verification audit** (2026-11-15): every check the
+channel path runs — the eligibility gate and the final
+verification, per requested action — was audited for
+phase-context assumptions, after three consecutive gate failures
+from one defect class (channel code reusing a check written for
+an earlier phase's context, aimed at a state the flow itself had
+moved past). Two checks were replaced; all others were already
+end-state (persistent settings, package/component/account state,
+durable markers, live processes) or unreachable from the channel
+path (the restore/remove actions the eligibility gate blocks).
+The replacements, both in `verify_requested_state(via_channel=True)`
+only — the race path's verification is byte-for-byte unchanged:
+
+- **Shizuku**: `verify_shizuku()` is an install-phase startup
+  check (standalone helper package present, `shizuku_server`
+  running as the shell user). The finished autoroot state differs
+  by design — the helper is removed once its keypair is merged
+  into the autoroot helper, and the server runs as uid 0 — so the
+  channel uses `verify_shizuku_channel()`: package-verifier state
+  restored, Shizuku package installed, server live as uid 0, and
+  the eligibility gate's identity conditions (sentinel + autoroot
+  helper present) re-asserted. Same guarantee: Shizuku installed
+  and serving in the mode the finished provision requires.
+- **Presence**: `verify_presence_runtime(require_profile=True)`
+  proves the profile from logcat lines emitted at config-load /
+  activation time (profile keys, full-scene marker, FPS-applied
+  and activation lines), which rotate away like the audio lines.
+  The channel uses `verify_presence_runtime_channel()`: the
+  durable installed marker (written only after a full profile
+  verification has passed) when a profile is claimed, the durable
+  fps-cap marker when a cap is requested, and the same live
+  pipeline subset the race verify polls for (aiservice pid,
+  active camera client, CAMERA appop, analysis/ROI frame markers,
+  pose metrics, frame processor). Same guarantee: the profile is
+  the applied one and the pipeline is live with it now.
