@@ -57,10 +57,12 @@ class DeviceSession:
         self,
         serial: str,
         post_boot_settle_seconds: Callable[[], int] | None = None,
+        wait_notice: Callable[[], str | None] | None = None,
     ):
         self.serial = serial
         self.adb = ["adb", "-s", serial]
         self._post_boot_settle_seconds = post_boot_settle_seconds or (lambda: 0)
+        self._wait_notice = wait_notice or (lambda: None)
 
     def run(
         self, args: list[str], timeout: float | None = None, check: bool = False
@@ -113,7 +115,19 @@ class DeviceSession:
             pass
         deadline = time.monotonic() + wait_seconds
         last_boot_id = ""
+        answered = False
+        next_notice = time.monotonic() + 15
         while time.monotonic() < deadline:
+            if not answered and time.monotonic() >= next_notice:
+                # The device has not answered at all since the reboot:
+                # on a not-yet-persistent Portal it will not come back
+                # until the user re-enables ADB by hand, so say so while
+                # there is still time to act (the notice callback stays
+                # silent for devices whose ADB persists on its own).
+                notice = self._wait_notice()
+                if notice:
+                    print(notice, flush=True)
+                next_notice = time.monotonic() + 60
             try:
                 # One adb invocation per poll tick: a single shell call
                 # returns both the boot-completed flag and the boot ID.
@@ -131,6 +145,7 @@ class DeviceSession:
                     self.run(["adb", "connect", self.serial], timeout=5)
                     time.sleep(3)
                     continue
+                answered = True
                 fields = probe.stdout.split()
                 completed = fields[0] if fields else ""
                 observed_boot_id = fields[1] if len(fields) > 1 else ""
