@@ -1344,7 +1344,11 @@ and another attempt. Before `WIRELESS_ADB_OK` has appeared, re-enable ADB in
 the Portal's Debug menu and run `adb -d tcpip 5555` after every reboot. If the
 Portal remains unresponsive, power-cycle it, restore USB and wireless ADB, and
 rerun the same command; completed provisioning actions are designed to be
-repeatable.
+repeatable. Re-running on an already provisioned Portal is supported as-is:
+the provisioner automatically pauses the on-device autoroot for the duration
+of the run (a live autoroot session would otherwise race the run's own
+reboots) and restores it when the run ends, so no manual preparation is
+needed — just rerun the same command.
 
 Use `--skip-build` only when the required outputs have already been built and
 have not changed. Every root-backed action requires both the selected exploit
