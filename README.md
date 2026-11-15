@@ -201,14 +201,15 @@ A full setup combining the core system features looks like:
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" \
   --audio --disable-updates --block-remote-wipe --debloat \
   --remove-meta-accounts --optimize-presence --allow-app-updates \
-  --disable-adb-auth-timeout
+  --disable-adb-auth-timeout --dhcp-dns
 ```
 
 Each flag is explained in the reference below; combine only the ones you
 want. Common add-ons:
 
 - `--presence-fps-cap 2` to reduce Meta's presence-analysis rate
-- `--dhcp-dns` or `--privacy-dns HOSTNAME` to change DNS behavior
+- `--privacy-dns HOSTNAME` to use a specific Private DNS resolver instead
+  of the full setup's DHCP-supplied DNS
 - `--system-theme-control light|dark` to enable and set live theme control
 - `--shizuku` to install Shizuku with automatic startup
 - `--custom-payload` to leave a per-boot root daemon running and restart
@@ -474,6 +475,22 @@ resolver that accepts DNS over TLS, so a public fallback resolver can bypass a
 local DNS block list. Fixed-IP rules are brittle because Meta rotates these
 names across its address space. The component list is maintained in
 `tools/meta_debloat_components.py`.
+
+**Residual vendor traffic.** Debloat covers Android packages and
+components. A few Meta daemons are native init services rather than
+packages — the fwanalytics telemetry pair and their upload pipeline
+(`fbacp`, `fwdiag`, the crash uploader), the `ping_daemon` connectivity
+checker, and the OTA daemon — so they sit outside the debloat model:
+they start unconditionally at boot and are still running after
+provisioning. The provisioner cannot disable or firewall them
+on-device: they have no package or init off-switch, and the
+provisioner's root shell is not permitted to change the kernel
+firewall tables. What provisioning does block is `--disable-updates`,
+which gates the OTA daemon's update checks, and the full setup's
+`--dhcp-dns`, which turns Android Private DNS off so DNS stays on the
+LAN resolver. Blocking the daemons' own traffic requires a
+network-side rule, such as dropping egress to Meta's `57.144.0.0/14`
+range for the Portal at the router.
 
 <details>
 <summary>Meta Portal Go, original Portal 10-inch, Portal Mini, Portal 10-inch (2nd generation) and Portal+ (2nd generation): up to 196 disabled components</summary>
