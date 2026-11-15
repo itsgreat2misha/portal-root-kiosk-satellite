@@ -28,6 +28,10 @@ from portal_targets import PortalTarget
 
 MHA_AUDIO_VERIFIED_LOG = "mha audio processing verified aec=0 ns=0"
 VOICE_AUDIO_VERIFIED_LOG = "audio processing verified aec=0 ns=0"
+AUDIO_INSTALLED_MARKER = "/data/local/tmp/portal-audio-backup/installed-v1"
+AUDIO_PERSIST_NATIVE_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
+AUDIO_PERSIST_JAVA_REMOTE = "/data/local/tmp/portal-audio-ctl.jar"
+AISERVICE_PACKAGE = "com.facebook.portal.aiservice"
 MHA_TUNING_DEVICE = "/vendor/etc/audio/omni/mha_tuning_blobs.tub"
 MHA_TUNING_STOCK_REMOTE = "/data/local/tmp/portal-mha-tuning-stock.tub"
 MHA_TUNING_PATCHED_REMOTE = "/data/local/tmp/portal-mha-tuning-disabled.tub"
@@ -145,6 +149,51 @@ class AudioFeature:
             return False
         print("AUDIO_PREFLIGHT installed=1 healthy=1 action=skip")
         return True
+
+    def audio_channel_preflight(self) -> bool:
+        """Boot-age-independent audio health for channel eligibility.
+
+        audio_preflight()'s health half is verify_watchdog(), a
+        logcat probe for this boot's PortalAudioPersist lines; those
+        lines rotate out of logcat as uptime grows, so on any
+        long-uptime device the probe reports a healthy install as
+        needing repair and the channel path refuses itself (Run 33
+        step 1). Eligibility therefore uses durable + live evidence
+        instead: the installed marker (written by verify_watchdog
+        only after a fully verified boot), the staged persist
+        artifact the watchdog loads from, and the aiservice process
+        — the watchdog's host — alive right now. No logcat history
+        is consulted, so the answer does not depend on boot age.
+        Any missing or disagreeing signal declines: the race
+        fallback is the safe direction."""
+        installed = self._adb_run(
+            ["shell", "test", "-f", AUDIO_INSTALLED_MARKER], timeout=5
+        ).returncode == 0
+        if not installed:
+            print(
+                "AUDIO_CHANNEL_PREFLIGHT installed=0 staged=0 "
+                "aiservice=0 action=decline"
+            )
+            return False
+        target = self._target()
+        artifact = (
+            AUDIO_PERSIST_JAVA_REMOTE
+            if target is not None and target.audio_java_fallback
+            else AUDIO_PERSIST_NATIVE_REMOTE
+        )
+        staged = self._adb_run(
+            ["shell", "test", "-f", artifact], timeout=5
+        ).returncode == 0
+        pid = self._adb_run(
+            ["shell", "pidof", AISERVICE_PACKAGE], timeout=5
+        ).stdout.strip()
+        live = bool(staged and pid)
+        print(
+            "AUDIO_CHANNEL_PREFLIGHT installed=1 "
+            f"staged={int(staged)} aiservice={int(bool(pid))} "
+            f"action={'skip' if live else 'decline'}"
+        )
+        return live
 
     def verify_watchdog(self, wait_seconds: int = 25) -> str:
         deadline = time.monotonic() + wait_seconds

@@ -466,3 +466,17 @@ flag state is restored at exit. Credential bootstraps under
 `--force` still only fire when their preflight reports the target
 unconfigured: they are install mechanisms, not action applies. On a
 never-provisioned device `--force` behaves as a normal run.
+
+**Audio eligibility signal** (`AUDIO_CHANNEL_PREFLIGHT`): the
+channel gate's audio check does not reuse `audio_preflight()` —
+that check's health half is a logcat probe for the current boot's
+`PortalAudioPersist` lines, which rotate out of logcat as uptime
+grows, so on a long-uptime device it reported a healthy install as
+needing repair and the channel path refused itself (Run 33 step 1).
+Eligibility instead reads durable + live evidence: the installed
+marker (written only after a fully verified boot), the staged
+persist artifact the watchdog loads from, and the aiservice process
+— the watchdog's host — alive at check time. No logcat history is
+consulted, so the answer is independent of boot age; any missing
+signal declines to the race fallback. The race path's own
+fresh-boot verification is unchanged.

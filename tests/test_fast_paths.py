@@ -84,6 +84,9 @@ class FakeDevice:
         self.helper = True
         self.simpleperf = True
         self.port = "5555"
+        self.audio_marker = True
+        self.audio_artifact = True
+        self.aiservice = True
 
     def adb_run(self, arguments, timeout=None, check=False):
         del timeout, check
@@ -108,6 +111,23 @@ class FakeDevice:
             )
         if "test -f /data/local/tmp/portal-simpleperf" in command:
             return completed(arguments, "", 0 if self.simpleperf else 1)
+        if (
+            "test -f /data/local/tmp/portal-audio-backup/installed-v1"
+            in command
+        ):
+            return completed(arguments, "", 0 if self.audio_marker else 1)
+        if "test -f /data/local/tmp/libportal_audio_persist.so" in command:
+            return completed(
+                arguments, "", 0 if self.audio_artifact else 1
+            )
+        if "test -f /data/local/tmp/portal-audio-ctl.jar" in command:
+            return completed(
+                arguments, "", 0 if self.audio_artifact else 1
+            )
+        if "pidof com.facebook.portal.aiservice" in command:
+            if self.aiservice:
+                return completed(arguments, "2703\n")
+            return completed(arguments, "", 1)
         if "getprop persist.adb.tcp.port" in command:
             return completed(arguments, self.port + "\n")
         return completed(arguments, "", 1)
@@ -139,6 +159,7 @@ def eligible_provisioner(temporary: str, **overrides):
     provisioner.adb_framework_boot_configured = True
     for name in (
         "audio_preflight",
+        "audio_channel_preflight",
         "ota_preflight",
         "meta_accounts_preflight",
         "debloat_preflight",
@@ -260,11 +281,11 @@ class ChannelBlockerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             provisioner, device = eligible_provisioner(temporary)
             state = good_state(provisioner)
-            provisioner.audio_preflight = lambda: False
+            provisioner.audio_channel_preflight = lambda: False
             self.assertEqual(
                 provisioner._channel_blocker(state), "audio-not-configured"
             )
-            provisioner.audio_preflight = lambda: True
+            provisioner.audio_channel_preflight = lambda: True
             provisioner.ota_preflight = lambda: False
             self.assertEqual(
                 provisioner._channel_blocker(state), "ota-not-configured"
@@ -299,6 +320,88 @@ class ChannelBlockerTest(unittest.TestCase):
                         ),
                         expected,
                     )
+
+
+class AudioChannelPreflightTest(unittest.TestCase):
+    """The channel eligibility audio check must be boot-age
+    independent: durable marker + staged persist artifact + the
+    aiservice process alive now, with no logcat consultation (the
+    logcat probe in audio_preflight rotates away on long uptimes —
+    Run 33 step 1). Each signal missing must decline, sending the
+    run to the race fallback."""
+
+    def _provisioner(self, temporary: str, device: FakeDevice):
+        provisioner = make_provisioner(temporary, **DOCUMENTED)
+        provisioner.adb_run = device.adb_run
+        provisioner.adb_framework_boot_configured = True
+        for name in (
+            "ota_preflight",
+            "meta_accounts_preflight",
+            "debloat_preflight",
+            "remote_wipe_preflight",
+        ):
+            setattr(provisioner, name, lambda: True)
+        return provisioner
+
+    def test_healthy_install_eligible_without_logcat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = FakeDevice()
+            provisioner = self._provisioner(temporary, device)
+
+            def no_logcat(*args, **kwargs):
+                raise AssertionError("eligibility consulted logcat")
+
+            provisioner.logcat_poll = no_logcat
+            provisioner.logcat_watermark = no_logcat
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner.audio_channel_preflight())
+                self.assertIsNone(
+                    provisioner._channel_blocker(
+                        good_state(provisioner)
+                    )
+                )
+            self.assertIn(
+                "AUDIO_CHANNEL_PREFLIGHT installed=1 staged=1 "
+                "aiservice=1 action=skip",
+                stdout.getvalue(),
+            )
+
+    def test_marker_present_but_aiservice_not_live_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = FakeDevice()
+            device.aiservice = False
+            provisioner = self._provisioner(temporary, device)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertFalse(provisioner.audio_channel_preflight())
+                self.assertEqual(
+                    provisioner._channel_blocker(
+                        good_state(provisioner)
+                    ),
+                    "audio-not-configured",
+                )
+            self.assertIn("action=decline", stdout.getvalue())
+
+    def test_marker_present_but_artifact_missing_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = FakeDevice()
+            device.audio_artifact = False
+            provisioner = self._provisioner(temporary, device)
+            with redirect_stdout(io.StringIO()):
+                self.assertFalse(provisioner.audio_channel_preflight())
+
+    def test_nothing_staged_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = FakeDevice()
+            device.audio_marker = False
+            provisioner = self._provisioner(temporary, device)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertFalse(provisioner.audio_channel_preflight())
+            self.assertIn(
+                "AUDIO_CHANNEL_PREFLIGHT installed=0", stdout.getvalue()
+            )
 
 
 class ChannelApplyTest(unittest.TestCase):
