@@ -1239,7 +1239,7 @@ class PortalProvisioner:
                 self.prepare_exploit_sentinel()
             if self.autoroot:
                 self.stage_autoroot_payload()
-            self.verify_requested_state()
+            self.verify_requested_state(via_channel=True)
             if not self._shizuku_root_ok():
                 raise ProvisionError(
                     "root-mode Shizuku did not survive the channel apply"
@@ -4307,7 +4307,7 @@ class PortalProvisioner:
     def verify_meta_accounts_removed(self) -> None:
         return self.settings_feature.verify_meta_accounts_removed()
 
-    def verify_requested_state(self) -> None:
+    def verify_requested_state(self, via_channel: bool = False) -> None:
         if self.persist_wireless_adb:
             property_name = (
                 self.target.wireless_adb_file_property
@@ -4347,7 +4347,19 @@ class PortalProvisioner:
             )
             self.verify_adb_framework_enabled(wait_seconds=wait_seconds)
         if self.audio:
-            self.verify_watchdog()
+            if via_channel:
+                # The channel apply verifies on the device's current
+                # boot, however old: verify_watchdog()'s logcat probe
+                # rotates away on long uptimes (see
+                # audio_channel_preflight), so the channel verifies
+                # audio with the same durable + live signal the
+                # eligibility gate used.
+                if not self.audio_channel_preflight():
+                    raise ProvisionError(
+                        "audio did not verify after the channel apply"
+                    )
+            else:
+                self.verify_watchdog()
         if self.restore_audio:
             self.verify_audio_restored()
         if self.disable_updates:

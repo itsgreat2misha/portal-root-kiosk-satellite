@@ -449,6 +449,14 @@ class ChannelApplyTest(unittest.TestCase):
                     name
                 ),
             )
+        verify_kwargs: list = []
+
+        def record_verify(*args, **kwargs):
+            calls.append("verify_requested_state")
+            verify_kwargs.append(kwargs)
+
+        provisioner.verify_requested_state = record_verify
+        self._verify_kwargs = verify_kwargs
         states: list = []
         provisioner.write_state = lambda status, **k: states.append(status)
         self._states = states
@@ -468,6 +476,7 @@ class ChannelApplyTest(unittest.TestCase):
             self.assertIn("apply_dhcp_dns", calls)
             self.assertIn("stage_autoroot_payload", calls)
             self.assertIn("verify_requested_state", calls)
+            self.assertEqual(self._verify_kwargs, [{"via_channel": True}])
             self.assertEqual(self._states, ["pending", "complete"])
 
     def test_channel_failure_falls_back_without_completing(self) -> None:
@@ -485,6 +494,51 @@ class ChannelApplyTest(unittest.TestCase):
             self.assertFalse(handled)
             self.assertIn("PROVISION_CHANNEL_FALLBACK", stdout.getvalue())
             self.assertEqual(self._states, ["pending"])
+
+
+class VerifyRequestedStateAudioTest(unittest.TestCase):
+    """The channel apply's final verification runs on the device's
+    current boot, however old, so its audio check must use the
+    boot-age-independent signal; the race path's verification keeps
+    the fresh-boot logcat probe (verify_watchdog)."""
+
+    def _provisioner(self, temporary: str):
+        provisioner = make_provisioner(temporary, audio=True)
+        watchdog_calls: list = []
+        provisioner.verify_watchdog = lambda *a, **k: watchdog_calls.append(
+            True
+        )
+        self._watchdog_calls = watchdog_calls
+        return provisioner
+
+    def test_channel_verify_uses_durable_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            provisioner.audio_channel_preflight = lambda: True
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state(via_channel=True)
+            self.assertEqual(self._watchdog_calls, [])
+
+    def test_channel_verify_declining_signal_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+            provisioner.audio_channel_preflight = lambda: False
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_requested_state(via_channel=True)
+            self.assertEqual(self._watchdog_calls, [])
+
+    def test_race_verify_keeps_logcat_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary)
+
+            def no_channel_signal():
+                raise AssertionError("race verify used the channel signal")
+
+            provisioner.audio_channel_preflight = no_channel_signal
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state()
+            self.assertEqual(self._watchdog_calls, [True])
 
 
 class RunFastPathTest(unittest.TestCase):

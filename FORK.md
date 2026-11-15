@@ -478,5 +478,9 @@ marker (written only after a fully verified boot), the staged
 persist artifact the watchdog loads from, and the aiservice process
 — the watchdog's host — alive at check time. No logcat history is
 consulted, so the answer is independent of boot age; any missing
-signal declines to the race fallback. The race path's own
-fresh-boot verification is unchanged.
+signal declines to the race fallback. The channel apply's final
+verification uses the same signal for audio
+(`verify_requested_state(via_channel=True)`): it verifies on the
+device's current boot, so the logcat probe would fail there for
+the same reason. The race path's own fresh-boot verification is
+unchanged.
