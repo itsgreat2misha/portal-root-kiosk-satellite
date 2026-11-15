@@ -1112,7 +1112,7 @@ class PortalProvisioner:
             and not self.adb_framework_boot_configured
         ):
             return "adb-framework-bootstrap"
-        if self.audio and not self.audio_preflight():
+        if self.audio and not self.audio_channel_preflight():
             return "audio-not-configured"
         if self.disable_updates and not self.ota_preflight():
             return "ota-not-configured"
@@ -2738,6 +2738,9 @@ class PortalProvisioner:
 
     def audio_preflight(self) -> bool:
         return self.audio_feature.audio_preflight()
+
+    def audio_channel_preflight(self) -> bool:
+        return self.audio_feature.audio_channel_preflight()
 
     def ota_preflight(self) -> bool:
         disabled = self.adb_run(
