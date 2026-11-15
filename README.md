@@ -1,3 +1,5 @@
+> ⚠️ **Under heavy development — not ready for release.** This project is being actively restructured and validated. It may not work on your device yet, behavior can change between commits, and there is no stable release. Use at your own risk.
+
 # Meta Portal Root Provisioner
 
 Provision and root Meta Portal devices with a controlled, exact-build
