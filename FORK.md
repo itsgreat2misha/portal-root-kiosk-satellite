@@ -427,7 +427,8 @@ the recorded target and build fingerprint match; every requested
 action equals the recorded applied value (the requested set may be a
 SUBSET of the applied set — the provisioner has no un-apply
 semantics, so asking for less is still "nothing to do"); every
-artifact hash the manifest records matches the current artifact; and
+artifact hash the manifest records for an artifact this run also
+selects matches the current artifact; and
 cheap live spot-checks pass (root-mode Shizuku answering on this
 boot, exploit sentinel and autoroot helper packages present). The
 run exits successfully without touching the device further. A

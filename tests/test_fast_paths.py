@@ -199,6 +199,19 @@ class NoopBlockerTest(unittest.TestCase):
             state["actions"]["autoroot"] = True
             self.assertIsNone(provisioner._noop_blocker(state))
 
+    def test_unselected_recorded_artifact_is_ignored(self) -> None:
+        """A recorded hash for an artifact this run does not select
+        (it belongs to an unrequested action) must not block the
+        no-op — regression: this only shows on machines where the
+        other actions' build outputs actually exist."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, audio=True)
+            state = good_state(provisioner)
+            state["artifact_sha256"]["exploit/build/not-selected.jar"] = (
+                "f" * 64
+            )
+            self.assertIsNone(provisioner._noop_blocker(state))
+
 
 class RootSetupBlockerTest(unittest.TestCase):
     def test_healthy_device_passes(self) -> None:
