@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import cast
 from unittest import mock
 
 
@@ -1194,6 +1195,117 @@ class ApkInstallVerifierBaselineTest(unittest.TestCase):
                 self.assertTrue(
                     provisioner.package_verifier_before_install_disabled
                 )
+
+
+class HelperSignatureMismatchInstallTest(unittest.TestCase):
+    """INSTALL_FAILED_UPDATE_INCOMPATIBLE fallback, helper package only."""
+
+    INCOMPATIBLE = (
+        "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package "
+        "dev.portal.shizukuhelper signatures do not match previously "
+        "installed version]\n"
+    )
+
+    def _run_install(
+        self,
+        temporary: str,
+        package: str,
+        install_outputs: list[str],
+    ) -> tuple[dict[str, object], str, ProvisionError | None]:
+        calls: dict[str, object] = {"install": 0, "uninstall": [], "push": 0}
+        outputs = iter(install_outputs)
+
+        def adb_run(
+            arguments: list[str],
+            timeout: float | None = None,
+            check: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout, check
+            if arguments[0] == "push":
+                calls["push"] = int(calls["push"]) + 1
+                return subprocess.CompletedProcess(
+                    arguments, 0, "1 file pushed\n"
+                )
+            if arguments[:3] == ["shell", "pm", "path"]:
+                return subprocess.CompletedProcess(arguments, 1, "")
+            if arguments[:5] == ["shell", "pm", "list", "packages", "-d"]:
+                return subprocess.CompletedProcess(arguments, 0, "")
+            if arguments[0] == "uninstall":
+                cast(list[str], calls["uninstall"]).append(arguments[1])
+                return subprocess.CompletedProcess(arguments, 0, "Success\n")
+            if arguments[0] == "shell":
+                calls["install"] = int(calls["install"]) + 1
+                output = next(outputs)
+                return subprocess.CompletedProcess(
+                    arguments, 0 if "Success" in output else 1, output
+                )
+            raise AssertionError(f"unexpected adb arguments: {arguments}")
+
+        apk = pathlib.Path(temporary) / "helper.apk"
+        apk.touch()
+        provisioner = PortalProvisioner(
+            "192.0.2.1:5555", 1, pathlib.Path(temporary)
+        )
+        stdout = io.StringIO()
+        error: ProvisionError | None = None
+        with (
+            mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+            contextlib.redirect_stdout(stdout),
+        ):
+            try:
+                provisioner.install_apk_preserving_verifier(
+                    apk, "shizuku-helper", package
+                )
+            except ProvisionError as exc:
+                error = exc
+        return calls, stdout.getvalue(), error
+
+    def test_helper_signature_mismatch_uninstalls_and_reinstalls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, stdout, error = self._run_install(
+                temporary,
+                "dev.portal.shizukuhelper",
+                [self.INCOMPATIBLE, "Success\n"],
+            )
+        self.assertIsNone(error)
+        self.assertEqual(calls["install"], 2)
+        self.assertEqual(calls["push"], 2)
+        self.assertEqual(calls["uninstall"], ["dev.portal.shizukuhelper"])
+        self.assertIn("APK_INSTALL_RETRY", stdout)
+        self.assertIn("APK_INSTALL_OK", stdout)
+
+    def test_helper_other_install_error_still_fails_hard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, _, error = self._run_install(
+                temporary,
+                "dev.portal.shizukuhelper",
+                ["Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n"],
+            )
+        self.assertIsNotNone(error)
+        self.assertEqual(calls["install"], 1)
+        self.assertEqual(calls["uninstall"], [])
+
+    def test_other_package_signature_mismatch_still_fails_hard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, _, error = self._run_install(
+                temporary,
+                "moe.shizuku.privileged.api",
+                [self.INCOMPATIBLE],
+            )
+        self.assertIsNotNone(error)
+        self.assertEqual(calls["install"], 1)
+        self.assertEqual(calls["uninstall"], [])
+
+    def test_helper_failed_reinstall_still_fails_hard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, _, error = self._run_install(
+                temporary,
+                "dev.portal.shizukuhelper",
+                [self.INCOMPATIBLE, self.INCOMPATIBLE],
+            )
+        self.assertIsNotNone(error)
+        self.assertEqual(calls["install"], 2)
+        self.assertEqual(calls["uninstall"], ["dev.portal.shizukuhelper"])
 
 
 class StreamliningTest(unittest.TestCase):

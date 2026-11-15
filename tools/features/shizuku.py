@@ -322,9 +322,38 @@ class ShizukuFeature:
             )
         result = self._adb_run(["shell", command], timeout=300)
         if result.returncode != 0 or "Success" not in result.stdout:
-            raise ProvisionError(
-                f"APK installation failed for {apk}: {result.stdout.strip()}"
-            )
+            if (
+                package == SHIZUKU_HELPER_PACKAGE
+                and "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in result.stdout
+            ):
+                # A helper installed by an older build host is signed with
+                # a different keystore, and Android refuses signature-
+                # changing updates, so the stale helper can never be
+                # updated in place. Replace it instead: no key
+                # authorization for the helper has happened yet at this
+                # point in a run (the install race later authorizes the
+                # installed helper's key), so uninstalling loses nothing.
+                print(
+                    f"APK_INSTALL_RETRY package={package} "
+                    "reason=signature-mismatch action=uninstall-reinstall",
+                    flush=True,
+                )
+                uninstall = self._adb_run(["uninstall", package], timeout=60)
+                if uninstall.returncode != 0 or "Success" not in uninstall.stdout:
+                    raise ProvisionError(
+                        f"failed to uninstall stale {package}: "
+                        f"{uninstall.stdout.strip()}"
+                    )
+                # The failed attempt's command removed the pushed APK
+                # (both variants delete it), so push it again.
+                self._adb_run(
+                    ["push", str(apk), remote], timeout=push_timeout, check=True
+                )
+                result = self._adb_run(["shell", command], timeout=300)
+            if result.returncode != 0 or "Success" not in result.stdout:
+                raise ProvisionError(
+                    f"APK installation failed for {apk}: {result.stdout.strip()}"
+                )
         print(
             f"APK_INSTALL_OK package_source={apk.name} "
             f"verifier_state={'disabled' if verifier_was_disabled else 'enabled'}"
