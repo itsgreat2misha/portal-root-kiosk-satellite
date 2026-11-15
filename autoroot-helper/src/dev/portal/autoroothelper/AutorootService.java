@@ -243,13 +243,17 @@ public final class AutorootService extends Service {
         // verdict - is cut at 600 s instead of eating the session,
         // and the kernel panic its damaged lock causes bounds it
         // independently.
-        try {
-            shellTracked("sh " + RUN_SH + " " + kaslr + " " + memstart + " " + attempts,
-                    600000);
-        } catch (Exception launchError) {
-            Log.w(TAG, "attempt runner error", launchError);
-            logFile("attempt runner error " + launchError);
-        }
+        //
+        // Fail-fast watchdog (2026-11-14): the launch runs on its
+        // own thread while this thread polls attempt.log for the
+        // race verdict. An attempt with NO verdict after
+        // AttemptWatchdog.CUTOFF_MS is cut by closing the tracked
+        // client - the same teardown the stop path uses - instead
+        // of riding to the 600 s timeout. An attempt whose verdict
+        // HAS appeared is never cut: wins write their verdict
+        // early and conclude at the timeout edge by design.
+        long attemptLogOffset = attemptLogSize();
+        runAttemptWithWatchdog(kaslr, memstart, attempts, attemptLogOffset);
         if (stopRequested) {
             logFile("stopped by user");
             return;
@@ -281,6 +285,103 @@ public final class AutorootService extends Service {
         logFile("attempt failed n=" + attempts);
         publishStatus("FAILED", attempts, maxAttempts, "attempt failed");
         rebootForCleanAttempt(attempts, maxAttempts);
+    }
+
+    // ---- attempt watchdog ----------------------------------------------
+
+    private static final String ATTEMPT_LOG = DIR + "/attempt.log";
+    private static final long WATCHDOG_POLL_MS = 5000;
+
+    /**
+     * Runs one attempt via the tracked foreground shell call on a
+     * launch thread, polling attempt.log for the verdict marker in
+     * the meantime. Cuts the attempt at the watchdog cutoff when no
+     * verdict has appeared; otherwise lets the launch ride to its
+     * own completion or the 600 s shell timeout, exactly as the
+     * pre-watchdog code did.
+     */
+    private void runAttemptWithWatchdog(String kaslr, String memstart,
+            int attempts, long attemptLogOffset) {
+        final Exception[] launchError = new Exception[1];
+        Thread launch = new Thread(() -> {
+            try {
+                shellTracked("sh " + RUN_SH + " " + kaslr + " " + memstart
+                        + " " + attempts, 600000);
+            } catch (Exception error) {
+                launchError[0] = error;
+            }
+        }, "portal-autoroot-attempt");
+        long startedMs = System.currentTimeMillis();
+        launch.start();
+        boolean verdictSeen = false;
+        while (launch.isAlive()) {
+            if (stopRequested) {
+                break;
+            }
+            if (!verdictSeen) {
+                verdictSeen = attemptVerdictSeen(attemptLogOffset);
+            }
+            if (AttemptWatchdog.shouldCut(
+                    System.currentTimeMillis() - startedMs, verdictSeen)) {
+                AdbClient client = activeClient;
+                if (client != null) {
+                    Log.w(TAG, "fail-fast: no verdict after "
+                            + (AttemptWatchdog.CUTOFF_MS / 1000)
+                            + "s, cutting attempt " + attempts);
+                    logFile("fail-fast cutoff attempt=" + attempts
+                            + " no verdict after "
+                            + (AttemptWatchdog.CUTOFF_MS / 1000) + "s");
+                    try {
+                        client.close();
+                    } catch (Exception ignored) {
+                    }
+                    break;
+                }
+                // The launch thread has not registered its client
+                // yet; keep polling rather than cutting blind.
+            }
+            try {
+                Thread.sleep(WATCHDOG_POLL_MS);
+            } catch (InterruptedException error) {
+                break;
+            }
+        }
+        try {
+            launch.join(30000);
+        } catch (InterruptedException ignored) {
+        }
+        if (launchError[0] != null) {
+            Log.w(TAG, "attempt runner error", launchError[0]);
+            logFile("attempt runner error " + launchError[0]);
+        }
+    }
+
+    /**
+     * attempt.log is append-only across attempts and sessions, so
+     * the verdict check is scoped to the bytes written since this
+     * attempt started (the offset captured just before launch).
+     * tail -c +N is 1-based: +offset+1 starts exactly at the first
+     * byte this attempt can write. A shrunken log (fresh staging)
+     * yields an empty tail, never a stale verdict.
+     */
+    private boolean attemptVerdictSeen(long attemptLogOffset) {
+        try {
+            String tail = shell("tail -c +" + (attemptLogOffset + 1)
+                    + " " + ATTEMPT_LOG + " 2>/dev/null");
+            return AttemptWatchdog.verdictIn(tail);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private long attemptLogSize() {
+        try {
+            String out = shell("stat -c %s " + ATTEMPT_LOG
+                    + " 2>/dev/null").trim();
+            return Long.parseLong(out);
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     // ---- UI control surface -------------------------------------------
