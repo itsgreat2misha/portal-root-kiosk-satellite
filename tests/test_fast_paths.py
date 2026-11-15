@@ -620,5 +620,282 @@ class ForceTest(unittest.TestCase):
                     self.assertEqual(seen, [expected_package])
 
 
+class ShizukuEndStateDevice:
+    """adb fake modelling the finished autoroot end state: the
+    Shizuku package installed, its server live as uid 0, the
+    standalone helper package ABSENT (removed by the flow itself
+    after the keypair merge), sentinel + autoroot helper present.
+    The install-phase verify_shizuku() can never pass on this
+    state; the channel end-state check must."""
+
+    def __init__(self) -> None:
+        self.shizuku_uid = "0"
+        self.shizuku_running = True
+        self.shizuku_package = True
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        if "pm path moe.shizuku.privileged.api" in command:
+            return completed(
+                arguments,
+                "package:/data/app/shizuku/base.apk\n"
+                if self.shizuku_package
+                else "",
+            )
+        if "pm path dev.portal.exploitsentinel" in command:
+            return completed(
+                arguments, "package:/data/app/sentinel/base.apk\n"
+            )
+        if "pm path dev.portal.autoroothelper" in command:
+            return completed(
+                arguments, "package:/data/app/helper/base.apk\n"
+            )
+        if "pidof shizuku_server" in command:
+            return completed(
+                arguments, "4242\n" if self.shizuku_running else ""
+            )
+        if "/proc/4242/status" in command:
+            return completed(
+                arguments,
+                f"Name:\tshizuku_server\nUid:\t{self.shizuku_uid}\t0\t0\t0\n",
+            )
+        if "pm list packages" in command:
+            return completed(
+                arguments,
+                "package:moe.shizuku.privileged.api\n"
+                "package:dev.portal.autoroothelper\n",
+            )
+        if "ps -A" in command:
+            user = "root" if self.shizuku_uid == "0" else "shell"
+            return completed(
+                arguments,
+                f"{user} 4242 1 0 0 0 0 S shizuku_server\n"
+                if self.shizuku_running
+                else "",
+            )
+        if "dumpsys package dev.portal.shizukuhelper" in command:
+            return completed(arguments, "")
+        return completed(arguments, "", 1)
+
+
+class VerifyShizukuChannelTest(unittest.TestCase):
+    """The channel Shizuku verification asserts the finished
+    autoroot end state (package installed, server uid 0, root
+    setup identities present) instead of the install-phase
+    startup state (standalone helper present, server as shell)."""
+
+    def _provisioner(self, temporary: str, device: ShizukuEndStateDevice):
+        provisioner = make_provisioner(
+            temporary, shizuku=True, autoroot=True
+        )
+        provisioner.adb_run = device.adb_run
+        return provisioner
+
+    def test_end_state_passes_channel_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShizukuEndStateDevice()
+            provisioner = self._provisioner(temporary, device)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.verify_shizuku_channel()
+            self.assertIn(
+                "SHIZUKU_OK privilege=root", stdout.getvalue()
+            )
+
+    def test_end_state_fails_the_old_phase_check(self) -> None:
+        """The same device state must FAIL the race path's
+        install-phase assertion — that mismatch is the defect
+        class this audit fixes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShizukuEndStateDevice()
+            provisioner = self._provisioner(temporary, device)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.shizuku_feature.verify_shizuku(
+                        wait_seconds=1
+                    )
+
+    def test_server_wrong_uid_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShizukuEndStateDevice()
+            device.shizuku_uid = "2000"
+            provisioner = self._provisioner(temporary, device)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_shizuku_channel()
+
+    def test_server_absent_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShizukuEndStateDevice()
+            device.shizuku_running = False
+            provisioner = self._provisioner(temporary, device)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_shizuku_channel()
+
+    def test_shizuku_package_absent_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShizukuEndStateDevice()
+            device.shizuku_package = False
+            provisioner = self._provisioner(temporary, device)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_shizuku_channel()
+
+    def test_dispatch_channel_vs_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, shizuku=True)
+            calls: list = []
+            provisioner.verify_shizuku = lambda *a, **k: calls.append(
+                "race"
+            )
+            provisioner.verify_shizuku_channel = lambda: calls.append(
+                "channel"
+            )
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state(via_channel=True)
+                provisioner.verify_requested_state()
+            self.assertEqual(calls, ["channel", "race"])
+
+
+class PresenceEndStateDevice:
+    """adb fake modelling a live presence runtime on an old boot:
+    the pipeline is running (aiservice pid, active camera client,
+    CAMERA appop allow, analysis/ROI frame markers in the current
+    logcat, pose metrics + frame processor in dumpsys) and the
+    durable profile marker is present — but NONE of the
+    config-load-time logcat evidence (settings_config.xml profile
+    keys, full-scene marker, FPS/activation lines) exists, because
+    it rotated away. The race-path profile verification needs
+    that evidence; the channel verification must not."""
+
+    def __init__(self) -> None:
+        self.marker = True
+        self.fps_marker = "5"
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        if (
+            "test -f /data/local/tmp/portal-presence-backup/installed-v1"
+            in command
+        ):
+            return completed(arguments, "", 0 if self.marker else 1)
+        if "cat /data/local/tmp/portal-presence-backup/fps-cap-v1" in command:
+            return completed(arguments, self.fps_marker + "\n")
+        if "pidof com.facebook.portal.aiservice" in command:
+            return completed(arguments, "2703\n")
+        if "dumpsys media.camera" in command:
+            return completed(
+                arguments,
+                "Active Camera Clients:\n"
+                "Client Package Name: com.facebook.portal.aiservice\n",
+            )
+        if "cmd appops get" in command:
+            return completed(arguments, "CAMERA: allow\n")
+        if "logcat" in command:
+            return completed(
+                arguments,
+                "Frame available for analysis stream\n"
+                "Frame available for roi stream\n",
+            )
+        if "dumpsys activity service" in command:
+            return completed(
+                arguments,
+                "[ PoseEstimatorManagerMetrics ]\n"
+                "10 ms - 20 ms: 3\n"
+                "[ AlohaFrameProcessor ]\nloaded\n"
+                "[ AiCameramanController ]\n",
+            )
+        return completed(arguments, "", 1)
+
+
+class VerifyPresenceChannelTest(unittest.TestCase):
+    """The channel presence verification asserts durable markers
+    (installed profile marker, fps-cap marker) plus the live
+    pipeline subset, instead of the race verify's config-load
+    logcat evidence."""
+
+    def _provisioner(self, temporary: str, device: PresenceEndStateDevice, **kwargs):
+        provisioner = make_provisioner(temporary, **kwargs)
+        provisioner.adb_run = device.adb_run
+        return provisioner
+
+    def test_live_runtime_with_marker_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = PresenceEndStateDevice()
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.verify_presence_runtime_channel()
+            self.assertIn(
+                "PRESENCE_RUNTIME_OK", stdout.getvalue()
+            )
+            self.assertIn("profile=durable-marker", stdout.getvalue())
+
+    def test_marker_absent_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = PresenceEndStateDevice()
+            device.marker = False
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_presence_runtime_channel()
+
+    def test_fps_cap_marker_mismatch_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = PresenceEndStateDevice()
+            device.fps_marker = "3"
+            provisioner = self._provisioner(
+                temporary, device, presence_fps_cap=5
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError):
+                    provisioner.verify_presence_runtime_channel(
+                        expected_analysis_fps=5
+                    )
+
+    def test_fps_cap_marker_match_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = PresenceEndStateDevice()
+            provisioner = self._provisioner(
+                temporary, device, presence_fps_cap=5
+            )
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_presence_runtime_channel(
+                    expected_analysis_fps=5
+                )
+
+    def test_dispatch_channel_vs_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, optimize_presence=True
+            )
+            calls: list = []
+            provisioner.verify_presence_runtime = (
+                lambda *a, **k: calls.append("race")
+            )
+            provisioner.verify_presence_runtime_channel = (
+                lambda *a, **k: calls.append(("channel", k))
+            )
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state(via_channel=True)
+                provisioner.verify_requested_state()
+            self.assertEqual(calls[0][0], "channel")
+            self.assertEqual(
+                calls[0][1],
+                {
+                    "expected_analysis_fps": None,
+                    "require_marker": True,
+                },
+            )
+            self.assertEqual(calls[1], "race")
+
+
 if __name__ == "__main__":
     unittest.main()

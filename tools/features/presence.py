@@ -807,6 +807,171 @@ class PresenceFeature:
             f"{camera_hint}"
         )
 
+    def verify_presence_runtime_channel(
+        self,
+        expected_analysis_fps: int | None = None,
+        require_marker: bool = True,
+        wait_seconds: int = 90,
+    ) -> None:
+        """End-state presence verification for the root-channel path.
+
+        verify_presence_runtime() proves the profile from logcat
+        evidence — settings_config.xml profile-key lines, the
+        full-scene marker, the "Setting AI Processing FPS" line, the
+        helper's activation line — that the aiservice emits when it
+        loads its config or applies the cap. On the device's current
+        boot, however old, those lines have rotated out of logcat,
+        so the race-path verification can never pass there (the same
+        defect class as the audio logcat probes). The live half of
+        that verification is boot-age independent — the pipeline
+        emits analysis/ROI frame markers continuously while it runs,
+        and the pose/frame-processor metrics live in dumpsys — so
+        this variant keeps exactly that live subset and replaces
+        the rotated evidence with durable state: the installed
+        marker, which verify_presence_runtime() writes only after
+        a full profile verification has passed, and the fps-cap
+        marker file whose content the race verify already reads.
+        Guarantee preserved: the presence profile is the applied
+        one (durable markers) and the presence pipeline is live
+        with it now (live subset)."""
+        if require_marker and self._adb_run(
+            ["shell", "test", "-f", PRESENCE_INSTALLED_REMOTE],
+            timeout=5,
+        ).returncode != 0:
+            raise ProvisionError(
+                "presence profile marker is absent on the channel "
+                "path; the profile has never completed a full "
+                "verification on this device"
+            )
+        if expected_analysis_fps is not None:
+            configured_path = (
+                "/data/local/tmp/portal-presence-backup/fps-cap-v1"
+                if self._target() and self._target().uid1000_embedded_helper
+                else self._uid1000_path("presence-fps")
+            )
+            configured = self._adb_run(
+                ["shell", "cat", configured_path], timeout=5
+            )
+            if (
+                configured.returncode != 0
+                or configured.stdout.strip() != str(expected_analysis_fps)
+            ):
+                raise ProvisionError(
+                    "presence FPS cap marker does not match on the "
+                    f"channel path: expected={expected_analysis_fps} "
+                    f"marker={configured.stdout.strip()!r}"
+                )
+        deadline = time.monotonic() + wait_seconds
+        pid = ""
+        camera_active = False
+        camera_allowed = False
+        camera_appop = ""
+        analysis_frames = False
+        roi_frames = False
+        pose_metrics = False
+        frame_processor_loaded = False
+        while time.monotonic() < deadline:
+            pid = self._adb_run(
+                ["shell", "pidof", "com.facebook.portal.aiservice"],
+                timeout=5,
+            ).stdout.strip()
+            camera = self._adb_run(
+                ["shell", "dumpsys", "media.camera"], timeout=15
+            ).stdout
+            camera_active = (
+                "Active Camera Clients:" in camera
+                and "Client Package Name: com.facebook.portal.aiservice"
+                in camera
+            )
+            appops = self._adb_run(
+                [
+                    "shell",
+                    "cmd",
+                    "appops",
+                    "get",
+                    "com.facebook.portal.aiservice",
+                    "CAMERA",
+                ],
+                timeout=10,
+            ).stdout
+            camera_appop = " ".join(appops.split()) or "no-operation-recorded"
+            camera_allowed = "CAMERA: allow" in appops
+            logs = self._adb_run(
+                [
+                    "shell",
+                    "logcat",
+                    "-d",
+                    "-v",
+                    "brief",
+                    "-e",
+                    PRESENCE_LOGCAT_REGEX,
+                ],
+                timeout=20,
+            ).stdout
+            analysis_frames = (
+                analysis_frames or PRESENCE_ANALYSIS_FRAME_MARKER in logs
+            )
+            roi_frames = roi_frames or PRESENCE_ROI_FRAME_MARKER in logs
+            metrics = self._adb_run(
+                [
+                    "shell",
+                    "dumpsys",
+                    "activity",
+                    "service",
+                    CAMERA_SERVICE_COMPONENT,
+                ],
+                timeout=20,
+            ).stdout
+            pose_section = ""
+            frame_section = ""
+            if "[ PoseEstimatorManagerMetrics ]" in metrics:
+                pose_section = metrics.split(
+                    "[ PoseEstimatorManagerMetrics ]", 1
+                )[1].split("[ AlohaFrameProcessor ]", 1)[0]
+            if "[ AlohaFrameProcessor ]" in metrics:
+                frame_section = metrics.split(
+                    "[ AlohaFrameProcessor ]", 1
+                )[1].split("[ AiCameramanController ]", 1)[0]
+                frame_processor_loaded = bool(frame_section)
+            latency_bucket = re.compile(r"\b\d+ ms - \d+ ms:\s+\d+\b")
+            pose_metrics = bool(latency_bucket.search(pose_section))
+            if (
+                pid
+                and camera_active
+                and camera_allowed
+                and analysis_frames
+                and roi_frames
+                and pose_metrics
+                and frame_processor_loaded
+            ):
+                print(
+                    "PRESENCE_RUNTIME_OK "
+                    f"pid={pid.split()[0]} camera=active appop=allow "
+                    "pipeline=active analysis_frames=observed "
+                    "roi_frames=observed pose_metrics=populated "
+                    "frame_processor=loaded profile=durable-marker "
+                    f"analysis_fps={expected_analysis_fps or 'unlimited'}"
+                )
+                return
+            time.sleep(2)
+        camera_hint = (
+            " Check that the Portal's physical camera cover is open "
+            "and its camera/microphone privacy control is off."
+            if not camera_active
+            else ""
+        )
+        raise ProvisionError(
+            "presence pipeline did not pass its channel live check: "
+            f"pid={pid!r} camera_active={int(camera_active)} "
+            f"camera_allowed={int(camera_allowed)} "
+            f"camera_appop={camera_appop!r} "
+            f"analysis_frames={int(analysis_frames)} "
+            f"roi_frames={int(roi_frames)} "
+            f"pose_metrics={int(pose_metrics)} "
+            f"frame_processor_loaded={int(frame_processor_loaded)}."
+            f"{camera_hint}"
+        )
+
     def verify_camera_light_disabled(self, wait_seconds: int = 35) -> None:
         if self._adb_run(
             ["shell", "test", "-f", CAMERA_LIGHT_INSTALLED_REMOTE], timeout=5

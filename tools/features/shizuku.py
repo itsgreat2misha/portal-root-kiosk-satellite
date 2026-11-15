@@ -451,6 +451,54 @@ class ShizukuFeature:
             f"helper_log={logs[-500:]!r}"
         )
 
+    def verify_shizuku_channel(self) -> None:
+        """End-state Shizuku verification for the root-channel path.
+
+        verify_shizuku() above is an install-phase startup check: it
+        requires the standalone helper package present and a
+        shizuku_server running as the shell user, because in its
+        original context (the verify boot before autoroot staging)
+        the helper has just started the server through loopback ADB.
+        The finished autoroot state legitimately differs on both
+        points — the flow removes the standalone helper once its
+        keypair is merged into the autoroot helper, and the server
+        runs as uid 0 — so on the channel path that check can never
+        pass (Run 33 gate re-run). This variant asserts the same
+        underlying guarantee against the finished state: the
+        install-time package-verifier manipulation was reverted,
+        the Shizuku package is installed, and its server is live as
+        uid 0 (the mode the autoroot handoff maintains)."""
+        self._verify_package_verifier_state()
+        package_path = self._adb_run(
+            ["shell", "pm", "path", SHIZUKU_PACKAGE],
+            timeout=10,
+            check=True,
+        ).stdout
+        if not package_path.startswith("package:"):
+            raise ProvisionError(
+                "Shizuku package is not installed on the channel path"
+            )
+        pid = self._adb_run(
+            ["shell", "pidof", "shizuku_server"], timeout=5
+        ).stdout.strip()
+        uid = ""
+        if pid:
+            status = self._adb_run(
+                ["shell", "cat", f"/proc/{pid.split()[0]}/status"],
+                timeout=5,
+            ).stdout
+            match = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
+            uid = match.group(1) if match else ""
+        if not pid or uid != "0":
+            raise ProvisionError(
+                "root-mode Shizuku is not live on the channel path: "
+                f"pid={pid.split()[0] if pid else 'none'} uid={uid!r}"
+            )
+        print(
+            "SHIZUKU_OK privilege=root startup=autoroot "
+            f"process=pid={pid.split()[0]} uid=0"
+        )
+
     def verify_shizuku_removed(self) -> None:
         packages = self._adb_run(
             ["shell", "pm", "list", "packages"], timeout=15, check=True
