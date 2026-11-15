@@ -237,6 +237,7 @@ class PortalProvisioner:
         backup_path: pathlib.Path | None = None,
         recover: bool = False,
         skip_build: bool = False,
+        force: bool = False,
         persistent_wireless_adb: bool = False,
         disable_adb_auth_timeout: bool = False,
         restore_adb_auth_timeout: bool = False,
@@ -473,6 +474,7 @@ class PortalProvisioner:
         self.backup_path = backup_path
         self.recover = recover
         self.skip_build = skip_build
+        self.force = force
         self.persistent_wireless_adb = persistent_wireless_adb
         self.disable_adb_auth_timeout = (
             disable_adb_auth_timeout or persistent_wireless_adb
@@ -993,6 +995,296 @@ class PortalProvisioner:
         if succeeded:
             raise ProvisionError(detail)
         print(detail, flush=True)
+
+    # ---- re-run fast paths: no-op and root-channel apply -----------
+    #
+    # On an already-provisioned device, a re-run whose recorded state
+    # still matches this build, the requested actions, and the live
+    # root setup has nothing to do (no-op, below). A re-run whose
+    # state drifted only in shell-applicable ways applies just the
+    # delta under the device's verified existing root setup (the
+    # channel path) instead of re-racing both races. Anything else —
+    # and any channel failure — falls back to the normal guarded race
+    # run. --force skips both fast paths. Neither path ever runs for
+    # nested bootstrap provision() calls (guard depth > 1): a
+    # bootstrap's single action must always really apply.
+
+    def _noop_blocker(self, state: dict[str, object]) -> str | None:
+        """Manifest-side no-op conditions; None when they all hold."""
+        if state.get("status") != "complete":
+            return f"status-{state.get('status')}"
+        if state.get("tool_revision") != self.tool_revision():
+            return "tool-revision"
+        if self.target is None or state.get("target") != self.target.key:
+            return "target"
+        if state.get("fingerprint") != self.target.fingerprint:
+            return "fingerprint"
+        recorded_actions = state.get("actions")
+        if not isinstance(recorded_actions, dict):
+            return "actions-unrecorded"
+        for name, value in self.requested_actions().items():
+            if recorded_actions.get(name) != value:
+                return f"actions-{name}"
+        recorded_hashes = state.get("artifact_sha256")
+        if not isinstance(recorded_hashes, dict):
+            return "artifacts-unrecorded"
+        current_hashes = self.selected_artifact_hashes()
+        for name, digest in recorded_hashes.items():
+            if current_hashes.get(name) != digest:
+                return f"artifact-{name}"
+        return None
+
+    def _shizuku_root_ok(self) -> bool:
+        pid = self.adb_run(
+            ["shell", "pidof", "shizuku_server"], timeout=5
+        ).stdout.strip()
+        if not pid:
+            return False
+        status = self.adb_run(
+            ["shell", "cat", f"/proc/{pid.split()[0]}/status"], timeout=5
+        ).stdout
+        match = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
+        return match is not None and match.group(1) == "0"
+
+    def _root_setup_blocker(self) -> str | None:
+        """Live proof that the device's existing root setup is intact:
+        root-mode Shizuku answering on this boot (which only the
+        autoroot handoff or a provision run can have produced), plus
+        the sentinel and autoroot helper packages present."""
+        if not self._shizuku_root_ok():
+            return "shizuku-root"
+        if self.uses_exploit_sentinel():
+            path = self.adb_run(
+                ["shell", "pm", "path", EXPLOIT_SENTINEL_PACKAGE],
+                timeout=10,
+            ).stdout
+            if not path.startswith("package:"):
+                return "sentinel-missing"
+        if self.autoroot:
+            path = self.adb_run(
+                ["shell", "pm", "path", AUTOROOT_HELPER_PACKAGE],
+                timeout=10,
+            ).stdout
+            if not path.startswith("package:"):
+                return "autoroot-helper-missing"
+        return None
+
+    def _channel_blocker(self, state: dict[str, object]) -> str | None:
+        """Eligibility for the root-channel apply path; None when the
+        delta can be applied without racing. Any requested action
+        whose apply mechanism is a credential bootstrap, the install
+        loop, or an adb_keys write disqualifies the channel — the
+        race run owns those."""
+        if state.get("status") != "complete":
+            return f"status-{state.get('status')}"
+        blocker = self._root_setup_blocker()
+        if blocker is not None:
+            return blocker
+        if self.disable_camera_light:
+            return "retired-camera-light"
+        property_name = (
+            self.target.wireless_adb_file_property
+            if self.target and self.target.wireless_adb_file_property
+            else "persist.adb.tcp.port"
+        )
+        if self.target and self.target.wireless_adb_file_property:
+            persistent_port = (
+                "5555"
+                if self.adb_run(
+                    ["shell", "test", "-f", WIRELESS_ADB_INSTALLED_REMOTE],
+                    timeout=5,
+                ).returncode
+                == 0
+                else ""
+            )
+        else:
+            persistent_port = self.adb_run(
+                ["shell", "getprop", property_name], timeout=5
+            ).stdout.strip()
+        if self.privileged_requested() and persistent_port != "5555":
+            return "wireless-adb-bootstrap"
+        if (
+            self.adb_framework_boot_install_requested()
+            and not self.adb_framework_boot_configured
+        ):
+            return "adb-framework-bootstrap"
+        if self.audio and not self.audio_preflight():
+            return "audio-not-configured"
+        if self.disable_updates and not self.ota_preflight():
+            return "ota-not-configured"
+        if self.remove_meta_accounts and not self.meta_accounts_preflight():
+            return "meta-accounts-not-clean"
+        if self.optimize_presence and not self.presence_preflight():
+            return "presence-not-configured"
+        if (
+            self.presence_fps_cap is not None
+            and not self.presence_fps_preflight()
+        ):
+            return "presence-fps-not-configured"
+        if (
+            self.debloat
+            and self.target
+            and self.target.shell_root_package_actions
+            and not self.debloat_preflight()
+        ):
+            return "debloat-bootstrap"
+        if (
+            self.block_remote_wipe
+            and self.target
+            and self.target.shell_root_package_actions
+            and not self.remote_wipe_preflight()
+        ):
+            return "remote-wipe-bootstrap"
+        if (
+            self.system_theme_control is not None
+            and not self.system_theme_control_preflight()
+        ):
+            return "system-theme-not-configured"
+        if self.restore_audio:
+            return "restore-audio"
+        if self.remove_shizuku:
+            return "remove-shizuku"
+        if self.enable_updates:
+            return "enable-updates"
+        if self.restore_camera_light:
+            return "restore-camera-light"
+        if self.autoroot and self.adb_run(
+            ["shell", "test", "-f", "/data/local/tmp/portal-simpleperf"],
+            timeout=5,
+        ).returncode != 0:
+            return "simpleperf-missing"
+        return None
+
+    def _apply_via_channel(self, reason: str) -> bool:
+        """Apply the drifted delta through the device's existing root
+        setup: the same shell-level applies, package installs, and
+        autoroot staging the race run performs, minus the races
+        themselves (their persistent products — the authorized helper
+        key, root-mode Shizuku, the lock repair — are already in
+        place and were just verified). No reboots. Any failure logs
+        the fallback and returns False so the caller continues into
+        the normal race run; every apply here is idempotent, so
+        re-applying there is safe."""
+        print(f"PROVISION_CHANNEL_ENGAGED reason={reason}", flush=True)
+        try:
+            if self.privileged_requested() and not self.skip_build:
+                android_build_environment(self.target)
+            if self.shizuku:
+                self.resolve_shizuku_apk()
+            self.write_state("pending")
+            if self.debloat and not self.debloat_preflight():
+                self.apply_debloat()
+            if self.restore_bloat:
+                self.restore_debloat()
+            if self.block_remote_wipe and not self.remote_wipe_preflight():
+                self.ensure_remote_wipe_backup()
+            if self.restore_remote_wipe:
+                self.read_remote_wipe_backup(required=True)
+            if self.needs_uid1000_payload():
+                if self.skip_build:
+                    self.validate_uid1000_payload()
+                self.prepare_camera_light_install()
+            if self.disable_updates:
+                self.disable_ota_packages()
+            if self.disable_adb_auth_timeout:
+                self.disable_adb_authorization_timeout()
+            if self.restore_adb_auth_timeout:
+                self.restore_adb_authorization_timeout()
+            if self.privacy_dns:
+                self.apply_privacy_dns()
+            if self.dhcp_dns:
+                self.apply_dhcp_dns()
+            if self.restore_privacy_dns:
+                self.restore_private_dns()
+            if self.allow_app_updates:
+                self.allow_third_party_app_updates()
+            if self.restore_app_verifier:
+                self.restore_app_verifier_setting()
+            if self.needs_component_ctl():
+                self.prepare_component_actions()
+            if not self.skip_build:
+                build(
+                    target=self.target,
+                    build_audio=False,
+                    build_account=self.remove_meta_accounts,
+                    build_components=self.needs_component_ctl(),
+                    build_shizuku=self.shizuku,
+                    build_autoroot=self.autoroot,
+                    build_presence=False,
+                    build_uid1000=self.needs_uid1000_payload(),
+                    build_sentinel=self.uses_exploit_sentinel(),
+                    build_daemon=(
+                        self.custom_payload is not None
+                        and self.custom_payload
+                        == DEFAULT_CUSTOM_PAYLOAD_LOCAL
+                    ),
+                )
+            if self.needs_uid1000_payload():
+                self.validate_uid1000_payload()
+            if self.shizuku:
+                self.install_shizuku_payload()
+            if (
+                self.needs_uid1000_payload()
+                and self.target
+                and self.target.uid1000_embedded_helper
+            ):
+                self.install_uid1000_runtime_payload()
+            if self.restore_presence_fps or self.restore_presence_profile:
+                self.uninstall_presence_helper()
+            if self.uses_exploit_sentinel():
+                self.prepare_exploit_sentinel()
+            if self.autoroot:
+                self.stage_autoroot_payload()
+            self.verify_requested_state()
+            if not self._shizuku_root_ok():
+                raise ProvisionError(
+                    "root-mode Shizuku did not survive the channel apply"
+                )
+        except (ProvisionError, OSError) as exc:
+            print(
+                f"PROVISION_CHANNEL_FALLBACK reason={exc}", flush=True
+            )
+            return False
+        self.write_state("complete")
+        print(
+            "PROVISION_CHANNEL_OK reboots=0 "
+            f"logs={self.log_dir}",
+            flush=True,
+        )
+        print(f"PROVISION_OK reboots=0 logs={self.log_dir}", flush=True)
+        return True
+
+    def _run_fast_path(self) -> bool:
+        """No-op / channel decision for the outermost run. Returns
+        True when the run is fully handled (no-op exit or a completed
+        channel apply) and the stages must not continue."""
+        try:
+            state = self.read_state()
+        except ProvisionError:
+            return False
+        if state is None:
+            return False
+        blocker = self._noop_blocker(state)
+        if blocker is None:
+            root_blocker = self._root_setup_blocker()
+            if root_blocker is None:
+                print(
+                    "PROVISION_NOOP reason=already-provisioned "
+                    f"tool_revision={state.get('tool_revision')} "
+                    f"logs={self.log_dir}",
+                    flush=True,
+                )
+                return True
+            blocker = root_blocker
+        print(f"PROVISION_NOOP_SKIP reason={blocker}", flush=True)
+        channel_blocker = self._channel_blocker(state)
+        if channel_blocker is not None:
+            print(
+                f"PROVISION_CHANNEL_SKIP reason={channel_blocker}",
+                flush=True,
+            )
+            return False
+        return self._apply_via_channel(blocker)
 
     @contextlib.contextmanager
     def bootstrap_guard(self, label: str):
@@ -2282,6 +2574,12 @@ class PortalProvisioner:
         tag: str,
         package: str | None = None,
     ) -> None:
+        if self.force:
+            # --force: bypass the byte-identical install skip (the
+            # feature only skips when it is given a package to compare
+            # against), so every install of the provisioner's own
+            # packages is genuine.
+            package = None
         result = self.shizuku_feature.install_apk_preserving_verifier(
             apk, tag, package
         )
@@ -4327,6 +4625,13 @@ class PortalProvisioner:
         self.adb_framework_boot_configured = (
             self.adb_framework_boot_preflight()
         )
+        if (
+            not self.force
+            and not resumed_pending
+            and _autoroot_guard_depth == 1
+            and self._run_fast_path()
+        ):
+            return
         if self.system_theme_control is not None:
             self.system_theme_control_already_configured = (
                 self.system_theme_control_preflight()

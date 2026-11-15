@@ -101,6 +101,16 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     parser.add_argument(
         "--skip-build", action="store_true", help="use existing build outputs"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "bypass the re-run fast paths (the already-provisioned no-op "
+            "exit and the root-channel apply) and run the full race-based "
+            "provision, re-installing the provisioner's own packages even "
+            "when they are byte-identical; the autoroot guard still applies"
+        ),
+    )
     shizuku_group = parser.add_mutually_exclusive_group()
     shizuku_group.add_argument(
         "--shizuku",
@@ -499,6 +509,7 @@ def main(
             backup_path=args.backup,
             recover=args.recover,
             skip_build=args.skip_build,
+            force=args.force,
             persistent_wireless_adb=args.persistent_wireless_adb,
             disable_adb_auth_timeout=args.disable_adb_auth_timeout,
             restore_adb_auth_timeout=args.restore_adb_auth_timeout,

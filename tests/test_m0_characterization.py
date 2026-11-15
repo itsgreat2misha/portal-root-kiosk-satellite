@@ -190,6 +190,7 @@ class CliDefaultsTest(unittest.TestCase):
                 "audio": True,
                 "restore_audio": False,
                 "skip_build": False,
+                "force": False,
                 "shizuku": False,
                 "remove_shizuku": False,
                 "shizuku_apk": None,
@@ -534,6 +535,7 @@ class MainConfigMappingTest(unittest.TestCase):
                 "backup_path": pathlib.Path("/tmp/backup.tar.gz"),
                 "recover": False,
                 "skip_build": True,
+                "force": False,
                 "persistent_wireless_adb": True,
                 # Implied by --persistent-wireless-adb in parse_args.
                 "disable_adb_auth_timeout": True,
