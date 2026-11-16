@@ -369,6 +369,18 @@ MobileConfig override setting `firmware_ota_update_enable=false`. Shared update
 infrastructure remains installed, but the native OTA daemon stays idle and
 does not discover or install firmware.
 
+On Portal+ (Aloha), the native OTA daemon reads MobileConfig through a
+backend selected by a system property, and with the stock selection it
+never reads the local override at all. On Aloha, `--disable-updates`
+therefore also pins the platform backend inside the override and, in a
+separate phase running under the system identity, sets
+`persist.sys.mobileconfigutil.usePlatformMobileConfig=true`. The
+property's original value is saved before it is changed, and
+`--enable-updates` restores it. Verification on Aloha requires the
+backend property to be set and the gate to be observed being read from
+the override; if that cannot be positively established, the run records
+the OTA block as unverified instead of reporting success.
+
 The provisioner verifies the disabled packages and requires Meta's own service
 to report the value from the local override on two boots. It refuses to replace
 an unrelated existing override. The original file state is recorded under
