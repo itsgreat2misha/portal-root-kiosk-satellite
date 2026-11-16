@@ -349,6 +349,9 @@ class PortalProvisioner:
             stage_autoroot_payload=(
                 lambda *a, **k: self.stage_autoroot_payload(*a, **k)
             ),
+            stage_simpleperf=(
+                lambda *a, **k: self.stage_simpleperf(*a, **k)
+            ),
             presence_fps_action_requested=(
                 lambda: self.presence_fps_action_requested()
             ),
@@ -1169,11 +1172,8 @@ class PortalProvisioner:
             return "enable-updates"
         if self.restore_camera_light:
             return "restore-camera-light"
-        if self.autoroot and self.adb_run(
-            ["shell", "test", "-f", "/data/local/tmp/portal-simpleperf"],
-            timeout=5,
-        ).returncode != 0:
-            return "simpleperf-missing"
+        # A missing staged simpleperf is not a blocker: autoroot
+        # staging pushes it on demand.
         return None
 
     def _apply_via_channel(self, reason: str) -> bool:
@@ -1189,7 +1189,9 @@ class PortalProvisioner:
         print(f"PROVISION_CHANNEL_ENGAGED reason={reason}", flush=True)
         try:
             if self.privileged_requested() and not self.skip_build:
-                android_build_environment(self.target)
+                android_build_environment(
+                    self.target, require_simpleperf=self.autoroot
+                )
             if self.shizuku:
                 self.resolve_shizuku_apk()
             self.write_state("pending")
@@ -2862,6 +2864,70 @@ class PortalProvisioner:
         fields = result.stdout.split()
         return not fields or fields[0].lower() != local_hash
 
+    def resolve_ndk_simpleperf(self) -> pathlib.Path:
+        """Locate the NDK's arm64 simpleperf on the host.
+
+        The candidate search KASLR discovery has always used: NDK
+        roots from the environment first, then NDKs installed under
+        the SDK roots and the default SDK locations.
+        """
+        roots = []
+        for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
+            value = os.environ.get(name)
+            if value:
+                roots.append(pathlib.Path(value))
+        for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+            value = os.environ.get(name)
+            if value:
+                roots.append(pathlib.Path(value) / "ndk")
+        roots.extend(
+            (
+                pathlib.Path.home() / "android-sdk/ndk",
+                pathlib.Path.home() / "Android/Sdk/ndk",
+            )
+        )
+        candidates: list[pathlib.Path] = []
+        for root in roots:
+            if (root / "simpleperf/bin/android/arm64/simpleperf").is_file():
+                candidates.append(root / "simpleperf/bin/android/arm64/simpleperf")
+            if root.is_dir():
+                candidates.extend(
+                    sorted(
+                        root.glob("*/simpleperf/bin/android/arm64/simpleperf"),
+                        reverse=True,
+                    )
+                )
+        local_simpleperf = next(
+            (candidate for candidate in candidates if candidate.is_file()),
+            None,
+        )
+        if local_simpleperf is None:
+            raise ProvisionError(
+                "this target needs the Android NDK arm64 simpleperf binary; "
+                "set ANDROID_NDK_HOME to the installed NDK directory"
+            )
+        return local_simpleperf
+
+    def stage_simpleperf(self) -> None:
+        """Push the NDK arm64 simpleperf to its staging path unless
+        the on-device copy already hashes identically."""
+        local_simpleperf = self.resolve_ndk_simpleperf()
+        remote = "/data/local/tmp/portal-simpleperf"
+        if self.simpleperf_push_needed(local_simpleperf, remote):
+            self.adb_run(
+                ["push", str(local_simpleperf), remote],
+                timeout=120,
+                check=True,
+            )
+            self.adb_run(
+                ["shell", "chmod", "0755", remote], timeout=20, check=True
+            )
+        else:
+            print(
+                "SIMPLEPERF_PUSH_SKIP reason=on-device-hash-matches",
+                flush=True,
+            )
+
     def kaslr_base(self, tag: str) -> int:
         if self.target is None:
             raise ProvisionError("target must be selected before KASLR discovery")
@@ -2874,56 +2940,8 @@ class PortalProvisioner:
         offsets = self.target.kaslr_pc_offsets
         simpleperf = "simpleperf"
         if self.target.bundled_simpleperf:
-            roots = []
-            for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
-                value = os.environ.get(name)
-                if value:
-                    roots.append(pathlib.Path(value))
-            for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
-                value = os.environ.get(name)
-                if value:
-                    roots.append(pathlib.Path(value) / "ndk")
-            roots.extend(
-                (
-                    pathlib.Path.home() / "android-sdk/ndk",
-                    pathlib.Path.home() / "Android/Sdk/ndk",
-                )
-            )
-            candidates: list[pathlib.Path] = []
-            for root in roots:
-                if (root / "simpleperf/bin/android/arm64/simpleperf").is_file():
-                    candidates.append(root / "simpleperf/bin/android/arm64/simpleperf")
-                if root.is_dir():
-                    candidates.extend(
-                        sorted(
-                            root.glob("*/simpleperf/bin/android/arm64/simpleperf"),
-                            reverse=True,
-                        )
-                    )
-            local_simpleperf = next(
-                (candidate for candidate in candidates if candidate.is_file()),
-                None,
-            )
-            if local_simpleperf is None:
-                raise ProvisionError(
-                    "this target needs the Android NDK arm64 simpleperf binary; "
-                    "set ANDROID_NDK_HOME to the installed NDK directory"
-                )
+            self.stage_simpleperf()
             simpleperf = "/data/local/tmp/portal-simpleperf"
-            if self.simpleperf_push_needed(local_simpleperf, simpleperf):
-                self.adb_run(
-                    ["push", str(local_simpleperf), simpleperf],
-                    timeout=120,
-                    check=True,
-                )
-                self.adb_run(
-                    ["shell", "chmod", "0755", simpleperf], timeout=20, check=True
-                )
-            else:
-                print(
-                    "SIMPLEPERF_PUSH_SKIP reason=on-device-hash-matches",
-                    flush=True,
-                )
         for sample_try in range(3):
             remote = f"/data/local/tmp/portal-perf-{tag}-{sample_try}.data"
             command = (
@@ -4747,7 +4765,9 @@ class PortalProvisioner:
                 )
                 return
         if self.privileged_requested() and not self.skip_build:
-            android_build_environment(self.target)
+            android_build_environment(
+                self.target, require_simpleperf=self.autoroot
+            )
         # Resolve host-side downloads before any exploit bootstrap can reboot the
         # Portal. This turns a missing host network connection into an immediate,
         # actionable error instead of a late failure after several phases.
@@ -5443,6 +5463,8 @@ class PortalProvisioner:
 
 def android_build_environment(
     target: PortalTarget | None = None,
+    *,
+    require_simpleperf: bool = False,
 ) -> dict[str, str]:
     """Resolve and validate the per-user Android toolchain."""
     environment = dict(os.environ)
@@ -5507,7 +5529,7 @@ def android_build_environment(
         "Android Build Tools zipalign": build_tools / "zipalign",
         "Android Build Tools d8": d8,
     }
-    if target and target.bundled_simpleperf:
+    if target and (target.bundled_simpleperf or require_simpleperf):
         required_paths["Android NDK arm64 simpleperf"] = (
             ndk / "simpleperf/bin/android/arm64/simpleperf"
         )
@@ -5561,7 +5583,9 @@ def build(
 ) -> None:
     if target is None:
         raise ProvisionError("target must be selected before building")
-    environment = android_build_environment(target)
+    environment = android_build_environment(
+        target, require_simpleperf=build_autoroot
+    )
     commands = [
         ["make", "-C", str(ROOT / "exploit"), "-j2", target.make_target]
     ]

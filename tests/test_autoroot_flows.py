@@ -429,6 +429,109 @@ class AutorootStagingTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
         return provisioner
 
+    def run_staging_simpleperf(self, provisioner, present, stage):
+        """run_staging variant whose fake device tracks the staged
+        simpleperf file; the stage double decides whether the
+        on-demand push lands it."""
+        state = {"present": present}
+        pushes: dict[str, str] = {}
+
+        def adb_run(args, timeout=None, check=False):
+            if args[:3] == ["shell", "pm", "path"]:
+                return subprocess.CompletedProcess(
+                    args, 0, "package:/data/app/~~s/base.apk\n", ""
+                )
+            if args[:3] == ["shell", "test", "-f"]:
+                if args[3] == "/data/local/tmp/portal-simpleperf":
+                    return subprocess.CompletedProcess(
+                        args, 0 if state["present"] else 1, "", ""
+                    )
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args and args[0] == "push":
+                local_path = pathlib.Path(args[1])
+                pushes[args[2]] = (
+                    local_path.read_text(encoding="utf-8")
+                    if local_path.is_file()
+                    else ""
+                )
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args and args[0] == "uninstall":
+                return subprocess.CompletedProcess(args, 0, "Success\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def land_simpleperf(*args, **kwargs):
+            state["present"] = True
+
+        if stage == "land":
+            stage_double = mock.Mock(side_effect=land_simpleperf)
+        elif stage == "fail":
+            stage_double = mock.Mock(
+                side_effect=ProvisionError(
+                    "this target needs the Android NDK arm64 simpleperf "
+                    "binary; set ANDROID_NDK_HOME to the installed NDK "
+                    "directory"
+                )
+            )
+        else:
+            stage_double = mock.Mock()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+            mock.patch.object(provisioner, "stage_simpleperf", stage_double),
+            mock.patch.object(provisioner, "install_apk_preserving_verifier"),
+            mock.patch.object(provisioner, "settle_package_state"),
+            mock.patch.object(
+                provisioner,
+                "package_sets",
+                return_value=({SHIZUKU_HELPER_PACKAGE}, set()),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            provisioner.stage_autoroot_payload()
+        return pushes, stdout.getvalue(), stage_double
+
+    def test_staging_skips_simpleperf_push_when_already_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            _pushes, output, stage = self.run_staging_simpleperf(
+                provisioner, present=True, stage="land"
+            )
+        stage.assert_not_called()
+        self.assertIn("AUTOROOT_STAGED_OK", output)
+
+    def test_staging_pushes_simpleperf_on_demand_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            pushes, output, stage = self.run_staging_simpleperf(
+                provisioner, present=False, stage="land"
+            )
+        stage.assert_called_once_with()
+        self.assertIn("AUTOROOT_STAGED_OK", output)
+        conf = pushes["/data/local/tmp/portal-autoroot/autoroot.conf"]
+        self.assertIn("SIMPLEPERF=/data/local/tmp/portal-simpleperf\n", conf)
+
+    def test_staging_fails_when_on_demand_push_cannot_resolve(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            with self.assertRaisesRegex(
+                ProvisionError, "needs the Android NDK arm64 simpleperf"
+            ):
+                self.run_staging_simpleperf(
+                    provisioner, present=False, stage="fail"
+                )
+
+    def test_staging_fails_when_simpleperf_still_absent_after_push(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            with self.assertRaisesRegex(
+                ProvisionError, "staged simpleperf is absent"
+            ):
+                self.run_staging_simpleperf(
+                    provisioner, present=False, stage="noop"
+                )
+
     def test_credential_environment_is_refused(self) -> None:
         # Fail-closed: an environment carrying a live per-boot credential
         # identity (pid/uid) must never be frozen into the on-device

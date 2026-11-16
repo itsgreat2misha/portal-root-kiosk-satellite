@@ -292,9 +292,9 @@ class ChannelBlockerTest(unittest.TestCase):
             )
             provisioner.ota_preflight = lambda: True
             device.simpleperf = False
-            self.assertEqual(
-                provisioner._channel_blocker(state), "simpleperf-missing"
-            )
+            # A missing staged simpleperf no longer blocks the channel
+            # path: autoroot staging pushes it on demand.
+            self.assertIsNone(provisioner._channel_blocker(state))
             device.simpleperf = True
             device.port = ""
             self.assertEqual(
@@ -426,7 +426,7 @@ class ChannelApplyTest(unittest.TestCase):
             pp_module.android_build_environment,
             pp_module.build,
         )
-        pp_module.android_build_environment = lambda target: None
+        pp_module.android_build_environment = lambda target, **_kwargs: None
         pp_module.build = lambda **kwargs: calls.append("build")
         provisioner.resolve_shizuku_apk = lambda: pathlib.Path("s.apk")
         for name in (
