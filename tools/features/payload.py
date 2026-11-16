@@ -88,6 +88,7 @@ class PayloadFeature:
         compile_camera_light_host_speed: Callable[..., None],
         start_shizuku_as_root: Callable[..., None],
         stage_autoroot_payload: Callable[..., None],
+        stage_simpleperf: Callable[..., None],
         presence_fps_action_requested: Callable[[], bool],
         stop_root_daemon: Callable[..., None],
         autoroot_helper_local: Callable[[], pathlib.Path],
@@ -107,6 +108,7 @@ class PayloadFeature:
         self._compile_camera_light_host_speed = compile_camera_light_host_speed
         self._start_shizuku_as_root = start_shizuku_as_root
         self._stage_autoroot_payload = stage_autoroot_payload
+        self._stage_simpleperf = stage_simpleperf
         self._presence_fps_action_requested = presence_fps_action_requested
         self._stop_root_daemon = stop_root_daemon
         self._autoroot_helper_local = autoroot_helper_local
@@ -482,10 +484,20 @@ class PayloadFeature:
         if self._adb_run(
             ["shell", "test", "-f", simpleperf_remote], timeout=5
         ).returncode != 0:
-            raise ProvisionError(
-                "staged simpleperf is absent; KASLR discovery for this "
-                "target pushes it during the custom-payload attempts"
-            )
+            # Discovery stages this binary only for bundled targets;
+            # every other target arrives here with the file absent.
+            # Push it on demand — the same resolve + hash check
+            # discovery uses — rather than refusing to stage, then
+            # re-test so a push that produced nothing still fails
+            # with the absence error instead of proceeding.
+            self._stage_simpleperf()
+            if self._adb_run(
+                ["shell", "test", "-f", simpleperf_remote], timeout=5
+            ).returncode != 0:
+                raise ProvisionError(
+                    "staged simpleperf is absent; KASLR discovery for this "
+                    "target pushes it during the custom-payload attempts"
+                )
         self._install_apk_preserving_verifier(
             self._autoroot_helper_local(), "autoroot-helper", AUTOROOT_HELPER_PACKAGE
         )

@@ -492,6 +492,55 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
         self.assertEqual(environment["NDK"], str(ndk))
         self.assertEqual(environment["BUILD_TOOLS"], str(build_tools))
 
+    def test_simpleperf_required_for_autoroot_on_non_bundled_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = pathlib.Path(temporary) / "sdk"
+            ndk = sdk / "ndk" / "28.2.13676358"
+            toolchain = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+            build_tools = sdk / "build-tools" / "37.0.0"
+            platform = sdk / "platforms" / "android-36"
+            for path in (
+                toolchain / "aarch64-linux-android29-clang",
+                toolchain / "armv7a-linux-androideabi28-clang",
+                toolchain / "armv7a-linux-androideabi29-clang",
+                build_tools / "aapt",
+                build_tools / "apksigner",
+                build_tools / "zipalign",
+                build_tools / "d8",
+                platform / "android.jar",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            target = next(
+                entry
+                for entry in TARGETS
+                if entry.key == "portal-10-omni-3051355900018050"
+            )
+            self.assertFalse(target.bundled_simpleperf)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ANDROID_SDK_ROOT": str(sdk)},
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+            ):
+                # Without autoroot the NDK simpleperf is not required
+                # for a non-bundled target; with autoroot it is, so a
+                # missing binary fails here instead of mid-staging.
+                android_build_environment(target)
+                with self.assertRaisesRegex(
+                    ProvisionError, "Android NDK arm64 simpleperf"
+                ):
+                    android_build_environment(target, require_simpleperf=True)
+                simpleperf = ndk / "simpleperf/bin/android/arm64/simpleperf"
+                simpleperf.parent.mkdir(parents=True, exist_ok=True)
+                simpleperf.touch()
+                android_build_environment(target, require_simpleperf=True)
+
     def test_missing_sdk_fails_with_configuration_help(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             sdk = pathlib.Path(temporary) / "missing-sdk"
