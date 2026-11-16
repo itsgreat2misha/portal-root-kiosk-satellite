@@ -403,3 +403,16 @@ def find_target(
         ),
         None,
     )
+
+
+def find_sibling_target(device: str) -> PortalTarget | None:
+    """First target for a device codename, regardless of build.
+
+    Diagnostics for an unsupported build use the nearest sibling
+    target's preload for the write-free page-prep diagnostic; the
+    exact-build lookup above remains the only gate for provisioning.
+    """
+    return next(
+        (target for target in TARGETS if target.device == device),
+        None,
+    )

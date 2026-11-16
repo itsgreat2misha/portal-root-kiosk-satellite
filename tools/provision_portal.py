@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import contextlib
 import datetime as dt
@@ -27,6 +28,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from typing import Callable
 
 if sys.version_info < (3, 9):
     raise SystemExit(
@@ -39,7 +41,7 @@ from meta_debloat_components import (
     DEBLOAT_COMPONENTS,
     DEBLOAT_COMPONENT_NAMES,
 )
-from portal_targets import PortalTarget, find_target
+from portal_targets import PortalTarget, find_sibling_target, find_target
 from device_session import DeviceSession, ProvisionError, run_command
 from run_state import STATE_REMOTE, RunState
 from cli import CliConfig, main as _cli_main, parse_args as _cli_parse_args
@@ -154,6 +156,7 @@ PROVISIONER_BANNER = rf"""
 HELPER_LOCAL = ROOT / "helper/build/libportal_audio_persist.so"
 HELPER_JAVA_LOCAL = ROOT / "helper/build/libportal_audio_persist_java.so"
 PRELOAD_REMOTE = "/data/local/tmp/preload-portal.so"
+DIAGNOSTICS_PRELOAD_REMOTE = "/data/local/tmp/portal-diagnostics-preload.so"
 DEFAULT_CUSTOM_PAYLOAD_LOCAL = ROOT / "root-daemon" / "portal-root-daemon"
 CUSTOM_PAYLOAD_REMOTE = "/data/local/tmp/portal-root-daemon"
 HELPER_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
@@ -234,6 +237,7 @@ class PortalProvisioner:
         verify_boots: int = 1,
         status_only: bool = False,
         dry_run: bool = False,
+        collect_diagnostics: bool = False,
         backup_path: pathlib.Path | None = None,
         recover: bool = False,
         skip_build: bool = False,
@@ -474,6 +478,7 @@ class PortalProvisioner:
         self.package_verifier_before_install_disabled: bool | None = None
         self.status_only = status_only
         self.dry_run = dry_run
+        self.collect_diagnostics = collect_diagnostics
         self.backup_path = backup_path
         self.recover = recover
         self.skip_build = skip_build
@@ -2265,6 +2270,330 @@ class PortalProvisioner:
         print(f"BACKUP_OK path={destination}")
         return destination
 
+    def collect_diagnostics_bundle(self) -> pathlib.Path:
+        """Collect a read-only diagnostics bundle for any build.
+
+        Lets a firmware build the target table does not support yet
+        be evaluated without the device: identity props, the
+        bugreport archive, the nearest sibling target's write-free
+        page-prep diagnostic, and best-effort kernel config/kallsyms.
+        Nothing is staged, installed, or rebooted; the one device-side
+        file (the diagnostic preload in /data/local/tmp) is removed
+        again before returning.
+        """
+        items: dict[str, dict[str, str]] = {}
+
+        def record(name: str, status: str, detail: str = "") -> None:
+            items[name] = {"status": status, "detail": detail}
+
+        def prop(name: str) -> str:
+            return self.adb_run(
+                ["shell", "getprop", name], timeout=10, check=True
+            ).stdout.strip()
+
+        fingerprint = prop("ro.build.fingerprint")
+        device = prop("ro.product.device")
+        product_model = prop("ro.product.model")
+        sibling = self.target or find_sibling_target(device)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        bundle_path = self.log_dir / f"portal-diagnostics-{stamp}.zip"
+        with tempfile.TemporaryDirectory(
+            prefix="portal-diagnostics-"
+        ) as temporary:
+            root = pathlib.Path(temporary) / "portal-diagnostics"
+            root.mkdir()
+
+            def capture(
+                name: str,
+                filename: str,
+                arguments: list[str],
+                timeout: int = 30,
+            ) -> None:
+                try:
+                    result = self.adb_run(
+                        arguments, timeout=timeout, check=True
+                    )
+                except (ProvisionError, OSError) as exc:
+                    record(name, "failed", str(exc)[:200])
+                    return
+                (root / filename).write_text(
+                    result.stdout, errors="replace"
+                )
+                record(name, "collected")
+
+            capture("getprop", "getprop.txt", ["shell", "getprop"])
+            capture("uname", "uname.txt", ["shell", "uname", "-a"])
+            capture(
+                "proc_version",
+                "proc-version.txt",
+                ["shell", "cat", "/proc/version"],
+            )
+            capture("nproc", "nproc.txt", ["shell", "nproc"])
+            capture(
+                "cpuinfo",
+                "cpuinfo.txt",
+                ["shell", "head", "-n", "100", "/proc/cpuinfo"],
+            )
+            # MobileConfig backend selection is per-family (the
+            # aloha OTA override defect was a legacy backend being
+            # selected); recording the selector property and the
+            # MobileConfig package/service inventory lets families
+            # we do not own be classified from a tester's bundle.
+            try:
+                backend = prop(
+                    "persist.sys.mobileconfigutil.usePlatformMobileConfig"
+                )
+            except (ProvisionError, OSError) as exc:
+                record("mobileconfig_backend", "failed", str(exc)[:200])
+            else:
+                (root / "mobileconfig-backend.txt").write_text(
+                    backend + "\n"
+                )
+                record(
+                    "mobileconfig_backend",
+                    "collected",
+                    "usePlatformMobileConfig="
+                    + (backend or "(unset)"),
+                )
+            for name, filename, arguments in (
+                (
+                    "mobileconfig_packages",
+                    "mobileconfig-packages.txt",
+                    ["shell", "pm", "list", "packages"],
+                ),
+                (
+                    "mobileconfig_services",
+                    "mobileconfig-services.txt",
+                    ["shell", "dumpsys", "activity", "services"],
+                ),
+            ):
+                try:
+                    result = self.adb_run(
+                        arguments, timeout=30, check=True
+                    )
+                except (ProvisionError, OSError) as exc:
+                    record(name, "failed", str(exc)[:200])
+                    continue
+                lines = [
+                    line
+                    for line in result.stdout.splitlines()
+                    if "mobileconfig" in line.lower()
+                ]
+                (root / filename).write_text(
+                    "\n".join(lines) + ("\n" if lines else ""),
+                    errors="replace",
+                )
+                record(name, "collected", f"{len(lines)} matching lines")
+            try:
+                self.bugreport_text(
+                    "diagnostics", archive_sink=root / "bugreport.zip"
+                )
+                record("bugreport", "collected")
+            except (ProvisionError, OSError, zipfile.BadZipFile) as exc:
+                record("bugreport", "failed", str(exc)[:200])
+            self._diagnostics_page_prep(root, sibling, record)
+            self._diagnostics_kernel_files(root, record)
+            manifest = {
+                "schema": 1,
+                "kind": "portal-diagnostics",
+                "tool_version": PROVISIONER_VERSION,
+                "tool_revision": self.tool_revision(),
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "serial": self.serial,
+                "model": product_model,
+                "device": device,
+                "fingerprint": fingerprint,
+                "supported_target": (
+                    self.target.key if self.target else None
+                ),
+                "sibling_target": sibling.key if sibling else None,
+                "items": items,
+            }
+            (root / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(
+                bundle_path, "w", zipfile.ZIP_DEFLATED
+            ) as archive:
+                for path in sorted(root.rglob("*")):
+                    if path.is_file():
+                        archive.write(
+                            path, arcname=path.relative_to(root)
+                        )
+        bundle_path.chmod(0o600)
+        print(f"DIAGNOSTICS_OK bundle={bundle_path}", flush=True)
+        print(
+            "DIAGNOSTICS_SUMMARY "
+            f"model={product_model} device={device} "
+            f"fingerprint={fingerprint} "
+            f"supported={'yes' if self.target else 'no'}",
+            flush=True,
+        )
+        for name in sorted(items):
+            detail = items[name]["detail"]
+            suffix = f" ({detail})" if detail else ""
+            print(
+                f"DIAGNOSTICS_ITEM {name}={items[name]['status']}{suffix}",
+                flush=True,
+            )
+        print(
+            "Attach this bundle to a firmware-support issue for this "
+            "build so support can be evaluated without the device.",
+            flush=True,
+        )
+        print(
+            "Privacy note: the bundled bugreport can contain the "
+            "device serial and usage metadata; review it or share it "
+            "privately before posting it publicly.",
+            flush=True,
+        )
+        return bundle_path
+
+    def _diagnostics_page_prep(
+        self,
+        root: pathlib.Path,
+        sibling: PortalTarget | None,
+        record: Callable[[str, str, str], None],
+    ) -> None:
+        """Run the sibling preload's page-prep diagnostic, write-free.
+
+        This is the same GHOSTLOCK_DIAG_PAGE_PREP_ONLY run memstart()
+        uses on allocator-strategy targets; its KernelSnitch
+        mm_struct leak result is the most decision-relevant signal
+        for an unsupported build. The pushed preload is removed from
+        /data/local/tmp again before returning.
+        """
+        if sibling is None:
+            record(
+                "page_prep_diag",
+                "skipped",
+                "no target for this device codename",
+            )
+            return
+        preload = sibling.preload_path(ROOT)
+        if not preload.is_file():
+            record(
+                "page_prep_diag",
+                "skipped",
+                f"sibling preload {preload.name} is not built "
+                "on this host",
+            )
+            return
+        command = (
+            "env GHOSTLOCK_VOLATILE_LOG=1 "
+            "GHOSTLOCK_DIAG_PAGE_PREP_ONLY=1 "
+            "GHOSTLOCK_PAGE_COLLISIONS=5 "
+            "GHOSTLOCK_LOG_P0_CANDIDATES=1 "
+            f"LD_PRELOAD={shlex.quote(DIAGNOSTICS_PRELOAD_REMOTE)} "
+            "/system/bin/true"
+        )
+        try:
+            self.adb_run(
+                ["push", str(preload), DIAGNOSTICS_PRELOAD_REMOTE],
+                timeout=60,
+                check=True,
+            )
+            result = self.adb_run(["shell", command], timeout=120)
+        except (ProvisionError, OSError) as exc:
+            record("page_prep_diag", "failed", str(exc)[:200])
+            return
+        finally:
+            try:
+                self.adb_run(
+                    ["shell", "rm", "-f", DIAGNOSTICS_PRELOAD_REMOTE],
+                    timeout=20,
+                )
+            except (ProvisionError, OSError):
+                pass
+        output = result.stdout + result.stderr
+        (root / "page-prep-diag.txt").write_text(output, errors="replace")
+        if "KernelSnitch mm_struct leak failed" in output:
+            detail = "KernelSnitch mm_struct leak FAILED"
+        else:
+            leak_line = next(
+                (
+                    line.strip()
+                    for line in output.splitlines()
+                    if "mm_struct" in line
+                ),
+                "",
+            )
+            detail = leak_line[:200] or "no mm_struct line in output"
+        record("page_prep_diag", "collected", detail)
+
+    def _diagnostics_kernel_files(
+        self,
+        root: pathlib.Path,
+        record: Callable[[str, str, str], None],
+    ) -> None:
+        """Best-effort /proc/config.gz and /proc/kallsyms capture.
+
+        Both are expected to fail or come back zeroed at shell
+        privilege on production builds; the attempt and its outcome
+        are recorded either way and never fail the bundle.
+        """
+        try:
+            result = self.adb_run(
+                ["shell", "base64", "/proc/config.gz"], timeout=30
+            )
+            encoded = "".join(result.stdout.split())
+            data = (
+                base64.b64decode(encoded, validate=True) if encoded else b""
+            )
+        except (ProvisionError, OSError, ValueError) as exc:
+            record(
+                "proc_config_gz",
+                "attempted",
+                f"unavailable: {str(exc)[:160]}",
+            )
+        else:
+            if result.returncode == 0 and data:
+                (root / "proc-config.gz").write_bytes(data)
+                record(
+                    "proc_config_gz", "collected", f"{len(data)} bytes"
+                )
+            else:
+                record(
+                    "proc_config_gz",
+                    "attempted",
+                    "not readable at shell privilege",
+                )
+        try:
+            result = self.adb_run(
+                ["shell", "head", "-c", "65536", "/proc/kallsyms"],
+                timeout=30,
+            )
+        except (ProvisionError, OSError) as exc:
+            record(
+                "proc_kallsyms",
+                "attempted",
+                f"unavailable: {str(exc)[:160]}",
+            )
+        else:
+            text = result.stdout
+            if text.strip():
+                (root / "proc-kallsyms.txt").write_text(
+                    text, errors="replace"
+                )
+                zeroed = all(
+                    line.startswith("0000000000000000") or not line.strip()
+                    for line in text.splitlines()
+                )
+                record(
+                    "proc_kallsyms",
+                    "collected",
+                    "addresses zeroed (kptr_restrict)"
+                    if zeroed
+                    else f"{len(text)} bytes",
+                )
+            else:
+                record(
+                    "proc_kallsyms",
+                    "attempted",
+                    "empty at shell privilege",
+                )
+
     def backup_private_dns(self) -> None:
         return self.settings_feature.backup_private_dns()
 
@@ -3026,7 +3355,9 @@ class PortalProvisioner:
             0x80000000 - (virtual_start - 0xFFFFFFC000000000)
         ) & 0xFFFFFFFFFFFFFFFF
 
-    def bugreport_text(self, tag: str) -> str:
+    def bugreport_text(
+        self, tag: str, archive_sink: pathlib.Path | None = None
+    ) -> str:
         cached = self._bugreport_cache.get(tag)
         if cached is not None:
             return cached
@@ -3098,6 +3429,11 @@ class PortalProvisioner:
                     )
                     time.sleep(30)
                     self.connect(wait_seconds=600)
+            if archive_sink is not None:
+                # Diagnostics bundles ship the archive itself, not
+                # only the parsed text; copy it out before the
+                # temporary directory is discarded.
+                shutil.copyfile(local, archive_sink)
             self.adb_run(["shell", "rm", "-f", remote], timeout=20)
         if recovered_archive:
             print("BUGREPORT_ARCHIVE_OK source=finalized-begin", flush=True)
@@ -3638,6 +3974,7 @@ class PortalProvisioner:
             "held child CFI complete ok=0",
             "prepare_kernel_page did not find usable nonzero source pointers",
             "proc_uid lock waiter setup failed",
+            "KernelSnitch mm_struct leak failed",
         )
         expected_markers: dict[str, tuple[str, bool]] = {}
         if self.custom_payload is not None:
@@ -3820,14 +4157,21 @@ class PortalProvisioner:
             deadline = time.monotonic() + self.target.exploit_timeout_seconds
             post_root_deadline_extended = False
             pending_output = ""
+            # How the read loop ended, for INSTALL_ATTEMPT_EXIT: an
+            # attempt that dies silently is only diagnosable if the
+            # log says whether output ended by EOF, by the process
+            # exiting, by a marker, or by the deadline expiring.
+            attempt_end = "deadline"
             while time.monotonic() < deadline:
                 ready, _, _ = select.select([process.stdout], [], [], 1)
                 if not ready:
                     if process.poll() is not None:
+                        attempt_end = "process-exit"
                         break
                     continue
                 chunk = os.read(process.stdout.fileno(), 4096)
                 if not chunk:
+                    attempt_end = "eof"
                     break
                 text = chunk.decode("utf-8", errors="replace")
                 sys.stdout.write(text)
@@ -3892,6 +4236,9 @@ class PortalProvisioner:
                         failed = True
                         break
                 if success or failed:
+                    attempt_end = (
+                        "success-marker" if success else "failure-marker"
+                    )
                     break
 
             if (
@@ -3948,6 +4295,13 @@ class PortalProvisioner:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+            exit_line = (
+                f"INSTALL_ATTEMPT_EXIT attempt={attempt} "
+                f"returncode={process.returncode} end={attempt_end}"
+            )
+            print(exit_line, flush=True)
+            output.write(exit_line + "\n")
+            output.flush()
         return success
 
     def apply_custom_payload(self) -> None:
@@ -4720,6 +5074,13 @@ class PortalProvisioner:
             self.print_status()
             if self.backup_path:
                 self.create_backup_bundle(self.backup_path)
+            return
+        if self.collect_diagnostics:
+            # Read-only path that works on any build, supported or
+            # not: verify_target only reports here, nothing is staged
+            # or rebooted, so the autoroot guard does not engage.
+            self.verify_target(require_supported=False)
+            self.collect_diagnostics_bundle()
             return
         self._engage_autoroot_guard()
         try:
