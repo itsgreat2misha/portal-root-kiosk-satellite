@@ -37,6 +37,21 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
 SHIZUKU_HELPER_PACKAGE = "dev.portal.shizukuhelper"
+# Packages this project builds and signs itself whose installed copy can
+# predate the current build host's keystore (a device provisioned by an
+# older build). Android refuses signature-changing updates, so for these
+# — and only these — install_apk_preserving_verifier replaces a stale
+# copy on INSTALL_FAILED_UPDATE_INCOMPATIBLE instead of failing. The
+# sentinel and autoroot-helper names are pinned to features.payload's
+# constants by a test. The Shizuku app itself is a third-party package
+# and is never replaced.
+SIGNATURE_MISMATCH_RETRY_PACKAGES = frozenset(
+    {
+        SHIZUKU_HELPER_PACKAGE,
+        "dev.portal.exploitsentinel",
+        "dev.portal.autoroothelper",
+    }
+)
 SHIZUKU_HELPER_LOCAL = ROOT / "shizuku-helper/build/portal-shizuku-helper.apk"
 SHIZUKU_KEY_REMOTE = "/data/local/tmp/portal-shizuku-adbkey.pub"
 SHIZUKU_SAVED_KEY_REMOTE = "/data/local/tmp/portal-shizuku-adbkey-v1.pub"
@@ -323,16 +338,19 @@ class ShizukuFeature:
         result = self._adb_run(["shell", command], timeout=300)
         if result.returncode != 0 or "Success" not in result.stdout:
             if (
-                package == SHIZUKU_HELPER_PACKAGE
+                package in SIGNATURE_MISMATCH_RETRY_PACKAGES
                 and "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in result.stdout
             ):
-                # A helper installed by an older build host is signed with
+                # A copy installed by an older build host is signed with
                 # a different keystore, and Android refuses signature-
-                # changing updates, so the stale helper can never be
-                # updated in place. Replace it instead: no key
-                # authorization for the helper has happened yet at this
-                # point in a run (the install race later authorizes the
-                # installed helper's key), so uninstalling loses nothing.
+                # changing updates, so the stale copy can never be
+                # updated in place. Replace it instead: nothing
+                # irreplaceable is lost — no key authorization for the
+                # helper has happened yet at this point in a run (the
+                # install race later authorizes the installed helper's
+                # key), the sentinel is a marker app this step
+                # recreates, and the autoroot helper receives its
+                # staged files after install.
                 print(
                     f"APK_INSTALL_RETRY package={package} "
                     "reason=signature-mismatch action=uninstall-reinstall",
