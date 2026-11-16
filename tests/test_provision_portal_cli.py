@@ -27,6 +27,7 @@ from provision_portal import (  # noqa: E402
     AUTOROOT_HELPER_PACKAGE,
     EXPLOIT_SENTINEL_PACKAGE,
     PACKAGE_STATE_SETTLE_SECONDS,
+    PRESENCE_HELPER_PACKAGE,
     ADB_ENABLED_SETTING,
     DEFAULT_CUSTOM_PAYLOAD_LOCAL,
     MHA_AUDIO_VERIFIED_LOG,
@@ -1362,7 +1363,7 @@ class HelperSignatureMismatchInstallTest(unittest.TestCase):
 
 
 class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
-    """INSTALL_FAILED_UPDATE_INCOMPATIBLE fallback, sentinel + autoroot."""
+    """INSTALL_FAILED_UPDATE_INCOMPATIBLE fallback, own packages."""
 
     @staticmethod
     def _incompatible(package: str) -> str:
@@ -1473,6 +1474,23 @@ class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
         self.assertIn("APK_INSTALL_RETRY", stdout)
         self.assertIn("APK_INSTALL_OK", stdout)
 
+    def test_presence_helper_signature_mismatch_uninstalls_and_reinstalls(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, stdout, error = self._run_install(
+                temporary,
+                PRESENCE_HELPER_PACKAGE,
+                "presence-helper",
+                [self._incompatible(PRESENCE_HELPER_PACKAGE), "Success\n"],
+            )
+        self.assertIsNone(error)
+        self.assertEqual(calls["install"], 2)
+        self.assertEqual(calls["push"], 2)
+        self.assertEqual(calls["uninstall"], [PRESENCE_HELPER_PACKAGE])
+        self.assertIn("APK_INSTALL_RETRY", stdout)
+        self.assertIn("APK_INSTALL_OK", stdout)
+
     def test_retry_packages_are_exactly_the_own_persistent_packages(
         self,
     ) -> None:
@@ -1482,6 +1500,7 @@ class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
                 SHIZUKU_HELPER_PACKAGE,
                 EXPLOIT_SENTINEL_PACKAGE,
                 AUTOROOT_HELPER_PACKAGE,
+                PRESENCE_HELPER_PACKAGE,
             },
         )
 

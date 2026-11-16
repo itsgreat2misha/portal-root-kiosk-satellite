@@ -43,13 +43,15 @@ SHIZUKU_HELPER_PACKAGE = "dev.portal.shizukuhelper"
 # — and only these — install_apk_preserving_verifier replaces a stale
 # copy on INSTALL_FAILED_UPDATE_INCOMPATIBLE instead of failing. The
 # sentinel and autoroot-helper names are pinned to features.payload's
-# constants by a test. The Shizuku app itself is a third-party package
-# and is never replaced.
+# constants, and the presence-helper name to features.presence's, by a
+# test. The Shizuku app itself is a third-party package and is never
+# replaced.
 SIGNATURE_MISMATCH_RETRY_PACKAGES = frozenset(
     {
         SHIZUKU_HELPER_PACKAGE,
         "dev.portal.exploitsentinel",
         "dev.portal.autoroothelper",
+        "dev.portal.presencehelper",
     }
 )
 SHIZUKU_HELPER_LOCAL = ROOT / "shizuku-helper/build/portal-shizuku-helper.apk"
@@ -349,8 +351,10 @@ class ShizukuFeature:
                 # helper has happened yet at this point in a run (the
                 # install race later authorizes the installed helper's
                 # key), the sentinel is a marker app this step
-                # recreates, and the autoroot helper receives its
-                # staged files after install.
+                # recreates, the autoroot helper receives its
+                # staged files after install, and the presence helper's
+                # keypair and FPS config are staged by its own prepare
+                # and activate steps after install.
                 print(
                     f"APK_INSTALL_RETRY package={package} "
                     "reason=signature-mismatch action=uninstall-reinstall",
