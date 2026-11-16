@@ -93,7 +93,6 @@ from features.presence import (
 from features.audio import (
     MHA_AUDIO_VERIFIED_LOG,
     MHA_TUNING_BACKUP_REMOTE,
-    MHA_TUNING_DEVICE,
     MHA_TUNING_PATCHED_REMOTE,
     MHA_TUNING_STOCK_REMOTE,
     VOICE_AUDIO_VERIFIED_LOG,
@@ -3241,6 +3240,9 @@ class PortalProvisioner:
                 environment.update(
                     {
                         "GHOSTLOCK_MHA_TUNING_INSTALL": "1",
+                        "GHOSTLOCK_MHA_TUNING_PATH": (
+                            self.audio_feature.mha_tuning_device_path()
+                        ),
                         "GHOSTLOCK_MHA_TUNING_STOCK": MHA_TUNING_STOCK_REMOTE,
                         "GHOSTLOCK_MHA_TUNING_PATCHED": (
                             MHA_TUNING_PATCHED_REMOTE
@@ -3265,6 +3267,9 @@ class PortalProvisioner:
                 environment.update(
                     {
                         "GHOSTLOCK_MHA_TUNING_RESTORE": "1",
+                        "GHOSTLOCK_MHA_TUNING_PATH": (
+                            self.audio_feature.mha_tuning_device_path()
+                        ),
                         "GHOSTLOCK_MHA_TUNING_STOCK": MHA_TUNING_STOCK_REMOTE,
                         "GHOSTLOCK_MHA_TUNING_PATCHED": (
                             MHA_TUNING_PATCHED_REMOTE

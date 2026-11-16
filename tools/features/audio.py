@@ -32,7 +32,7 @@ AUDIO_INSTALLED_MARKER = "/data/local/tmp/portal-audio-backup/installed-v1"
 AUDIO_PERSIST_NATIVE_REMOTE = "/data/local/tmp/libportal_audio_persist.so"
 AUDIO_PERSIST_JAVA_REMOTE = "/data/local/tmp/portal-audio-ctl.jar"
 AISERVICE_PACKAGE = "com.facebook.portal.aiservice"
-MHA_TUNING_DEVICE = "/vendor/etc/audio/omni/mha_tuning_blobs.tub"
+MHA_TUNING_PATH_TEMPLATE = "/vendor/etc/audio/{board}/mha_tuning_blobs.tub"
 MHA_TUNING_STOCK_REMOTE = "/data/local/tmp/portal-mha-tuning-stock.tub"
 MHA_TUNING_PATCHED_REMOTE = "/data/local/tmp/portal-mha-tuning-disabled.tub"
 MHA_TUNING_BACKUP_REMOTE = (
@@ -42,6 +42,29 @@ MHA_TUNING_BACKUP_REMOTE = (
 AdbRun = Callable[..., "subprocess.CompletedProcess[str]"]
 PullFile = Callable[[str, pathlib.Path], bytes]
 LogcatPoll = Callable[..., str]
+
+
+def mha_tuning_path_for_board(board: str) -> str:
+    """On-device MHA tuning blob path for a board (ro.boot.hardware).
+
+    The audio stack keeps one tuning blob per board under
+    /vendor/etc/audio/<board>/ and loads only that board's copy, so
+    the provisioner must act on the file the device's own board
+    reads. The board name becomes a single path component; anything
+    that is not a plain component is refused rather than forming a
+    path outside the per-board directory.
+    """
+    if (
+        not board
+        or board != board.strip()
+        or "/" in board
+        or board in (".", "..")
+    ):
+        raise ProvisionError(
+            f"unexpected ro.boot.hardware value {board!r}; "
+            "refusing to form an MHA tuning path"
+        )
+    return MHA_TUNING_PATH_TEMPLATE.format(board=board)
 
 
 def audio_processing_disabled_observed(
@@ -80,6 +103,7 @@ class AudioFeature:
         self._log_dir = log_dir
         self._target = target
         self._restore_audio = restore_audio
+        self._mha_tuning_device_path: str | None = None
 
     @staticmethod
     def audio_processing_disabled_observed(
@@ -87,13 +111,31 @@ class AudioFeature:
     ) -> bool:
         return audio_processing_disabled_observed(logs, target)
 
+    def mha_tuning_device_path(self) -> str:
+        """This device's board-resolved MHA tuning blob path.
+
+        Resolved once from ro.boot.hardware and cached. The payload
+        receives the same path through GHOSTLOCK_MHA_TUNING_PATH, so
+        the host pull/prepare/hash-gate and the on-device replace
+        always act on the same file.
+        """
+        if self._mha_tuning_device_path is None:
+            board = self._adb_run(
+                ["shell", "getprop", "ro.boot.hardware"],
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+            self._mha_tuning_device_path = mha_tuning_path_for_board(board)
+        return self._mha_tuning_device_path
+
     def prepare_mha_tuning_payloads(
         self,
     ) -> tuple[pathlib.Path, pathlib.Path]:
         current_path = self._log_dir / "mha_tuning_blobs.device.tub"
         stock_path = self._log_dir / "mha_tuning_blobs.stock.tub"
         patched_path = self._log_dir / "mha_tuning_blobs.disabled.tub"
-        current = self._pull_file(MHA_TUNING_DEVICE, current_path)
+        device_path = self.mha_tuning_device_path()
+        current = self._pull_file(device_path, current_path)
         current_hash = sha256(current)
 
         if current_hash == OMNI_STOCK_SHA256:
@@ -117,6 +159,7 @@ class AudioFeature:
         patched_path.write_bytes(patched)
         print(
             "MHA_TUNING_PREPARED "
+            f"path={device_path} "
             f"current={current_hash} stock={OMNI_STOCK_SHA256} "
             f"patched={patched_hash} parameters={len(changes)} "
             f"action={'restore' if self._restore_audio() else 'disable'}",
