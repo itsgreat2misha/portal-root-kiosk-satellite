@@ -28,6 +28,8 @@ from provision_portal import (  # noqa: E402
     EXPLOIT_SENTINEL_PACKAGE,
     OTA_BACKEND_BACKUP_REMOTE,
     OTA_BACKEND_PROPERTY,
+    OTA_JSON_URL,
+    OTA_POLL_INTERVAL_MINUTES,
     PACKAGE_STATE_SETTLE_SECONDS,
     PRESENCE_HELPER_PACKAGE,
     ADB_ENABLED_SETTING,
@@ -41,6 +43,7 @@ from provision_portal import (  # noqa: E402
     android_build_environment,
     build,
     parse_args,
+    parse_ota_config,
 )
 from meta_debloat_components import (  # noqa: E402
     DEBLOAT_COMPONENT_NAMES,
@@ -1734,6 +1737,7 @@ class OtaPlatformBackendTest(unittest.TestCase):
         gate_false: bool = False,
         backend: str | None = None,
         provenance: bool = False,
+        polling_off: bool = True,
     ):
         def adb_run(
             arguments: list[str],
@@ -1753,9 +1757,26 @@ class OtaPlatformBackendTest(unittest.TestCase):
                 "facebook.aloha.otaservice",
             ]:
                 output = (
-                    "getBool(kFirmwareOtaUpdateEnable): false\n"
-                    if gate_false
-                    else "getBool(kFirmwareOtaUpdateEnable): true\n"
+                    "Dump OtaConfig\n"
+                    "    getString(kOtaJsonUrl): "
+                    + (
+                        OTA_JSON_URL
+                        if polling_off
+                        else "https://graph.facebook.com/"
+                        "mobile_release_updates"
+                    )
+                    + "\n"
+                    "    getBool(kUpdateIntervalFromServer): false\n"
+                    "    getInt64(kUpdateIntervalInitialMinutes): "
+                    + (
+                        str(OTA_POLL_INTERVAL_MINUTES)
+                        if polling_off
+                        else "6"
+                    )
+                    + "\n"
+                    "    getBool(kFirmwareOtaUpdateEnable): "
+                    + ("false" if gate_false else "true")
+                    + "\n"
                 )
             elif arguments[:2] == ["shell", "logcat"]:
                 output = (
@@ -2306,6 +2327,13 @@ class OtaPlatformBackendTest(unittest.TestCase):
             "sizeof(contents) - 1)",
             fops,
         )
+        # The pre-port gate-only body stays recognized as a legacy
+        # upgrade source alongside the extended body.
+        self.assertIn("legacy_contents", fops)
+        self.assertIn(
+            "file_has_exact_contents(path, legacy_contents,",
+            fops,
+        )
 
     def test_fops_still_refuses_foreign_override(self) -> None:
         fops = (ROOT / "exploit/src/fops.c").read_text()
@@ -2322,6 +2350,197 @@ class OtaPlatformBackendTest(unittest.TestCase):
         self.assertIn(
             "persist.sys.mobileconfigutil.usePlatformMobileConfig", fops
         )
+
+
+OTA_DUMP_HEAD = (
+    "----------\n"
+    "Dump OtaService\n"
+    "    lastKnownOtaStatus_: 0, (OtaStatusEnum: idle)\n"
+)
+
+
+def ota_config_dump(
+    gate: str = "false",
+    interval: str = "1000000",
+    url: str = OTA_JSON_URL,
+) -> str:
+    return (
+        OTA_DUMP_HEAD
+        + "----------\n"
+        "Dump OtaConfig\n"
+        f"    getString(kOtaJsonUrl): {url}\n"
+        "    getBool(kUpdateIntervalFromServer): false\n"
+        f"    getInt64(kUpdateIntervalInitialMinutes): {interval}\n"
+        f"    getBool(kFirmwareOtaUpdateEnable): {gate}\n"
+        "----------\n"
+    )
+
+
+class OtaPollingOverrideTest(unittest.TestCase):
+    """The OTA override also stops otad's update polling (port of
+    upstream 5c2c531d): preflight and verification require the gate
+    off AND polling off, and tolerate dumps cut off while otad is
+    still starting."""
+
+    def provisioner(self, temporary: str) -> PortalProvisioner:
+        provisioner = PortalProvisioner(
+            "192.0.2.1:5555",
+            1,
+            pathlib.Path(temporary),
+            disable_updates=True,
+        )
+        provisioner.target = next(
+            target for target in TARGETS if target.device == "omni"
+        )
+        return provisioner
+
+    def adb(self, dumps: list[str]) -> mock.Mock:
+        disabled = "".join(
+            f"package:{package}\n"
+            for package in next(
+                target for target in TARGETS if target.device == "omni"
+            ).ota_packages
+        )
+        remaining = list(dumps)
+
+        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["shell", "pm"]:
+                return subprocess.CompletedProcess(args, 0, disabled)
+            if args[:2] == ["shell", "dumpsys"]:
+                text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+                return subprocess.CompletedProcess(args, 0, text)
+            return subprocess.CompletedProcess(args, 0, "")
+
+        return mock.Mock(side_effect=run)
+
+    def test_parse_rejects_dump_cut_before_config(self) -> None:
+        self.assertIsNone(parse_ota_config(OTA_DUMP_HEAD))
+        config = parse_ota_config(ota_config_dump())
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config["kFirmwareOtaUpdateEnable"], "false")
+        self.assertEqual(
+            config["kUpdateIntervalInitialMinutes"],
+            str(OTA_POLL_INTERVAL_MINUTES),
+        )
+        self.assertEqual(config["kOtaJsonUrl"], OTA_JSON_URL)
+
+    def test_preflight_retries_while_otad_is_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb([OTA_DUMP_HEAD, OTA_DUMP_HEAD, ota_config_dump()])
+            with mock.patch.object(provisioner, "adb_run", adb), mock.patch(
+                "provision_portal.time.sleep"
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertTrue(provisioner.ota_preflight())
+            self.assertIn("dump=complete", output.getvalue())
+            self.assertIn("action=skip", output.getvalue())
+
+    def test_preflight_reinstalls_legacy_gate_only_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        interval="6",
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates",
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(provisioner.ota_preflight())
+            self.assertIn("firmware_gate_false=1", output.getvalue())
+            self.assertIn("poll_interval_minutes=6", output.getvalue())
+            self.assertIn("update_url_blocked=0", output.getvalue())
+            self.assertIn("action=install", output.getvalue())
+
+    def test_preflight_requires_blocked_update_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates"
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(provisioner.ota_preflight())
+            self.assertIn(
+                "poll_interval_minutes=1000000", output.getvalue()
+            )
+            self.assertIn("update_url_blocked=0", output.getvalue())
+
+    def test_preflight_survives_dumpsys_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb([ota_config_dump()])
+            original = adb.side_effect
+            calls = {"dumpsys": 0}
+
+            def flaky(args: list[str], **kwargs: object):
+                if args[:2] == ["shell", "dumpsys"]:
+                    calls["dumpsys"] += 1
+                    if calls["dumpsys"] == 1:
+                        raise ProvisionError(
+                            "command timed out: adb shell dumpsys"
+                        )
+                return original(args, **kwargs)
+
+            adb.side_effect = flaky
+            with mock.patch.object(provisioner, "adb_run", adb), mock.patch(
+                "provision_portal.time.sleep"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(provisioner.ota_preflight())
+            self.assertEqual(calls["dumpsys"], 2)
+
+    def test_verify_block_requires_polling_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        interval="6",
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates",
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    mock.patch.object(
+                        provision_portal_module, "time", _FakeClock()
+                    ), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    ProvisionError, "polling interval"
+                ):
+                    provisioner.verify_ota_block(wait_seconds=4)
+
+    def test_fops_bodies_carry_polling_keys_and_legacy(self) -> None:
+        for relative in (
+            "exploit/src/fops.c",
+            "exploit/targets/portal-ripley-2041515800015050/fops.c",
+        ):
+            fops = (ROOT / relative).read_text()
+            for key in (
+                "1: updateintervalfromserver: false",
+                f"15: updateintervalinitial: {OTA_POLL_INTERVAL_MINUTES}",
+                f"21: jsonqueryurl: {OTA_JSON_URL}",
+                f"26: updateintervalnonetw: {OTA_POLL_INTERVAL_MINUTES}",
+                "36: firmware_ota_update_enable: false",
+            ):
+                self.assertIn(key, fops, f"{key} missing from {relative}")
+            # The gate-only body stays recognized as an upgrade source
+            # and the installed-body check is exact-contents.
+            self.assertIn("legacy_contents", fops)
+            self.assertIn(
+                "file_has_exact_contents(path, contents, "
+                "sizeof(contents) - 1)",
+                fops,
+            )
 
 
 if __name__ == "__main__":
