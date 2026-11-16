@@ -22,6 +22,16 @@ the fork diverged from upstream:
 - NOTICE file, per-file Apache-2.0 SPDX headers, SECURITY.md,
   CONTRIBUTING.md, issue/PR templates, CI, and a tag-driven release
   workflow that publishes CI-built binaries with SHA-256 checksums.
+- `--collect-diagnostics`: read-only mode that works on any build,
+  supported or not, and writes one zip bundle (identity props,
+  bugreport archive, the sibling target's write-free page-prep
+  diagnostic, MobileConfig backend inventory, best-effort kernel
+  config/kallsyms, and a manifest) so support for a new firmware
+  build can be evaluated without owning the device.
+- Exploit attempts now log their subprocess return code and how the
+  output stream ended (`INSTALL_ATTEMPT_EXIT`), and a KernelSnitch
+  mm_struct leak failure is classified as an attempt failure instead
+  of ending the attempt silently.
 
 ### Changed
 

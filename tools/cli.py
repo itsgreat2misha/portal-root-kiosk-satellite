@@ -340,6 +340,14 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         action="store_true",
         help="clean stale staging and resume actions from a pending state manifest",
     )
+    mode_group.add_argument(
+        "--collect-diagnostics",
+        action="store_true",
+        help=(
+            "collect a read-only diagnostics bundle (identity, bugreport, "
+            "page-prep diagnostic) for any build, supported or not, and exit"
+        ),
+    )
     parser.add_argument(
         "--backup",
         type=pathlib.Path,
@@ -446,12 +454,28 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         parser.error("--recover cannot be combined with --backup")
     if args.status and selected:
         parser.error("--status cannot be combined with provisioning actions")
+    if args.collect_diagnostics and selected:
+        parser.error(
+            "--collect-diagnostics cannot be combined with provisioning actions"
+        )
+    if args.collect_diagnostics and args.backup:
+        parser.error("--collect-diagnostics cannot be combined with --backup")
     args.backup_only = (
         args.backup is not None
         and not selected
-        and not any((args.status, args.dry_run, args.recover))
+        and not any(
+            (args.status, args.dry_run, args.recover, args.collect_diagnostics)
+        )
     )
-    if not selected and not any((args.status, args.dry_run, args.recover, args.backup)):
+    if not selected and not any(
+        (
+            args.status,
+            args.dry_run,
+            args.recover,
+            args.backup,
+            args.collect_diagnostics,
+        )
+    ):
         args.audio = True
     return args
 
@@ -506,6 +530,7 @@ def main(
             verify_boots=args.verify_boots,
             status_only=args.status or args.backup_only,
             dry_run=args.dry_run,
+            collect_diagnostics=args.collect_diagnostics,
             backup_path=args.backup,
             recover=args.recover,
             skip_build=args.skip_build,
