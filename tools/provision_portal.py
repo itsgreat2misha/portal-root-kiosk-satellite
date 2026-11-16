@@ -176,6 +176,32 @@ ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
 PACKAGE_STATE_SETTLE_SECONDS = 15
 OTA_UI_PACKAGE = "com.facebook.aloha.otaui"
 OTA_SETUP_PACKAGE = "com.facebook.aloha.alohaotasetup"
+OTA_BACKEND_PROPERTY = "persist.sys.mobileconfigutil.usePlatformMobileConfig"
+OTA_BACKEND_BACKUP_REMOTE = "/data/local/tmp/portal-ota-backend-before-v1.json"
+# Minutes otad sleeps between update checks once the OTA override is
+# installed, and the closed local URL it uses for any check it still makes.
+# Both must match the native override in exploit/src/fops.c.
+OTA_POLL_INTERVAL_MINUTES = 1_000_000
+OTA_JSON_URL = "https://127.0.0.1:9/"
+
+
+def parse_ota_config(dump: str) -> dict[str, str] | None:
+    """Return otad's effective config values, or None for an incomplete dump.
+
+    otad answers dumpsys while it is still starting and the output can stop
+    before its config section, so a missing value is not a stock value.
+    """
+    if (
+        "Dump OtaConfig" not in dump
+        or "getBool(kFirmwareOtaUpdateEnable):" not in dump
+    ):
+        return None
+    return {
+        match.group(1): match.group(2).strip()
+        for match in re.finditer(
+            r"get(?:Bool|Int64|String)\((k\w+)\): ([^\r\n]*)", dump
+        )
+    }
 DEFAULT_UID1000_HOST_PACKAGE = "com.facebook.alohasdk.platformbatterystate"
 WIRELESS_ADB_INSTALLED_REMOTE = (
     "/data/local/tmp/portal-wireless-adb-installed-v1"
@@ -250,6 +276,7 @@ class PortalProvisioner:
         meta_accounts_local_only: bool = False,
         meta_accounts_auth_only: bool = False,
         meta_accounts_finalize_only: bool = False,
+        ota_backend_value: str | None = None,
     ):
         self.serial = serial
         self.attempts = attempts
@@ -262,6 +289,8 @@ class PortalProvisioner:
         self.restore_audio = restore_audio
         self.disable_updates = disable_updates
         self.ota_already_configured = False
+        self.ota_backend_value = ota_backend_value
+        self.ota_unverified = False
         self.enable_updates = enable_updates
         self.debloat = debloat
         self.debloat_already_configured = False
@@ -1438,13 +1467,19 @@ class PortalProvisioner:
         fingerprint = self.adb_run(
             ["shell", "getprop", "ro.build.fingerprint"], timeout=5, check=True
         ).stdout.strip()
+        actions = self.requested_actions()
+        if self.ota_unverified and "disable_updates" in actions:
+            # The OTA block was applied but its effectiveness could
+            # not be positively established; record it as unverified
+            # so a later run never treats it as a completed no-op.
+            actions["disable_updates"] = "unverified"
         self.run_state.write_state(
             state_status,
             fingerprint=fingerprint,
             target_key=self.target.key if self.target else None,
             tool_revision=self.tool_revision(),
             artifact_sha256=self.selected_artifact_hashes(),
-            actions=self.requested_actions(),
+            actions=actions,
             first_boot=first_boot,
             second_boot=second_boot,
         )
@@ -1821,6 +1856,14 @@ class PortalProvisioner:
                 ),
                 "firmware_gate_false": (
                     "getBool(kFirmwareOtaUpdateEnable): false" in ota_dump
+                ),
+                "poll_interval_minutes": (
+                    (parse_ota_config(ota_dump) or {}).get(
+                        "kUpdateIntervalInitialMinutes"
+                    )
+                ),
+                "update_url": (
+                    (parse_ota_config(ota_dump) or {}).get("kOtaJsonUrl")
                 ),
                 "restored_marker": ota_restored,
             },
@@ -2238,6 +2281,7 @@ class PortalProvisioner:
                 PRIVACY_BACKUP_REMOTE,
                 ADB_AUTH_TIMEOUT_BACKUP_REMOTE,
                 APP_VERIFIER_BACKUP_REMOTE,
+                OTA_BACKEND_BACKUP_REMOTE,
                 "/data/local/tmp/portal-ota-backup",
                 "/data/local/tmp/portal-presence-backup",
                 "/data/local/tmp/portal-device-owner-backup",
@@ -3135,18 +3179,145 @@ class PortalProvisioner:
         packages_disabled = all(
             f"package:{package}" in disabled for package in packages
         )
-        ota_dump = self.adb_run(
-            ["shell", "dumpsys", "facebook.aloha.otaservice"], timeout=10
-        ).stdout
-        gate_false = "getBool(kFirmwareOtaUpdateEnable): false" in ota_dump
-        healthy = packages_disabled and gate_false
+        config, _ = self.read_ota_config(wait_seconds=30)
+        gate_false, polling_off = self.ota_override_applied(config)
+        interval = (
+            config.get("kUpdateIntervalInitialMinutes", "missing")
+            if config is not None
+            else "unknown"
+        )
+        url_blocked = (
+            config is not None and config.get("kOtaJsonUrl") == OTA_JSON_URL
+        )
+        backend_selected = True
+        if self.target and self.target.device == "aloha":
+            # On Aloha the native OTA client only reads the override
+            # through the platform MobileConfig backend; without the
+            # selector property set, a false gate in this dump does not
+            # establish that the block is in effect.
+            backend_selected = (
+                self.adb_run(
+                    ["shell", "getprop", OTA_BACKEND_PROPERTY], timeout=5
+                ).stdout.strip()
+                == "true"
+            )
+        healthy = (
+            packages_disabled and gate_false and polling_off
+            and backend_selected
+        )
         print(
             "OTA_PREFLIGHT "
             f"packages_disabled={int(packages_disabled)} "
             f"firmware_gate_false={int(gate_false)} "
+            f"poll_interval_minutes={interval} "
+            f"update_url_blocked={int(url_blocked)} "
+            f"backend_platform={int(backend_selected)} "
+            f"dump={'complete' if config is not None else 'incomplete'} "
             f"action={'skip' if healthy else 'install'}"
         )
         return healthy
+
+    def read_ota_config(
+        self, wait_seconds: int
+    ) -> tuple[dict[str, str] | None, str]:
+        """Read otad's config, retrying while otad is starting or slow."""
+        deadline = time.monotonic() + wait_seconds
+        dump = ""
+        while True:
+            try:
+                dump = self.adb_run(
+                    ["shell", "dumpsys", "facebook.aloha.otaservice"],
+                    timeout=15,
+                ).stdout
+            except ProvisionError:
+                dump = ""
+            config = parse_ota_config(dump)
+            if config is not None or time.monotonic() >= deadline:
+                return config, dump
+            time.sleep(2)
+
+    @staticmethod
+    def ota_override_applied(
+        config: dict[str, str] | None,
+    ) -> tuple[bool, bool]:
+        """Return whether the OTA gate is off and update polling is off.
+
+        Polling counts as off only when otad both sleeps for the override
+        interval and sends any remaining check to the closed local URL.
+        """
+        if config is None:
+            return False, False
+        return (
+            config.get("kFirmwareOtaUpdateEnable") == "false",
+            config.get("kUpdateIntervalInitialMinutes")
+            == str(OTA_POLL_INTERVAL_MINUTES)
+            and config.get("kOtaJsonUrl") == OTA_JSON_URL,
+        )
+
+    def read_ota_backend_backup(self) -> str | None:
+        result = self.adb_run(
+            ["shell", "cat", OTA_BACKEND_BACKUP_REMOTE], timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            saved = json.loads(result.stdout)
+            if saved["property"] != OTA_BACKEND_PROPERTY:
+                raise ValueError("unexpected property")
+            value = saved["value"]
+            if value not in ("", "true", "false", "1", "0"):
+                raise ValueError("unexpected backend value")
+            return value
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ProvisionError("invalid OTA backend backup") from exc
+
+    def prepare_ota_backend_backup(self) -> None:
+        if self.read_ota_backend_backup() is not None:
+            return
+        value = self.adb_run(
+            ["shell", "getprop", OTA_BACKEND_PROPERTY], timeout=5, check=True
+        ).stdout.strip()
+        if value not in ("", "true", "false", "1", "0"):
+            raise ProvisionError(f"unexpected OTA backend value: {value!r}")
+        self.push_text_atomic(
+            json.dumps({"property": OTA_BACKEND_PROPERTY, "value": value})
+            + "\n",
+            OTA_BACKEND_BACKUP_REMOTE,
+        )
+        print(
+            f"OTA_BACKEND_BACKUP value={value!r} "
+            f"path={OTA_BACKEND_BACKUP_REMOTE}"
+        )
+
+    def configure_ota_backend_phase(self) -> bool:
+        """Use the system identity only for the backend property update."""
+        if self.ota_backend_value is not None or not self.target:
+            return False
+        if self.target.device != "aloha":
+            return False
+        value = (
+            "true" if self.disable_updates else self.read_ota_backend_backup()
+        )
+        if value is None:
+            return False
+        current = self.adb_run(
+            ["shell", "getprop", OTA_BACKEND_PROPERTY], timeout=5, check=True
+        ).stdout.strip()
+        if current == value:
+            return False
+        phase_logs = self.log_dir / "ota-backend"
+        phase_logs.mkdir(parents=True, exist_ok=True)
+        print(f"OTA_BACKEND_PHASE value={value!r}", flush=True)
+        PortalProvisioner(
+            self.serial,
+            self.attempts,
+            phase_logs,
+            disable_updates=self.disable_updates,
+            enable_updates=self.enable_updates,
+            skip_build=self.skip_build,
+            ota_backend_value=value,
+        ).provision()
+        return True
 
     def debloat_preflight(self) -> bool:
         return self.settings_feature.debloat_preflight()
@@ -3701,6 +3872,8 @@ class PortalProvisioner:
                 self.meta_accounts_local_only or self.meta_accounts_finalize_only
             ):
                 source_process = "com.facebook.alohaservices.alohausers"
+            elif private_ota_action and self.ota_backend_value is not None:
+                source_process = "system_server"
             elif private_ota_action and self.target.ota_credential_process:
                 source_process = self.target.ota_credential_process
             else:
@@ -3760,9 +3933,13 @@ class PortalProvisioner:
             and self.meta_accounts_absent
         ):
             environment["GHOSTLOCK_META_ACCOUNTS_EMPTY"] = "1"
-        if self.disable_updates and not self.ota_already_configured:
+        if self.ota_backend_value is not None:
+            environment["GHOSTLOCK_OTA_BACKEND_VALUE"] = self.ota_backend_value
+        elif self.disable_updates and not self.ota_already_configured:
             environment["GHOSTLOCK_OTA_BLOCK"] = "1"
-        if self.enable_updates:
+            if self.target.device == "aloha":
+                environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"] = "1"
+        if self.enable_updates and self.ota_backend_value is None:
             environment["GHOSTLOCK_RESTORE_OTA_BLOCK"] = "1"
         if self.optimize_presence and not self.presence_already_configured:
             environment["GHOSTLOCK_PRESENCE_PROFILE"] = "1"
@@ -4034,9 +4211,11 @@ class PortalProvisioner:
                     "MHA tuning restore",
                     True,
                 )
-        if self.disable_updates and not self.ota_already_configured:
+        if self.ota_backend_value is not None:
+            expected_markers["ota_backend"] = ("OTA backend property", True)
+        elif self.disable_updates and not self.ota_already_configured:
             expected_markers["ota_block"] = ("OTA block file install", True)
-        if self.enable_updates:
+        if self.enable_updates and self.ota_backend_value is None:
             expected_markers["ota_restore"] = ("OTA block restore", True)
         if self.optimize_presence and not self.presence_already_configured:
             expected_markers["presence_profile"] = (
@@ -4517,6 +4696,18 @@ class PortalProvisioner:
         marker = "/data/local/tmp/portal-ota-backup/restored-v1"
         if self.adb_run(["shell", "test", "-f", marker], timeout=5).returncode != 0:
             raise ProvisionError("OTA restore marker is absent")
+        if self.target and self.target.device == "aloha":
+            original = self.read_ota_backend_backup()
+            if original is not None:
+                current = self.adb_run(
+                    ["shell", "getprop", OTA_BACKEND_PROPERTY],
+                    timeout=5,
+                    check=True,
+                ).stdout.strip()
+                if current != original:
+                    raise ProvisionError(
+                        "OTA native configuration backend was not restored"
+                    )
         disabled = self.adb_run(
             ["shell", "pm", "list", "packages", "-d", "-u"],
             timeout=10,
@@ -4557,14 +4748,31 @@ class PortalProvisioner:
         if missing:
             raise ProvisionError(f"OTA packages became enabled: {', '.join(missing)}")
 
+        aloha = bool(self.target and self.target.device == "aloha")
+        if aloha:
+            # A false gate in the service dump alone does not establish
+            # that the block is in effect on Aloha: the native OTA
+            # client reads the override only through the platform
+            # MobileConfig backend, and that path is selected by this
+            # property. If it is not set, the native client is known
+            # not to be reading the override.
+            backend = self.adb_run(
+                ["shell", "getprop", OTA_BACKEND_PROPERTY], timeout=5
+            ).stdout.strip()
+            if backend != "true":
+                raise ProvisionError(
+                    f"OTA backend property {OTA_BACKEND_PROPERTY} is "
+                    f"{backend!r}, not 'true': the native OTA client is "
+                    "not using the platform MobileConfig backend, so "
+                    "the local override is not in effect for it"
+                )
+
         deadline = time.monotonic() + wait_seconds
         last_dump = ""
         last_log = ""
+        gate_false = False
         while time.monotonic() < deadline:
-            result = self.adb_run(
-                ["shell", "dumpsys", "facebook.aloha.otaservice"], timeout=10
-            )
-            last_dump = result.stdout
+            config, last_dump = self.read_ota_config(wait_seconds=0)
             last_log = self.adb_run(
                 [
                     "shell",
@@ -4582,17 +4790,37 @@ class PortalProvisioner:
                 r"latestBoolean: false, source: OVERRIDE",
                 last_log,
             )
-            if "getBool(kFirmwareOtaUpdateEnable): false" in last_dump:
-                print(
-                    "OTA_BLOCK_OK packages=disabled "
-                    "firmware_ota_update_enable=false source="
-                    + ("OVERRIDE" if override_loaded else "effective-config")
-                )
-                return
+            gate_now, polling_off = self.ota_override_applied(config)
+            if gate_now:
+                gate_false = True
+                if polling_off and (override_loaded or not aloha):
+                    print(
+                        "OTA_BLOCK_OK packages=disabled "
+                        "firmware_ota_update_enable=false "
+                        f"poll_interval_minutes={OTA_POLL_INTERVAL_MINUTES} "
+                        f"update_url={OTA_JSON_URL} source="
+                        + ("OVERRIDE" if override_loaded else "effective-config")
+                    )
+                    return
             time.sleep(2)
+        if aloha and gate_false:
+            # The gate reads false and the platform backend is
+            # selected, but no client was observed reading the gate
+            # from the override, so effectiveness is not positively
+            # established. Report the action as unverified rather
+            # than claiming the block is in place.
+            self.ota_unverified = True
+            print(
+                "OTA_BLOCK_UNVERIFIED packages=disabled "
+                "firmware_ota_update_enable=false backend=platform "
+                "provenance=absent: the override was not observed "
+                "being read as an override, so the OTA block is "
+                "recorded as unverified, not applied"
+            )
+            return
         raise ProvisionError(
-            "OTA daemon did not report its firmware-update gate from the "
-            "local override; recent dump/log follow:\n"
+            "OTA daemon did not report its firmware-update gate and polling "
+            "interval from the local override; recent dump/log follow:\n"
             + last_dump[-3000:]
             + "\n"
             + last_log[-3000:]
@@ -5043,6 +5271,25 @@ class PortalProvisioner:
                     print("UID1000_RUNTIME_APK_RETAIN package=installed")
                 if self.enable_updates:
                     self.enable_ota_packages()
+                if self.configure_ota_backend_phase():
+                    if self.requested_actions() in (
+                        {"disable_updates": True},
+                        {"enable_updates": True},
+                    ):
+                        # The backend phase verified the same
+                        # requested state on its own boots and wrote
+                        # the final manifest.
+                        self.report_deferred_failures()
+                        return
+                    post_attempt_boot = self.adb_run(
+                        [
+                            "shell",
+                            "cat",
+                            "/proc/sys/kernel/random/boot_id",
+                        ],
+                        timeout=5,
+                        check=True,
+                    ).stdout.strip()
                 if self.remove_shizuku:
                     self.uninstall_shizuku_payload()
                 if self.presence_fps_action_requested():
@@ -5329,6 +5576,13 @@ class PortalProvisioner:
             self.report_deferred_failures()
             return
         self.write_state("pending")
+        if (
+            self.disable_updates
+            and self.ota_backend_value is None
+            and self.target
+            and self.target.device == "aloha"
+        ):
+            self.prepare_ota_backend_backup()
         self.ota_already_configured = (
             self.ota_preflight() if self.disable_updates else False
         )

@@ -26,6 +26,10 @@ from provision_portal import (  # noqa: E402
     ADB_AUTH_TIMEOUT_BACKUP_REMOTE,
     AUTOROOT_HELPER_PACKAGE,
     EXPLOIT_SENTINEL_PACKAGE,
+    OTA_BACKEND_BACKUP_REMOTE,
+    OTA_BACKEND_PROPERTY,
+    OTA_JSON_URL,
+    OTA_POLL_INTERVAL_MINUTES,
     PACKAGE_STATE_SETTLE_SECONDS,
     PRESENCE_HELPER_PACKAGE,
     ADB_ENABLED_SETTING,
@@ -39,6 +43,7 @@ from provision_portal import (  # noqa: E402
     android_build_environment,
     build,
     parse_args,
+    parse_ota_config,
 )
 from meta_debloat_components import (  # noqa: E402
     DEBLOAT_COMPONENT_NAMES,
@@ -1711,6 +1716,831 @@ class DeKioskScrubTest(unittest.TestCase):
         self.assertTrue(arguments.shizuku)
         self.assertTrue(arguments.autoroot)
         self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
+
+
+class OtaPlatformBackendTest(unittest.TestCase):
+    """Aloha OTA backend selection (upstream issue #31) and the
+    provenance-based OTA verification rules."""
+
+    @staticmethod
+    def aloha_target():
+        return next(t for t in TARGETS if t.device == "aloha")
+
+    @staticmethod
+    def omni_target():
+        return next(t for t in TARGETS if t.device == "omni")
+
+    @staticmethod
+    def ota_adb(
+        *,
+        disabled_packages: tuple[str, ...] = (),
+        gate_false: bool = False,
+        backend: str | None = None,
+        provenance: bool = False,
+        polling_off: bool = True,
+    ):
+        def adb_run(
+            arguments: list[str],
+            timeout: float | None = None,
+            check: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout, check
+            if arguments[:4] == ["shell", "pm", "list", "packages"]:
+                output = "".join(
+                    f"package:{package}\n" for package in disabled_packages
+                )
+            elif arguments[:2] == ["shell", "getprop"]:
+                output = (backend or "") + "\n"
+            elif arguments[:3] == [
+                "shell",
+                "dumpsys",
+                "facebook.aloha.otaservice",
+            ]:
+                output = (
+                    "Dump OtaConfig\n"
+                    "    getString(kOtaJsonUrl): "
+                    + (
+                        OTA_JSON_URL
+                        if polling_off
+                        else "https://graph.facebook.com/"
+                        "mobile_release_updates"
+                    )
+                    + "\n"
+                    "    getBool(kUpdateIntervalFromServer): false\n"
+                    "    getInt64(kUpdateIntervalInitialMinutes): "
+                    + (
+                        str(OTA_POLL_INTERVAL_MINUTES)
+                        if polling_off
+                        else "6"
+                    )
+                    + "\n"
+                    "    getBool(kFirmwareOtaUpdateEnable): "
+                    + ("false" if gate_false else "true")
+                    + "\n"
+                )
+            elif arguments[:2] == ["shell", "logcat"]:
+                output = (
+                    "getLatestBooleanWithOptions [18296358819858434], "
+                    "latestBoolean: false, source: OVERRIDE\n"
+                    if provenance
+                    else ""
+                )
+            else:
+                output = ""
+            return subprocess.CompletedProcess(arguments, 0, output)
+
+        return adb_run
+
+    def test_backend_backup_preserves_first_value_on_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "read_ota_backend_backup",
+                    return_value="false",
+                ),
+                mock.patch.object(provisioner, "adb_run") as adb,
+                mock.patch.object(provisioner, "push_text_atomic") as push,
+            ):
+                provisioner.prepare_ota_backend_backup()
+            adb.assert_not_called()
+            push.assert_not_called()
+
+    def test_backend_backup_records_current_value_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            with (
+                mock.patch.object(
+                    provisioner, "read_ota_backend_backup", return_value=None
+                ),
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "false\n"
+                    ),
+                ),
+                mock.patch.object(provisioner, "push_text_atomic") as push,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                provisioner.prepare_ota_backend_backup()
+            contents, remote = push.call_args.args
+            self.assertEqual(remote, OTA_BACKEND_BACKUP_REMOTE)
+            saved = provision_portal_module.json.loads(contents)
+            self.assertEqual(saved["property"], OTA_BACKEND_PROPERTY)
+            self.assertEqual(saved["value"], "false")
+
+    def test_backend_restore_phase_uses_saved_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                enable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "read_ota_backend_backup",
+                    return_value="false",
+                ),
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "true\n"
+                    ),
+                ),
+                mock.patch(
+                    "provision_portal.PortalProvisioner"
+                ) as phase,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertTrue(provisioner.configure_ota_backend_phase())
+            self.assertEqual(
+                phase.call_args.kwargs["ota_backend_value"], "false"
+            )
+            self.assertTrue(phase.call_args.kwargs["enable_updates"])
+            phase.return_value.provision.assert_called_once()
+
+    def test_backend_phase_skips_when_property_already_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "true\n"
+                    ),
+                ),
+                mock.patch("provision_portal.PortalProvisioner") as phase,
+            ):
+                self.assertFalse(provisioner.configure_ota_backend_phase())
+            phase.assert_not_called()
+
+    def test_backend_phase_does_not_run_for_omni(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = self.omni_target()
+            with mock.patch.object(provisioner, "adb_run") as adb:
+                self.assertFalse(provisioner.configure_ota_backend_phase())
+            adb.assert_not_called()
+
+    def test_backend_property_action_uses_system_identity_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+                ota_backend_value="true",
+            )
+            provisioner.target = self.aloha_target()
+            calls: list[list[str]] = []
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                calls.append(arguments)
+                value = (
+                    "1204"
+                    if arguments[:2] == ["shell", "pidof"]
+                    else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n"
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertIn(
+                ["shell", "pidof", "system_server"],
+                calls,
+            )
+            self.assertEqual(
+                environment["GHOSTLOCK_OTA_BACKEND_VALUE"], "true"
+            )
+            self.assertNotIn("GHOSTLOCK_OTA_BLOCK", environment)
+            self.assertNotIn("GHOSTLOCK_RESTORE_OTA_BLOCK", environment)
+
+    def test_aloha_install_uses_installer_identity_and_pins_backend(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+            calls: list[list[str]] = []
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                calls.append(arguments)
+                value = (
+                    "1204"
+                    if arguments[:2] == ["shell", "pidof"]
+                    else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n"
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertIn(["shell", "pidof", "installd"], calls)
+            self.assertEqual(environment["GHOSTLOCK_OTA_BLOCK"], "1")
+            self.assertEqual(
+                environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"], "1"
+            )
+            self.assertNotIn("GHOSTLOCK_OTA_BACKEND_VALUE", environment)
+
+    def test_omni_install_has_no_platform_backend_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = self.omni_target()
+            calls: list[list[str]] = []
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                calls.append(arguments)
+                return subprocess.CompletedProcess(arguments, 0, "")
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertFalse(
+                any(
+                    call[:2] == ["shell", "pidof"] for call in calls
+                ),
+                "omni OTA install must not resolve a credential identity",
+            )
+            self.assertEqual(environment["GHOSTLOCK_OTA_BLOCK"], "1")
+            self.assertNotIn("GHOSTLOCK_OTA_PLATFORM_BACKEND", environment)
+            self.assertNotIn("GHOSTLOCK_OTA_BACKEND_VALUE", environment)
+
+    def test_preflight_aloha_requires_backend_property(self) -> None:
+        aloha = self.aloha_target()
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = aloha
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=self.ota_adb(
+                        disabled_packages=aloha.ota_packages,
+                        gate_false=True,
+                        backend="false",
+                    ),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertFalse(provisioner.ota_preflight())
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=self.ota_adb(
+                        disabled_packages=aloha.ota_packages,
+                        gate_false=True,
+                        backend="true",
+                    ),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertTrue(provisioner.ota_preflight())
+
+    def test_verify_block_aloha_rejects_unselected_backend(self) -> None:
+        aloha = self.aloha_target()
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = aloha
+            with mock.patch.object(
+                provisioner,
+                "adb_run",
+                side_effect=self.ota_adb(
+                    disabled_packages=aloha.ota_packages,
+                    gate_false=True,
+                    backend="false",
+                    provenance=True,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "not using the platform MobileConfig backend",
+                ):
+                    provisioner.verify_ota_block()
+
+    def test_verify_block_aloha_accepts_override_provenance(self) -> None:
+        aloha = self.aloha_target()
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = aloha
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=self.ota_adb(
+                        disabled_packages=aloha.ota_packages,
+                        gate_false=True,
+                        backend="true",
+                        provenance=True,
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                provisioner.verify_ota_block()
+            self.assertIn("OTA_BLOCK_OK", output.getvalue())
+            self.assertIn("source=OVERRIDE", output.getvalue())
+            self.assertFalse(provisioner.ota_unverified)
+
+    def test_verify_block_aloha_without_provenance_is_unverified(
+        self,
+    ) -> None:
+        aloha = self.aloha_target()
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = aloha
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=self.ota_adb(
+                        disabled_packages=aloha.ota_packages,
+                        gate_false=True,
+                        backend="true",
+                        provenance=False,
+                    ),
+                ),
+                mock.patch.object(
+                    provision_portal_module, "time", _FakeClock()
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                provisioner.verify_ota_block(wait_seconds=4)
+            self.assertIn("OTA_BLOCK_UNVERIFIED", output.getvalue())
+            self.assertTrue(provisioner.ota_unverified)
+
+    def test_verify_block_omni_keeps_effective_config_pass(self) -> None:
+        omni = self.omni_target()
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.target = omni
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=self.ota_adb(
+                        disabled_packages=omni.ota_packages,
+                        gate_false=True,
+                        provenance=False,
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                provisioner.verify_ota_block()
+            self.assertIn("source=effective-config", output.getvalue())
+            self.assertFalse(provisioner.ota_unverified)
+
+    def test_unverified_ota_action_is_recorded_in_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            provisioner.ota_unverified = True
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "Facebook/aloha_prod/aloha:9/x\n"
+                    ),
+                ),
+                mock.patch.object(provisioner, "run_state") as run_state,
+            ):
+                provisioner.write_state("complete")
+            actions = run_state.write_state.call_args.kwargs["actions"]
+            self.assertEqual(actions["disable_updates"], "unverified")
+
+    def test_verified_ota_action_is_recorded_as_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+            )
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "Facebook/aloha_prod/aloha:9/x\n"
+                    ),
+                ),
+                mock.patch.object(provisioner, "run_state") as run_state,
+            ):
+                provisioner.write_state("complete")
+            actions = run_state.write_state.call_args.kwargs["actions"]
+            self.assertIs(actions["disable_updates"], True)
+
+    def test_restore_rejects_unrestored_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                enable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                output = (
+                    "true\n"
+                    if arguments[:2] == ["shell", "getprop"]
+                    else ""
+                )
+                return subprocess.CompletedProcess(arguments, 0, output)
+
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "read_ota_backend_backup",
+                    return_value="false",
+                ),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "backend was not restored",
+                ):
+                    provisioner.verify_ota_restored()
+
+    def test_restore_accepts_restored_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                enable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                output = (
+                    "false\n"
+                    if arguments[:2] == ["shell", "getprop"]
+                    else ""
+                )
+                return subprocess.CompletedProcess(arguments, 0, output)
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "read_ota_backend_backup",
+                    return_value="false",
+                ),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                provisioner.verify_ota_restored()
+            self.assertIn("OTA_RESTORE_OK", output.getvalue())
+
+    def test_fops_recognizes_gate_only_body_as_upgrade_source(
+        self,
+    ) -> None:
+        fops = (ROOT / "exploit/src/fops.c").read_text()
+        self.assertIn(
+            "21220: portal_framework_platform_mobileconfig", fops
+        )
+        self.assertIn(
+            "1: enable_aosp_mobileconfig_util_over_platform_mobileconfig:",
+            fops,
+        )
+        self.assertIn("GHOSTLOCK_OTA_PLATFORM_BACKEND", fops)
+        self.assertIn(
+            "file_has_exact_contents(path, contents, "
+            "sizeof(contents) - 1)",
+            fops,
+        )
+        # The pre-port gate-only body stays recognized as a legacy
+        # upgrade source alongside the extended body.
+        self.assertIn("legacy_contents", fops)
+        self.assertIn(
+            "file_has_exact_contents(path, legacy_contents,",
+            fops,
+        )
+
+    def test_fops_still_refuses_foreign_override(self) -> None:
+        fops = (ROOT / "exploit/src/fops.c").read_text()
+        self.assertIn(
+            "OTA block refused to replace unrelated existing override",
+            fops,
+        )
+        self.assertIn("errno = EEXIST", fops)
+        self.assertIn(
+            "file_has_exact_contents(path, body, body_len)", fops
+        )
+        self.assertIn("GHOSTLOCK_OTA_BACKEND_VALUE", fops)
+        self.assertIn("configure_ota_backend", fops)
+        self.assertIn(
+            "persist.sys.mobileconfigutil.usePlatformMobileConfig", fops
+        )
+
+
+OTA_DUMP_HEAD = (
+    "----------\n"
+    "Dump OtaService\n"
+    "    lastKnownOtaStatus_: 0, (OtaStatusEnum: idle)\n"
+)
+
+
+def ota_config_dump(
+    gate: str = "false",
+    interval: str = "1000000",
+    url: str = OTA_JSON_URL,
+) -> str:
+    return (
+        OTA_DUMP_HEAD
+        + "----------\n"
+        "Dump OtaConfig\n"
+        f"    getString(kOtaJsonUrl): {url}\n"
+        "    getBool(kUpdateIntervalFromServer): false\n"
+        f"    getInt64(kUpdateIntervalInitialMinutes): {interval}\n"
+        f"    getBool(kFirmwareOtaUpdateEnable): {gate}\n"
+        "----------\n"
+    )
+
+
+class OtaPollingOverrideTest(unittest.TestCase):
+    """The OTA override also stops otad's update polling (port of
+    upstream 5c2c531d): preflight and verification require the gate
+    off AND polling off, and tolerate dumps cut off while otad is
+    still starting."""
+
+    def provisioner(self, temporary: str) -> PortalProvisioner:
+        provisioner = PortalProvisioner(
+            "192.0.2.1:5555",
+            1,
+            pathlib.Path(temporary),
+            disable_updates=True,
+        )
+        provisioner.target = next(
+            target for target in TARGETS if target.device == "omni"
+        )
+        return provisioner
+
+    def adb(self, dumps: list[str]) -> mock.Mock:
+        disabled = "".join(
+            f"package:{package}\n"
+            for package in next(
+                target for target in TARGETS if target.device == "omni"
+            ).ota_packages
+        )
+        remaining = list(dumps)
+
+        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["shell", "pm"]:
+                return subprocess.CompletedProcess(args, 0, disabled)
+            if args[:2] == ["shell", "dumpsys"]:
+                text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+                return subprocess.CompletedProcess(args, 0, text)
+            return subprocess.CompletedProcess(args, 0, "")
+
+        return mock.Mock(side_effect=run)
+
+    def test_parse_rejects_dump_cut_before_config(self) -> None:
+        self.assertIsNone(parse_ota_config(OTA_DUMP_HEAD))
+        config = parse_ota_config(ota_config_dump())
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config["kFirmwareOtaUpdateEnable"], "false")
+        self.assertEqual(
+            config["kUpdateIntervalInitialMinutes"],
+            str(OTA_POLL_INTERVAL_MINUTES),
+        )
+        self.assertEqual(config["kOtaJsonUrl"], OTA_JSON_URL)
+
+    def test_preflight_retries_while_otad_is_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb([OTA_DUMP_HEAD, OTA_DUMP_HEAD, ota_config_dump()])
+            with mock.patch.object(provisioner, "adb_run", adb), mock.patch(
+                "provision_portal.time.sleep"
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertTrue(provisioner.ota_preflight())
+            self.assertIn("dump=complete", output.getvalue())
+            self.assertIn("action=skip", output.getvalue())
+
+    def test_preflight_reinstalls_legacy_gate_only_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        interval="6",
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates",
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(provisioner.ota_preflight())
+            self.assertIn("firmware_gate_false=1", output.getvalue())
+            self.assertIn("poll_interval_minutes=6", output.getvalue())
+            self.assertIn("update_url_blocked=0", output.getvalue())
+            self.assertIn("action=install", output.getvalue())
+
+    def test_preflight_requires_blocked_update_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates"
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(provisioner.ota_preflight())
+            self.assertIn(
+                "poll_interval_minutes=1000000", output.getvalue()
+            )
+            self.assertIn("update_url_blocked=0", output.getvalue())
+
+    def test_preflight_survives_dumpsys_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb([ota_config_dump()])
+            original = adb.side_effect
+            calls = {"dumpsys": 0}
+
+            def flaky(args: list[str], **kwargs: object):
+                if args[:2] == ["shell", "dumpsys"]:
+                    calls["dumpsys"] += 1
+                    if calls["dumpsys"] == 1:
+                        raise ProvisionError(
+                            "command timed out: adb shell dumpsys"
+                        )
+                return original(args, **kwargs)
+
+            adb.side_effect = flaky
+            with mock.patch.object(provisioner, "adb_run", adb), mock.patch(
+                "provision_portal.time.sleep"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(provisioner.ota_preflight())
+            self.assertEqual(calls["dumpsys"], 2)
+
+    def test_verify_block_requires_polling_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.provisioner(temporary)
+            adb = self.adb(
+                [
+                    ota_config_dump(
+                        interval="6",
+                        url="https://graph.facebook.com/"
+                        "mobile_release_updates",
+                    )
+                ]
+            )
+            with mock.patch.object(provisioner, "adb_run", adb), \
+                    mock.patch.object(
+                        provision_portal_module, "time", _FakeClock()
+                    ), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    ProvisionError, "polling interval"
+                ):
+                    provisioner.verify_ota_block(wait_seconds=4)
+
+    def test_fops_bodies_carry_polling_keys_and_legacy(self) -> None:
+        for relative in (
+            "exploit/src/fops.c",
+            "exploit/targets/portal-ripley-2041515800015050/fops.c",
+        ):
+            fops = (ROOT / relative).read_text()
+            for key in (
+                "1: updateintervalfromserver: false",
+                f"15: updateintervalinitial: {OTA_POLL_INTERVAL_MINUTES}",
+                f"21: jsonqueryurl: {OTA_JSON_URL}",
+                f"26: updateintervalnonetw: {OTA_POLL_INTERVAL_MINUTES}",
+                "36: firmware_ota_update_enable: false",
+            ):
+                self.assertIn(key, fops, f"{key} missing from {relative}")
+            # The gate-only body stays recognized as an upgrade source
+            # and the installed-body check is exact-contents.
+            self.assertIn("legacy_contents", fops)
+            self.assertIn(
+                "file_has_exact_contents(path, contents, "
+                "sizeof(contents) - 1)",
+                fops,
+            )
 
 
 if __name__ == "__main__":

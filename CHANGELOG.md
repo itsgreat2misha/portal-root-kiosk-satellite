@@ -33,6 +33,32 @@ the fork diverged from upstream:
   mm_struct leak failure is classified as an attempt failure instead
   of ending the attempt silently.
 
+### Fixed
+
+- Aloha OTA block: the local MobileConfig override was never read by
+  the native OTA daemon, because the native MobileConfig util selects
+  a legacy backend service that does not exist on Aloha (upstream
+  issue #31, reported and fixed by feynmanliang). On Aloha,
+  `--disable-updates` now pins the platform backend inside the
+  managed override and sets
+  `persist.sys.mobileconfigutil.usePlatformMobileConfig=true` in a
+  separate system-identity phase; the original value is saved and
+  restored by `--enable-updates`. Overrides installed by earlier
+  versions are upgraded in place. OTA verification on Aloha now
+  requires positive evidence the override is in effect and records
+  the action as unverified when that evidence is absent, instead of
+  reporting success from the gate value alone.
+- OTA block: the local override now also stops the OTA daemon's
+  update polling. With only the firmware gate off, the daemon still
+  contacted Meta's update servers every few minutes; the override now
+  also sets the poll intervals to 1000000 minutes and points the
+  update query URL at a closed local port (ported from upstream
+  5c2c531d). Gate-only overrides installed by earlier versions are
+  upgraded in place. OTA preflight and verification now read the
+  daemon's config with retries (a dump cut off while the daemon is
+  starting no longer reads as a stock value) and require both the
+  gate and polling to be off.
+
 ### Changed
 
 - `--verify-boots` now defaults to 1 (one verification boot).
