@@ -187,8 +187,8 @@ class SweepWiringTest(unittest.TestCase):
 
     def test_helper_version_bumped(self) -> None:
         manifest = MANIFEST_XML.read_text(encoding="utf-8")
-        self.assertIn('android:versionCode="9"', manifest)
-        self.assertIn('android:versionName="1.8"', manifest)
+        self.assertIn('android:versionCode="10"', manifest)
+        self.assertIn('android:versionName="1.9"', manifest)
 
 
 if __name__ == "__main__":

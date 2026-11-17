@@ -63,7 +63,7 @@ public final class BudgetHarness {
     }
 
     public static void main(String[] args) {
-        check(FailureBudget.THRESHOLD == 5, "threshold is not 5");
+        check(FailureBudget.THRESHOLD == 10, "threshold is not 10");
 
         // A fresh budget (what a host re-stage leaves behind: the
         // state file is deleted) starts clean.
@@ -153,25 +153,32 @@ public final class BudgetHarness {
         check(recovered.openLogOffset() == -1,
                 "re-enable kept the log offset");
 
-        // Five consecutive incomplete boots stand down; four do
-        // not.
+        // Ten consecutive incomplete boots stand down; five and
+        // nine do not.
         FailureBudget loop = new FailureBudget(0, false, false, -1);
         incompleteBoot(loop);
         check(!loop.stoodDown(), "stood down at 1");
         incompleteBoot(loop);
         incompleteBoot(loop);
         incompleteBoot(loop);
-        check(loop.incompleteStreak() == 4, "streak not 4");
-        check(!loop.stoodDown(), "stood down at 4");
         incompleteBoot(loop);
         check(loop.incompleteStreak() == 5, "streak not 5");
-        check(loop.stoodDown(), "not stood down at 5");
+        check(!loop.stoodDown(), "stood down at 5");
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        check(loop.incompleteStreak() == 9, "streak not 9");
+        check(!loop.stoodDown(), "stood down at 9");
+        incompleteBoot(loop);
+        check(loop.incompleteStreak() == 10, "streak not 10");
+        check(loop.stoodDown(), "not stood down at 10");
         // The stand-down persists across quiet boots.
         check(!loop.accountBoot(), "quiet stood-down boot changed state");
         check(loop.stoodDown(), "stand-down did not persist");
 
         // Re-enable clears the counter and the stand-down, and the
-        // budget re-arms: 5 more incomplete boots stand down again.
+        // budget re-arms: 10 more incomplete boots stand down again.
         loop.reenable();
         check(loop.incompleteStreak() == 0, "re-enable kept the streak");
         check(!loop.attemptOpen(), "re-enable kept an open mark");
@@ -180,7 +187,13 @@ public final class BudgetHarness {
         incompleteBoot(loop);
         incompleteBoot(loop);
         incompleteBoot(loop);
-        check(!loop.stoodDown(), "re-armed budget stood down at 4");
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        check(loop.incompleteStreak() == 9, "re-armed streak not 9");
+        check(!loop.stoodDown(), "re-armed budget stood down at 9");
         incompleteBoot(loop);
         check(loop.stoodDown(), "re-armed budget did not stand down");
 
@@ -235,7 +248,7 @@ class FailureBudgetWiringTest(unittest.TestCase):
         self.activity = ACTIVITY_JAVA.read_text(encoding="utf-8")
 
     def test_threshold_and_state_keys(self) -> None:
-        self.assertIn("THRESHOLD = 5", self.budget)
+        self.assertIn("THRESHOLD = 10", self.budget)
         # The budget state lives in the autoroot state file, under
         # its own keys - alongside, not as, the disable flag.
         self.assertIn('KEY_STREAK = "budget_streak"', self.budget)
@@ -244,24 +257,24 @@ class FailureBudgetWiringTest(unittest.TestCase):
         self.assertIn('KEY_LOG_OFFSET = "budget_log_offset"', self.budget)
         self.assertNotIn("portal-autoroot.disable", self.budget)
 
-    def test_threshold_prose_says_five_everywhere(self) -> None:
+    def test_threshold_prose_says_ten_everywhere(self) -> None:
         # Every user-facing or documented surface of the threshold
-        # moved from 3 to 5 with the constant; nothing still says 3.
-        self.assertIn("last 5 boots", self.activity)
-        self.assertIn("5 more bad boots", self.activity)
-        self.assertNotIn("last 3 boots", self.activity)
-        self.assertNotIn("3 more bad boots", self.activity)
-        self.assertIn("after 5 in a row", self.service)
-        self.assertNotIn("after 3 in a row", self.service)
-        self.assertNotIn("after 3 more incomplete", self.service)
+        # moved from 5 to 10 with the constant; nothing still says 5.
+        self.assertIn("last 10 boots", self.activity)
+        self.assertIn("10 more bad boots", self.activity)
+        self.assertNotIn("last 5 boots", self.activity)
+        self.assertNotIn("5 more bad boots", self.activity)
+        self.assertIn("after 10 in a row", self.service)
+        self.assertNotIn("after 5 in a row", self.service)
+        self.assertNotIn("after 5 more incomplete", self.service)
         provisioner = (ROOT / "tools" / "provision_portal.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("After 5 consecutive verdict-less", provisioner)
+        self.assertIn("After 10 consecutive verdict-less", provisioner)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("After 5 such boots", readme)
-        self.assertIn("after 5 more bad boots", readme)
-        self.assertNotIn("After 3 such boots", readme)
+        self.assertIn("After 10 such boots", readme)
+        self.assertIn("after 10 more bad boots", readme)
+        self.assertNotIn("After 5 such boots", readme)
 
     def test_accounting_and_gate_run_before_any_racing(self) -> None:
         account = self.service.index("budget.accountBoot(lossVerdictRecovered)")
