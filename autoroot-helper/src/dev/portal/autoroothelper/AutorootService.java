@@ -46,7 +46,7 @@ import java.util.zip.ZipInputStream;
  * per-session cap survives the reboots a failed attempt can cause.
  * The same state file carries the cross-boot failure budget (see
  * FailureBudget): attempts that never complete - the crash/freeze
- * signature - are counted across boots, and after 3 in a row the
+ * signature - are counted across boots, and after 5 in a row the
  * service stands down instead of looping the fault forever.
  */
 public final class AutorootService extends Service {
@@ -211,12 +211,29 @@ public final class AutorootService extends Service {
         // the stand-down gate - both before any new attempt starts.
         // A verdict-less mark counts one incomplete; at the
         // threshold the service stands down and does not race.
+        // First, though, recover the race's own verdict when one
+        // exists: the native attempt writes WATCH_CFI_OK into
+        // attempt.log early, so a clean loss whose reboot outran
+        // this service's verdict still left its record behind.
+        // The check is scoped to the log offset recorded with the
+        // mark, so the verdict consulted is the open attempt's
+        // own, and clearing the mark consumes it. Only a fail
+        // verdict recovers - a win verdict with no root active
+        // means the attempt died after the race, which stays in
+        // the counted crash/freeze class.
         FailureBudget budget = loadBudget(state);
-        if (budget.accountBoot()) {
+        boolean lossVerdictRecovered = budget.attemptOpen()
+                && budget.openLogOffset() >= 0
+                && attemptVerdict(budget.openLogOffset())
+                        == AttemptWatchdog.VERDICT_FAIL;
+        if (budget.accountBoot(lossVerdictRecovered)) {
             storeBudget(state, budget);
             writeState(state);
-            logFile("failure budget: verdict-less attempt counted, streak="
-                    + budget.incompleteStreak());
+            logFile(lossVerdictRecovered
+                    ? "failure budget: loss verdict recovered from"
+                            + " attempt.log; attempt counted completed"
+                    : "failure budget: verdict-less attempt counted,"
+                            + " streak=" + budget.incompleteStreak());
         }
         if (budget.stoodDown()) {
             Log.w(TAG, "autoroot stood down by failure budget streak="
@@ -270,8 +287,13 @@ public final class AutorootService extends Service {
         // attempt runs: from here on, every controlled exit records
         // the attempt's verdict via completeBudgetAttempt, so a
         // mark still set on a later boot means this attempt never
-        // completed (the crash/freeze signature).
-        budget.attemptStarted();
+        // completed (the crash/freeze signature). The mark records
+        // the current attempt.log size with it: attempt.log is
+        // append-only and nothing writes it between here and the
+        // attempt's launch, so that offset is exactly where this
+        // attempt's output begins, which is what lets a later boot
+        // recover this attempt's own race verdict from the log.
+        budget.attemptStarted(attemptLogSizeForBudget());
         storeBudget(state, budget);
         budgetAttemptOpen = true;
         writeState(state);
@@ -497,13 +519,30 @@ public final class AutorootService extends Service {
         }
     }
 
+    /**
+     * attemptLogSize for the failure budget's mark: -1 when the
+     * size cannot be measured, so verdict recovery is disabled for
+     * that attempt instead of consulting the log from a guessed
+     * offset (a guess could reach an earlier attempt's verdict).
+     */
+    private long attemptLogSizeForBudget() {
+        try {
+            String out = shell("stat -c %s " + ATTEMPT_LOG
+                    + " 2>/dev/null").trim();
+            return Long.parseLong(out);
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+
     // ---- failure budget ----------------------------------------------
 
     private FailureBudget loadBudget(Map<String, String> state) {
         return new FailureBudget(
                 parseInt(state.get(FailureBudget.KEY_STREAK), 0),
                 "1".equals(state.get(FailureBudget.KEY_OPEN)),
-                "1".equals(state.get(FailureBudget.KEY_STOOD_DOWN)));
+                "1".equals(state.get(FailureBudget.KEY_STOOD_DOWN)),
+                parseLong(state.get(FailureBudget.KEY_LOG_OFFSET), -1));
     }
 
     private void storeBudget(Map<String, String> state,
@@ -513,6 +552,8 @@ public final class AutorootService extends Service {
         state.put(FailureBudget.KEY_OPEN, budget.attemptOpen() ? "1" : "0");
         state.put(FailureBudget.KEY_STOOD_DOWN,
                 budget.stoodDown() ? "1" : "0");
+        state.put(FailureBudget.KEY_LOG_OFFSET,
+                Long.toString(budget.openLogOffset()));
     }
 
     /**
@@ -563,7 +604,7 @@ public final class AutorootService extends Service {
      * User re-enable from the helper screen (the notification's
      * target): clears the counter and the stand-down, removes the
      * notification, and starts a session. The budget re-arms - a
-     * persisting fault stands down again after 3 more incomplete
+     * persisting fault stands down again after 5 more incomplete
      * boots. No provisioner run is needed; a host re-stage also
      * clears the state (it deletes the state file).
      */
