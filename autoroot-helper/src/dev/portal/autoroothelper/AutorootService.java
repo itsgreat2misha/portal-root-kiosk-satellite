@@ -24,6 +24,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -60,6 +61,16 @@ public final class AutorootService extends Service {
     private static final String DISABLE_FLAG = "/data/local/tmp/portal-autoroot.disable";
     private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
     private static final int DAEMON_PORT = 37373;
+    // Bound on the post-starter wait of one Shizuku handoff try.
+    // The poll loop's individual shell calls can each stall for
+    // minutes when a wedged attempt tree is starving the device
+    // (the ~13-minute handoff stalls of 2026-11-17), so the
+    // iteration count alone does not bound the wait; the wall
+    // clock does. A try that hits the bound fails, and
+    // finishShizukuHandoff retries once after an orphan sweep; a
+    // handoff still incomplete after that is retried by the next
+    // service start's daemon-up path.
+    private static final long HANDOFF_WAIT_MS = 120_000L;
 
     // Control surface for AutorootActivity. The activity only sends
     // intents; this service stays the single owner of shell work and
@@ -196,7 +207,7 @@ public final class AutorootService extends Service {
             // serving as root the daemon has no further job.
             logFile("daemon already up boot=" + bootId);
             publishStatus("DONE", lastAttempt, lastMax, "root active");
-            if (ensureShizukuRoot()) {
+            if (finishShizukuHandoff()) {
                 stopDaemon();
             }
             Map<String, String> state = readKeyValues(STATE);
@@ -357,6 +368,10 @@ public final class AutorootService extends Service {
             completeBudgetAttempt(state, budget);
             return;
         }
+        // The attempt's verdict is in, so any of its process tree
+        // still alive is an orphan: sweep before the handoff,
+        // whose shell calls the orphans would otherwise starve.
+        sweepAttemptOrphans("post-attempt");
         boolean up = false;
         for (int waited = 0; waited < 30; waited += 5) {
             if (daemonServingRoot()) {
@@ -374,7 +389,7 @@ public final class AutorootService extends Service {
             Log.i(TAG, "daemon up after attempt " + attempts);
             logFile("daemon up attempt=" + attempts);
             publishStatus("DONE", attempts, maxAttempts, "root active");
-            if (ensureShizukuRoot()) {
+            if (finishShizukuHandoff()) {
                 stopDaemon();
             }
             state.put("done_boot", bootId);
@@ -963,6 +978,54 @@ public final class AutorootService extends Service {
         return null;
     }
 
+    // ---- post-attempt orphan sweep + bounded handoff ---------------
+
+    /**
+     * Kills the just-finished attempt's leftover process tree
+     * (see OrphanSweep for the selection policy). Runs from this
+     * service's shell context (uid 2000, the same uid the attempt
+     * processes run as), which can signal them - the root daemon
+     * cannot (its shell SELinux domain gets EPERM, observed live
+     * 2026-11-17). Best effort: a failed sweep is logged, never
+     * fatal - the bounded handoff and its retry are the backstop.
+     */
+    private void sweepAttemptOrphans(String when) {
+        try {
+            String ps = shell("ps -A -o pid,ppid,comm");
+            List<Integer> kill = OrphanSweep.selectKillPids(
+                    ps, android.os.Process.myPid());
+            if (kill.isEmpty()) {
+                return;
+            }
+            StringBuilder command = new StringBuilder("kill -9");
+            for (int pid : kill) {
+                command.append(' ').append(pid);
+            }
+            shell(command.toString());
+            Log.w(TAG, "orphan sweep (" + when + ") killed " + kill);
+            logFile("orphan sweep when=" + when + " killed=" + kill);
+        } catch (Exception error) {
+            Log.w(TAG, "orphan sweep failed (" + when + ")", error);
+            logFile("orphan sweep failed when=" + when + " " + error);
+        }
+    }
+
+    /**
+     * The Shizuku handoff: one bounded try, then - if it did not
+     * complete - a re-sweep of the attempt's orphans and exactly
+     * one retry before giving up. Giving up is survivable by
+     * design: the daemon stays up, and the next service start
+     * takes the daemon-up path above and tries the handoff again.
+     */
+    private boolean finishShizukuHandoff() {
+        if (ensureShizukuRoot()) {
+            return true;
+        }
+        logFile("handoff incomplete; re-sweeping orphans, retrying once");
+        sweepAttemptOrphans("handoff-retry");
+        return ensureShizukuRoot();
+    }
+
     // ---- root daemon --------------------------------------------------
 
     private boolean daemonServingRoot() {
@@ -1104,7 +1167,13 @@ public final class AutorootService extends Service {
                     + quote(starter) + " --apk=" + quote(apkMatch.group(1))
                     + "; sleep 1; pidof shizuku_server";
             daemonExec(command);
-            for (int waited = 0; waited < 30; waited += 2) {
+            // Bounded by the wall clock, not the iteration count:
+            // under a wedged attempt tree each shell() poll can
+            // itself take minutes, so a fixed 30-iteration loop
+            // was the unbounded wait behind the ~13-minute
+            // handoff stalls. finishShizukuHandoff owns the retry.
+            long deadlineMs = System.currentTimeMillis() + HANDOFF_WAIT_MS;
+            while (System.currentTimeMillis() < deadlineMs) {
                 Thread.sleep(2000);
                 String newPid = shell("pidof shizuku_server").trim().split("\\s+")[0];
                 if (!newPid.isEmpty() && newPid.matches("\\d+")

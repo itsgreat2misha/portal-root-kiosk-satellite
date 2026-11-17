@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 import provision_portal as provision_portal_module  # noqa: E402
 from provision_portal import (  # noqa: E402
     AUTOROOT_DISABLE_FLAG_REMOTE,
+    AUTOROOT_FLAG_ABSENT_TOKEN,
+    AUTOROOT_FLAG_PRESENT_TOKEN,
     AUTOROOT_GUARD_TOKEN,
     PortalProvisioner,
     ProvisionError,
@@ -39,7 +41,11 @@ class FakeFlagDevice:
     All non-flag commands fail with rc=1. Failure injection:
     fail_set (the guard's create never lands), fail_rm (removal
     never lands), dark (every flag command reports an adb transport
-    error, as a wedged device does)."""
+    error, as a wedged device does), disrupt_probes (the Run 34
+    shape: that many initial flag probes after disruption starts
+    return a bare non-zero with no token while rm/touch never
+    land, as commands issued into an adbd restart do; the
+    disruption is armed by setting the attribute mid-run)."""
 
     def __init__(
         self,
@@ -54,6 +60,7 @@ class FakeFlagDevice:
         self.fail_set = fail_set
         self.fail_rm = fail_rm
         self.dark = dark
+        self.disrupt_probes = 0
         self.flag_commands: list[str] = []
 
     def adb_run(self, arguments, timeout=None, check=False):
@@ -67,9 +74,19 @@ class FakeFlagDevice:
             return subprocess.CompletedProcess(
                 arguments, 1, "error: device offline"
             )
+        if self.disrupt_probes > 0:
+            if "test" in arguments:
+                self.disrupt_probes -= 1
+                return subprocess.CompletedProcess(arguments, 1, "")
+            # rm / touch / echo issued into the disruption are lost.
+            return subprocess.CompletedProcess(arguments, 1, "")
         if "test" in arguments:
             return subprocess.CompletedProcess(
-                arguments, 0 if self.present else 1, ""
+                arguments,
+                0 if self.present else 1,
+                AUTOROOT_FLAG_PRESENT_TOKEN
+                if self.present
+                else AUTOROOT_FLAG_ABSENT_TOKEN,
             )
         if "cat" in arguments:
             if not self.present:
@@ -94,6 +111,15 @@ class FakeFlagDevice:
 class AutorootGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         provision_portal_module._autoroot_guard_depth = 0
+        # The restore's retry delays ride out a real adbd restart;
+        # the fakes answer instantly, so collapse them to zero.
+        delays = mock.patch.object(
+            provision_portal_module,
+            "AUTOROOT_GUARD_RESTORE_DELAYS",
+            (0.0, 0.0, 0.0, 0.0),
+        )
+        delays.start()
+        self.addCleanup(delays.stop)
 
     def tearDown(self) -> None:
         provision_portal_module._autoroot_guard_depth = 0
@@ -293,6 +319,54 @@ class AutorootGuardTest(unittest.TestCase):
             self.assertIn(
                 "AUTOROOT_GUARD_RESTORE_FAILED", stdout.getvalue()
             )
+
+    def test_disrupted_restore_never_claims_restored(self) -> None:
+        """The Run 34 shape: the release's rm is lost in an adbd
+        disruption and its probes come back with no token at all.
+        The old exit-code check printed AUTOROOT_GUARD_RESTORED
+        over a flag that was still on disk; the restore must now
+        report failure, and the run's own error stays unmasked."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.make_provisioner(temporary)
+            device = FakeFlagDevice()
+            stdout = io.StringIO()
+
+            def stages():
+                device.disrupt_probes = 99
+                raise ProvisionError("device wedged")
+
+            with (
+                mock.patch.object(provisioner, "connect"),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=device.adb_run
+                ),
+                mock.patch.object(
+                    provisioner, "_provision_stages", side_effect=stages
+                ),
+                contextlib.redirect_stdout(stdout),
+                self.assertRaisesRegex(ProvisionError, "device wedged"),
+            ):
+                provisioner.provision()
+            output = stdout.getvalue()
+            self.assertIn("AUTOROOT_GUARD_RESTORE_FAILED", output)
+            self.assertNotIn("AUTOROOT_GUARD_RESTORED", output)
+            self.assertTrue(device.present)
+
+    def test_disrupted_restore_recovers_within_the_window(self) -> None:
+        """The same disruption, clearing after two probes: the
+        bounded retry re-applies the rm once the transport answers
+        again, and RESTORED is printed only over a verified absent
+        flag."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.make_provisioner(temporary)
+            device = FakeFlagDevice()
+
+            def stages():
+                device.disrupt_probes = 2
+
+            _, output = self.drive(provisioner, device, stages)
+            self.assertIn("AUTOROOT_GUARD_RESTORED prior=absent", output)
+            self.assertFalse(device.present)
 
     def test_status_only_never_touches_the_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1163,7 +1163,11 @@ def flag_aware_adb_run(state: dict | None = None):
             return subprocess.CompletedProcess(arguments, 1, "")
         if "test" in arguments:
             return subprocess.CompletedProcess(
-                arguments, 0 if state["present"] else 1, ""
+                arguments,
+                0 if state["present"] else 1,
+                provision_portal_module.AUTOROOT_FLAG_PRESENT_TOKEN
+                if state["present"]
+                else provision_portal_module.AUTOROOT_FLAG_ABSENT_TOKEN,
             )
         if "cat" in arguments:
             if not state["present"]:

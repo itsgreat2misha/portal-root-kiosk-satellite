@@ -115,7 +115,11 @@ def flag_aware_adb_run(state: dict | None = None, fallback_returncode: int = 1):
             )
         if "test" in arguments:
             return subprocess.CompletedProcess(
-                arguments, 0 if state["present"] else 1, ""
+                arguments,
+                0 if state["present"] else 1,
+                provision_portal_module.AUTOROOT_FLAG_PRESENT_TOKEN
+                if state["present"]
+                else provision_portal_module.AUTOROOT_FLAG_ABSENT_TOKEN,
             )
         if "cat" in arguments:
             if not state["present"]:
@@ -2224,6 +2228,18 @@ class FailureBeforeRebootTest(unittest.TestCase):
 
             def adb_run(arguments, timeout=None, check=False):
                 del timeout, check
+                arguments = [str(argument) for argument in arguments]
+                if (
+                    "portal-autoroot.disable" in " ".join(arguments)
+                    and "test" in arguments
+                ):
+                    # The guard's flag probe: answer present, so
+                    # the run reaches the target check it is about.
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        provision_portal_module.AUTOROOT_FLAG_PRESENT_TOKEN,
+                    )
                 return subprocess.CompletedProcess(
                     arguments, 0, "unknown-value\n"
                 )
