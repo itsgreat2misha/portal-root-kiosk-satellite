@@ -227,6 +227,58 @@ def print_banner() -> None:
     print(PROVISIONER_BANNER, file=sys.stderr, flush=True)
 
 
+# The watch verdict's STEP is cfi_last_step from the native payload:
+# the CFI-stage steps below plus the post-root action ladder in
+# run_postroot_actions() (exploit/src/fops.c), where the step names
+# the first failed action. Steps 70-79 are the custom payload's
+# failure phase, 150-199 the audio-persistence sub-steps, and
+# 250-269 the UID1000 helper's sub-steps.
+WATCH_STEP_ACTIONS: dict[int, str] = {
+    0: "none",
+    1: "CFI write",
+    2: "CFI llseek repair",
+    3: "CFI readback",
+    4: "FOPS check",
+    5: "FOPS restore",
+    6: "FOPS verify",
+    7: "post-root cleanup",
+    8: "credential install",
+    9: "KASLR base",
+    10: "boot-id restore",
+    11: "ashmem open",
+    12: "runtime memstart",
+    13: "audio control",
+    14: "wireless ADB",
+    16: "device owner",
+    17: "OTA block",
+    18: "Meta accounts",
+    19: "presence profile",
+    20: "Shizuku key",
+    21: "presence FPS",
+    22: "component profile",
+    23: "presence key",
+    24: "MHA tuning",
+    25: "UID1000 camera light",
+    26: "action child spawn",
+    27: "owner clear",
+    28: "binary scratch verify",
+    30: "lock repair",
+}
+
+
+def watch_step_action(step: int) -> str:
+    """Name the native ladder step a watch verdict reports."""
+    if step in WATCH_STEP_ACTIONS:
+        return WATCH_STEP_ACTIONS[step]
+    if 70 <= step < 80:
+        return "custom payload"
+    if 150 <= step < 200:
+        return "audio persistence"
+    if 250 <= step < 270:
+        return "UID1000 helper"
+    return "unknown"
+
+
 class PortalProvisioner:
     def __init__(
         self,
@@ -291,6 +343,10 @@ class PortalProvisioner:
         self.ota_already_configured = False
         self.ota_backend_value = ota_backend_value
         self.ota_unverified = False
+        # Process whose credential the most recently built exploit
+        # environment's action child clones, if any; reported by
+        # exploit() alongside the environment's action keys.
+        self._action_credential_source: str | None = None
         self.enable_updates = enable_updates
         self.debloat = debloat
         self.debloat_already_configured = False
@@ -3883,6 +3939,7 @@ class PortalProvisioner:
             or private_presence_action
             or private_uid1000_action
         )
+        self._action_credential_source = None
         if credential_action:
             if private_meta_action and (
                 self.meta_accounts_local_only or self.meta_accounts_finalize_only
@@ -3929,6 +3986,7 @@ class PortalProvisioner:
                     "GHOSTLOCK_ACTION_EXPECT_UID": uid,
                 }
             )
+            self._action_credential_source = source_process
             if private_audio_action:
                 environment.update(
                     {
@@ -3949,16 +4007,42 @@ class PortalProvisioner:
             and self.meta_accounts_absent
         ):
             environment["GHOSTLOCK_META_ACCOUNTS_EMPTY"] = "1"
+        # The OTA block action belongs to the dedicated OTA phase,
+        # whose action child clones the OTA installer credential. On
+        # targets with such a credential, the main flow's own attempts
+        # run under init's credential instead: install_ota_block()
+        # writes inside the alohausers app-private directory, fails
+        # there with EACCES (step 17), and every race the phase won is
+        # discarded (Run 37A, 2026-11-16: the dedicated phases had run,
+        # verification stayed unverified, and the key leaked into the
+        # standard-install attempts). Targets without a dedicated OTA
+        # credential have no separate phase, so their standard context
+        # keeps the action exactly as before.
+        ota_phase_owns_block = private_ota_action or not (
+            self.target.ota_installer_credentials
+            or self.target.ota_system_credentials
+            or self.target.ota_credential_process is not None
+        )
         if self.ota_backend_value is not None:
             environment["GHOSTLOCK_OTA_BACKEND_VALUE"] = self.ota_backend_value
         elif self.disable_updates and not self.ota_already_configured:
-            environment["GHOSTLOCK_OTA_BLOCK"] = "1"
-            if self.target.device == "aloha":
-                environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"] = "1"
+            if ota_phase_owns_block:
+                environment["GHOSTLOCK_OTA_BLOCK"] = "1"
+                if self.target.device == "aloha":
+                    environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"] = "1"
         if self.enable_updates and self.ota_backend_value is None:
             environment["GHOSTLOCK_RESTORE_OTA_BLOCK"] = "1"
         if self.optimize_presence and not self.presence_already_configured:
-            environment["GHOSTLOCK_PRESENCE_PROFILE"] = "1"
+            # Same phase rule as the OTA block: on targets with a
+            # dedicated presence installer credential the profile
+            # action belongs to the dedicated presence phase. Carried
+            # into the main flow's attempts it writes inside the
+            # aiservice app-private directory under init's credential,
+            # fails with EACCES (step 19), and discards won races.
+            if private_presence_action or not (
+                self.target.presence_installer_credentials
+            ):
+                environment["GHOSTLOCK_PRESENCE_PROFILE"] = "1"
         if self.restore_presence_profile:
             environment["GHOSTLOCK_RESTORE_PRESENCE_PROFILE"] = "1"
         if self.presence_fps_action_requested():
@@ -4154,6 +4238,26 @@ class PortalProvisioner:
             raise ProvisionError("target must be selected before exploitation")
         environment = self.build_exploit_environment(base, memstart, attempt)
         credential_action = "GHOSTLOCK_ACTION_CREDENTIAL_PID" in environment
+        # One line per attempt naming the phase's credential context
+        # and every GHOSTLOCK_* key its action child will run, so an
+        # action key leaking into a phase whose context cannot
+        # perform it is visible in the host log at a glance.
+        print(
+            "EXPLOIT_ATTEMPT_ENV "
+            f"attempt={attempt} "
+            f"credential_source={self._action_credential_source or 'none'} "
+            "credential_pid="
+            f"{environment.get('GHOSTLOCK_ACTION_CREDENTIAL_PID', 'none')} "
+            "ghostlock_keys="
+            + ",".join(
+                sorted(
+                    name
+                    for name in environment
+                    if name.startswith("GHOSTLOCK_")
+                )
+            ),
+            flush=True,
+        )
         shell = "env " + " ".join(
             f"{name}={shlex.quote(value)}" for name, value in environment.items()
         ) + " /system/bin/true"
@@ -4229,11 +4333,15 @@ class PortalProvisioner:
                 )
         if self.ota_backend_value is not None:
             expected_markers["ota_backend"] = ("OTA backend property", True)
-        elif self.disable_updates and not self.ota_already_configured:
+        elif "GHOSTLOCK_OTA_BLOCK" in environment:
             expected_markers["ota_block"] = ("OTA block file install", True)
         if self.enable_updates and self.ota_backend_value is None:
             expected_markers["ota_restore"] = ("OTA block restore", True)
-        if self.optimize_presence and not self.presence_already_configured:
+        if (
+            self.optimize_presence
+            and not self.presence_already_configured
+            and "GHOSTLOCK_PRESENCE_PROFILE" in environment
+        ):
             expected_markers["presence_profile"] = (
                 "presence profile install",
                 True,
@@ -4380,6 +4488,19 @@ class PortalProvisioner:
                 else:
                     pending_output = ""
                 for line in lines:
+                    watch_match = re.search(
+                        r"WATCH_CFI_OK=\d+ STEP=(\d+) ERRNO=\d+", line
+                    )
+                    if watch_match:
+                        step = int(watch_match.group(1))
+                        annotation = (
+                            f"WATCH_STEP step={step} "
+                            f"action={watch_step_action(step)}\n"
+                        )
+                        sys.stdout.write(annotation)
+                        sys.stdout.flush()
+                        output.write(annotation)
+                        output.flush()
                     if (
                         self.target.post_scheduler_timeout_seconds > 0
                         and "post-scheduler checkpoint complete" in line

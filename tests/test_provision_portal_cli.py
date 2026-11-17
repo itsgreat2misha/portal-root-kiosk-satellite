@@ -44,6 +44,7 @@ from provision_portal import (  # noqa: E402
     build,
     parse_args,
     parse_ota_config,
+    watch_step_action,
 )
 from meta_debloat_components import (  # noqa: E402
     DEBLOAT_COMPONENT_NAMES,
@@ -2035,6 +2036,139 @@ class OtaPlatformBackendTest(unittest.TestCase):
             self.assertEqual(environment["GHOSTLOCK_OTA_BLOCK"], "1")
             self.assertNotIn("GHOSTLOCK_OTA_PLATFORM_BACKEND", environment)
             self.assertNotIn("GHOSTLOCK_OTA_BACKEND_VALUE", environment)
+
+    def test_combined_aloha_env_omits_ota_block(self) -> None:
+        # A multi-action run on an installer-credential target: the
+        # dedicated OTA phase owns the OTA block action. The main
+        # flow's attempts run under init's credential, where the
+        # action fails with EACCES and discards won races, so the
+        # combined environment must not carry the key even while the
+        # OTA state is still unverified.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                audio=True,
+                disable_updates=True,
+            )
+            provisioner.target = self.aloha_target()
+            self.assertFalse(provisioner.ota_already_configured)
+            calls: list[list[str]] = []
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                calls.append(arguments)
+                value = (
+                    "1204"
+                    if arguments[:2] == ["shell", "pidof"]
+                    else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n"
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertNotIn("GHOSTLOCK_OTA_BLOCK", environment)
+            self.assertNotIn("GHOSTLOCK_OTA_PLATFORM_BACKEND", environment)
+            self.assertNotIn(
+                "GHOSTLOCK_ACTION_CREDENTIAL_PID", environment
+            )
+            self.assertFalse(
+                any(
+                    call[:2] == ["shell", "pidof"] for call in calls
+                ),
+                "combined attempts must not resolve a credential identity",
+            )
+            # Sanity: the combined environment really was built, with
+            # the run's other actions present.
+            self.assertEqual(environment["GHOSTLOCK_AUDIO_PERSIST"], "1")
+
+    def test_combined_aloha_env_omits_presence_profile(self) -> None:
+        # Same phase rule as the OTA block: the dedicated presence
+        # phase owns the profile action on installer-credential
+        # targets, so a combined run's environment must not carry it.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                disable_updates=True,
+                optimize_presence=True,
+            )
+            provisioner.target = self.aloha_target()
+            self.assertFalse(provisioner.presence_already_configured)
+            with mock.patch.object(
+                provisioner,
+                "adb_run",
+                return_value=subprocess.CompletedProcess([], 0, "1000\n"),
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertNotIn("GHOSTLOCK_PRESENCE_PROFILE", environment)
+            self.assertNotIn("GHOSTLOCK_OTA_BLOCK", environment)
+
+    def test_dedicated_aloha_presence_env_has_presence_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                optimize_presence=True,
+            )
+            provisioner.target = self.aloha_target()
+            calls: list[list[str]] = []
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                calls.append(arguments)
+                value = (
+                    "1204"
+                    if arguments[:2] == ["shell", "pidof"]
+                    else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n"
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                environment = provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+            self.assertIn(["shell", "pidof", "installd"], calls)
+            self.assertEqual(environment["GHOSTLOCK_PRESENCE_PROFILE"], "1")
+            self.assertEqual(
+                environment["GHOSTLOCK_PRESENCE_PRIVATE_ONLY"], "1"
+            )
+
+    def test_watch_step_action_names_ladder_steps(self) -> None:
+        self.assertEqual(watch_step_action(0), "none")
+        self.assertEqual(watch_step_action(17), "OTA block")
+        self.assertEqual(watch_step_action(19), "presence profile")
+        self.assertEqual(watch_step_action(24), "MHA tuning")
+        self.assertEqual(watch_step_action(30), "lock repair")
+        self.assertEqual(watch_step_action(75), "custom payload")
+        self.assertEqual(watch_step_action(151), "audio persistence")
+        self.assertEqual(watch_step_action(251), "UID1000 helper")
+        self.assertEqual(watch_step_action(999), "unknown")
 
     def test_preflight_aloha_requires_backend_property(self) -> None:
         aloha = self.aloha_target()
