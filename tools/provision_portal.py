@@ -1059,6 +1059,39 @@ class PortalProvisioner:
             + (" leftover=1" if leftover else ""),
             flush=True,
         )
+        self._report_autoroot_stood_down()
+
+    def _report_autoroot_stood_down(self) -> None:
+        """Surface a failure-budget stand-down found on the device.
+
+        After 3 consecutive verdict-less (crashed or frozen)
+        attempts the on-device helper stops racing and records the
+        stand-down in its state file; a provision run is the next
+        host connection, so report it here, where the run already
+        inspects the autoroot guard state. Best-effort: a device
+        without the state file, or without the stand-down key, has
+        nothing to report, and a failed read never fails the run.
+        The stand-down itself is untouched - a re-stage clears it,
+        and so does the user on the device.
+        """
+        try:
+            result = self.adb_run(
+                ["shell", "cat", f"{AUTOROOT_REMOTE_DIR}/state"],
+                timeout=15,
+            )
+        except (ProvisionError, OSError):
+            return
+        values: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key.strip()] = value.strip()
+        if values.get("budget_stood_down") == "1":
+            print(
+                "AUTOROOT_STOOD_DOWN streak="
+                + values.get("budget_streak", "?"),
+                flush=True,
+            )
 
     def _release_autoroot_guard(self, succeeded: bool) -> None:
         global _autoroot_guard_depth

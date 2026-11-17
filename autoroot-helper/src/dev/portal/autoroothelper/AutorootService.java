@@ -5,9 +5,14 @@
 
 package dev.portal.autoroothelper;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
 
@@ -39,6 +44,10 @@ import java.util.zip.ZipInputStream;
  * to answer.
  * Attempts are counted in a state file under /data/local/tmp so the
  * per-session cap survives the reboots a failed attempt can cause.
+ * The same state file carries the cross-boot failure budget (see
+ * FailureBudget): attempts that never complete - the crash/freeze
+ * signature - are counted across boots, and after 3 in a row the
+ * service stands down instead of looping the fault forever.
  */
 public final class AutorootService extends Service {
     private static final String TAG = "PortalAutoroot";
@@ -63,6 +72,8 @@ public final class AutorootService extends Service {
             "dev.portal.autoroothelper.RUN_NOW";
     public static final String ACTION_STATUS_QUERY =
             "dev.portal.autoroothelper.STATUS_QUERY";
+    public static final String ACTION_REENABLE =
+            "dev.portal.autoroothelper.REENABLE";
     public static final String EXTRA_ENABLED = "enabled";
 
     public static final String PREFS_NAME = "autoroot_status";
@@ -71,10 +82,17 @@ public final class AutorootService extends Service {
     public static final String PREF_MAX = "max";
     public static final String PREF_DETAIL = "detail";
     public static final String PREF_DISABLED = "disabled";
+    public static final String PREF_STOOD_DOWN = "stood_down";
+
+    // The failure-budget stand-down notification: posted on the
+    // stood-down boot and kept while stood down (see FailureBudget).
+    private static final String NOTIFY_CHANNEL_ID = "autoroot_stood_down";
+    private static final int NOTIFY_ID_STOOD_DOWN = 1;
 
     private volatile boolean workerRunning;
     private volatile boolean stopRequested;
     private volatile boolean forceFreshSession;
+    private volatile boolean budgetAttemptOpen;
     private volatile AdbClient activeClient;
     private volatile String lastPhase = "IDLE";
     private volatile int lastAttempt;
@@ -97,15 +115,26 @@ public final class AutorootService extends Service {
             new Thread(this::refreshDisabledPref, "portal-autoroot-ctl").start();
             return START_STICKY;
         }
+        if (ACTION_REENABLE.equals(action)) {
+            // The user accepted the risk on the helper screen:
+            // clear the stand-down, then start a session.
+            new Thread(() -> handleReenable(startId),
+                    "portal-autoroot-ctl").start();
+            return START_STICKY;
+        }
         if (ACTION_RUN_NOW.equals(action)) {
             forceFreshSession = true;
         }
+        startWorkerIfIdle(startId);
+        return START_STICKY;
+    }
+
+    private void startWorkerIfIdle(int startId) {
         if (!workerRunning) {
             workerRunning = true;
             stopRequested = false;
             new Thread(() -> run(startId), "portal-autoroot").start();
         }
-        return START_STICKY;
     }
 
     private void run(int startId) {
@@ -114,6 +143,7 @@ public final class AutorootService extends Service {
         } catch (Exception error) {
             Log.e(TAG, "autoroot pass failed", error);
             logFile("error " + error);
+            completeOpenAttemptAfterError();
         } finally {
             workerRunning = false;
             stopSelf(startId);
@@ -121,6 +151,11 @@ public final class AutorootService extends Service {
     }
 
     private void runAutoroot() throws Exception {
+        // The stand-down notification follows the persisted budget
+        // state on every service start, ahead of every early return
+        // below: it is kept while stood down and cleared only when
+        // the stand-down itself clears.
+        refreshStandDownNotification();
         if (!shell("test -f " + DISABLE_FLAG + " && echo yes").contains("yes")) {
             // not disabled: fall through
         } else {
@@ -146,6 +181,11 @@ public final class AutorootService extends Service {
             publishStatus("DONE", lastAttempt, lastMax, "root active (shizuku)");
             Map<String, String> state = readKeyValues(STATE);
             state.put("done_boot", bootId);
+            // Root is active, so an attempt left open by a previous
+            // boot did complete in effect - record its verdict
+            // instead of counting it incomplete at the accounting
+            // below.
+            completeBudgetAttempt(state);
             writeState(state);
             return;
         }
@@ -161,11 +201,33 @@ public final class AutorootService extends Service {
             }
             Map<String, String> state = readKeyValues(STATE);
             state.put("done_boot", bootId);
+            completeBudgetAttempt(state);
             writeState(state);
             return;
         }
 
         Map<String, String> state = readKeyValues(STATE);
+        // Failure-budget accounting for the previous attempt, then
+        // the stand-down gate - both before any new attempt starts.
+        // A verdict-less mark counts one incomplete; at the
+        // threshold the service stands down and does not race.
+        FailureBudget budget = loadBudget(state);
+        if (budget.accountBoot()) {
+            storeBudget(state, budget);
+            writeState(state);
+            logFile("failure budget: verdict-less attempt counted, streak="
+                    + budget.incompleteStreak());
+        }
+        if (budget.stoodDown()) {
+            Log.w(TAG, "autoroot stood down by failure budget streak="
+                    + budget.incompleteStreak());
+            logFile("stood down streak=" + budget.incompleteStreak());
+            publishStatus("STOOD_DOWN", lastAttempt, lastMax,
+                    "crashed or froze " + budget.incompleteStreak()
+                            + " boots running");
+            refreshStandDownNotification();
+            return;
+        }
         long now = System.currentTimeMillis() / 1000;
         long sessionStart = parseLong(state.get("session_start"), 0);
         int attempts = parseInt(state.get("attempts"), 0);
@@ -204,6 +266,14 @@ public final class AutorootService extends Service {
         attempts++;
         state.put("session_start", Long.toString(sessionStart));
         state.put("attempts", Integer.toString(attempts));
+        // The failure budget's in-progress mark, written before the
+        // attempt runs: from here on, every controlled exit records
+        // the attempt's verdict via completeBudgetAttempt, so a
+        // mark still set on a later boot means this attempt never
+        // completed (the crash/freeze signature).
+        budget.attemptStarted();
+        storeBudget(state, budget);
+        budgetAttemptOpen = true;
         writeState(state);
         logFile("attempt " + attempts + " of " + maxAttempts + " boot=" + bootId);
         publishStatus("ATTEMPT", attempts, maxAttempts, "discovering addresses");
@@ -213,12 +283,14 @@ public final class AutorootService extends Service {
         String kaslr = memstart == null ? null : discoverKaslr(simpleperf, offsets);
         if (stopRequested) {
             logFile("stopped by user");
+            completeBudgetAttempt(state, budget);
             return;
         }
         if (memstart == null || kaslr == null) {
             Log.w(TAG, "discovery failed memstart=" + memstart + " kaslr=" + kaslr);
             logFile("discovery failed memstart=" + memstart + " kaslr=" + kaslr);
             publishStatus("FAILED", attempts, maxAttempts, "discovery failed");
+            completeBudgetAttempt(state, budget);
             rebootForCleanAttempt(attempts, maxAttempts);
             return;
         }
@@ -260,6 +332,7 @@ public final class AutorootService extends Service {
         runAttemptWithWatchdog(kaslr, memstart, attempts, attemptLogOffset);
         if (stopRequested) {
             logFile("stopped by user");
+            completeBudgetAttempt(state, budget);
             return;
         }
         boolean up = false;
@@ -270,6 +343,7 @@ public final class AutorootService extends Service {
             }
             if (stopRequested) {
                 logFile("stopped by user");
+                completeBudgetAttempt(state, budget);
                 return;
             }
             Thread.sleep(5000);
@@ -282,12 +356,14 @@ public final class AutorootService extends Service {
                 stopDaemon();
             }
             state.put("done_boot", bootId);
+            completeBudgetAttempt(state, budget);
             writeState(state);
             return;
         }
         Log.w(TAG, "attempt " + attempts + " did not bring the daemon up");
         logFile("attempt failed n=" + attempts);
         publishStatus("FAILED", attempts, maxAttempts, "attempt failed");
+        completeBudgetAttempt(state, budget);
         rebootForCleanAttempt(attempts, maxAttempts);
     }
 
@@ -418,6 +494,164 @@ public final class AutorootService extends Service {
             return Long.parseLong(out);
         } catch (Exception ignored) {
             return 0;
+        }
+    }
+
+    // ---- failure budget ----------------------------------------------
+
+    private FailureBudget loadBudget(Map<String, String> state) {
+        return new FailureBudget(
+                parseInt(state.get(FailureBudget.KEY_STREAK), 0),
+                "1".equals(state.get(FailureBudget.KEY_OPEN)),
+                "1".equals(state.get(FailureBudget.KEY_STOOD_DOWN)));
+    }
+
+    private void storeBudget(Map<String, String> state,
+            FailureBudget budget) {
+        state.put(FailureBudget.KEY_STREAK,
+                Integer.toString(budget.incompleteStreak()));
+        state.put(FailureBudget.KEY_OPEN, budget.attemptOpen() ? "1" : "0");
+        state.put(FailureBudget.KEY_STOOD_DOWN,
+                budget.stoodDown() ? "1" : "0");
+    }
+
+    /**
+     * Records the verdict of the attempt this pass opened: the
+     * attempt completed under service control (win or clean loss),
+     * so its mark clears and the incomplete streak resets. Called
+     * on every controlled exit after the mark was written.
+     */
+    private void completeBudgetAttempt(Map<String, String> state,
+            FailureBudget budget) {
+        budget.attemptCompleted();
+        storeBudget(state, budget);
+        budgetAttemptOpen = false;
+        writeState(state);
+    }
+
+    /** Verdict for an open mark, loading the budget from the map. */
+    private void completeBudgetAttempt(Map<String, String> state) {
+        completeBudgetAttempt(state, loadBudget(state));
+    }
+
+    /**
+     * Safety net for a service-level failure (an exception out of
+     * runAutoroot): the device did not crash - this process caught
+     * the failure - so an attempt left open is closed as completed
+     * rather than counted incomplete on the next boot. Best effort:
+     * if the device is actually dying, the write simply fails and
+     * the mark survives, which is the correct outcome then.
+     */
+    private void completeOpenAttemptAfterError() {
+        if (!budgetAttemptOpen) {
+            return;
+        }
+        budgetAttemptOpen = false;
+        try {
+            Map<String, String> state = readKeyValues(STATE);
+            FailureBudget budget = loadBudget(state);
+            budget.attemptCompleted();
+            storeBudget(state, budget);
+            writeState(state);
+            logFile("attempt closed by error handler"
+                    + " (service-level failure)");
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * User re-enable from the helper screen (the notification's
+     * target): clears the counter and the stand-down, removes the
+     * notification, and starts a session. The budget re-arms - a
+     * persisting fault stands down again after 3 more incomplete
+     * boots. No provisioner run is needed; a host re-stage also
+     * clears the state (it deletes the state file).
+     */
+    private void handleReenable(int startId) {
+        try {
+            Map<String, String> state = readKeyValues(STATE);
+            FailureBudget budget = loadBudget(state);
+            budget.reenable();
+            storeBudget(state, budget);
+            writeState(state);
+            logFile("failure budget cleared by user re-enable");
+            publishStatus("IDLE", lastAttempt, lastMax, "re-enabled");
+            refreshStandDownNotification();
+        } catch (Exception error) {
+            Log.w(TAG, "re-enable failed", error);
+            return;
+        }
+        forceFreshSession = true;
+        startWorkerIfIdle(startId);
+    }
+
+    /**
+     * Keeps the stand-down notification and the published
+     * stood-down pref in step with the persisted budget state:
+     * posted while stood down, cancelled when not.
+     */
+    private void refreshStandDownNotification() {
+        boolean stoodDown = false;
+        int streak = 0;
+        try {
+            FailureBudget budget = loadBudget(readKeyValues(STATE));
+            stoodDown = budget.stoodDown();
+            streak = budget.incompleteStreak();
+        } catch (Exception ignored) {
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_STOOD_DOWN, stoodDown).apply();
+        if (stoodDown) {
+            postStandDownNotification(streak);
+        } else {
+            cancelStandDownNotification();
+        }
+    }
+
+    private void postStandDownNotification(int streak) {
+        try {
+            NotificationManager manager = (NotificationManager)
+                    getSystemService(NOTIFICATION_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 26) {
+                manager.createNotificationChannel(new NotificationChannel(
+                        NOTIFY_CHANNEL_ID, "Autoroot stand-down",
+                        NotificationManager.IMPORTANCE_DEFAULT));
+            }
+            Intent intent = new Intent(this, AutorootActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            PendingIntent pending = PendingIntent.getActivity(
+                    this, 0, intent,
+                    Build.VERSION.SDK_INT >= 23
+                            ? PendingIntent.FLAG_IMMUTABLE : 0);
+            Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, NOTIFY_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            Notification notification = builder
+                    .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                    .setContentTitle("Autoroot is off")
+                    .setContentText("Autoroot crashed or froze " + streak
+                            + " boots in a row and turned itself off."
+                            + " Tap to review and re-enable.")
+                    .setContentIntent(pending)
+                    .setOngoing(true)
+                    .build();
+            manager.notify(NOTIFY_ID_STOOD_DOWN, notification);
+        } catch (Exception error) {
+            Log.w(TAG, "stand-down notification failed", error);
+        }
+    }
+
+    private void cancelStandDownNotification() {
+        try {
+            NotificationManager manager = (NotificationManager)
+                    getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.cancel(NOTIFY_ID_STOOD_DOWN);
+            }
+        } catch (Exception ignored) {
         }
     }
 

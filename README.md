@@ -1259,6 +1259,17 @@ removed at staging time: the autoroot helper holds its own copy of the
 already-authorized ADB keypair, so the deployed set is the sentinel,
 Shizuku and the autoroot helper.
 
+The helper also keeps a failure budget across boots. An attempt that
+starts but never finishes (the device crashed or froze mid-attempt)
+counts against it; ordinary failed attempts do not. After 3 such boots
+in a row the helper turns autoroot off by itself and posts a
+notification, instead of crash-looping the Portal on every boot. Open
+the helper from the notification to re-enable autoroot; the screen
+states the risk first, and the budget re-arms, so a fault that is still
+there turns autoroot off again after 3 more bad boots. Re-running the
+provisioner also clears the stand-down, and a provision run reports one
+when it finds it.
+
 Autoroot attempts carry the same race risks as host-driven attempts,
 without anyone watching: a failed attempt reboots the Portal, and an
 attempt can occasionally leave it unresponsive until it is power-cycled.
