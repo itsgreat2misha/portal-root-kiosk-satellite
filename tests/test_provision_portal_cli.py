@@ -1546,6 +1546,7 @@ class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
         package: str,
         tag: str,
         install_outputs: list[str],
+        force: bool = False,
     ) -> tuple[dict[str, object], str, ProvisionError | None]:
         calls: dict[str, object] = {"install": 0, "uninstall": [], "push": 0}
         outputs = iter(install_outputs)
@@ -1579,7 +1580,7 @@ class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
         apk = pathlib.Path(temporary) / "payload.apk"
         apk.touch()
         provisioner = PortalProvisioner(
-            "192.0.2.1:5555", 1, pathlib.Path(temporary)
+            "192.0.2.1:5555", 1, pathlib.Path(temporary), force=force
         )
         stdout = io.StringIO()
         error: ProvisionError | None = None
@@ -1640,6 +1641,44 @@ class OwnPackageSignatureMismatchInstallTest(unittest.TestCase):
         self.assertEqual(calls["uninstall"], [AUTOROOT_HELPER_PACKAGE])
         self.assertIn("APK_INSTALL_RETRY", stdout)
         self.assertIn("APK_INSTALL_OK", stdout)
+
+    def test_force_autoroot_helper_signature_mismatch_still_retries(
+        self,
+    ) -> None:
+        # Regression (Nov 17, 2026): --force used to null the package
+        # on its way to the feature, disarming the retry along with
+        # the identical-skip. A force run's autoroot staging install
+        # hard-failed on a helper signed by the lost pre-Nov-16
+        # keystore even though the package is in the retry set.
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, stdout, error = self._run_install(
+                temporary,
+                AUTOROOT_HELPER_PACKAGE,
+                "autoroot-helper",
+                [self._incompatible(AUTOROOT_HELPER_PACKAGE), "Success\n"],
+                force=True,
+            )
+        self.assertIsNone(error)
+        self.assertEqual(calls["install"], 2)
+        self.assertEqual(calls["push"], 2)
+        self.assertEqual(calls["uninstall"], [AUTOROOT_HELPER_PACKAGE])
+        self.assertIn("APK_INSTALL_RETRY", stdout)
+        self.assertIn("APK_INSTALL_OK", stdout)
+
+    def test_force_other_package_signature_mismatch_still_fails_hard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, _, error = self._run_install(
+                temporary,
+                "moe.shizuku.privileged.api",
+                "shizuku",
+                [self._incompatible("moe.shizuku.privileged.api")],
+                force=True,
+            )
+        self.assertIsNotNone(error)
+        self.assertEqual(calls["install"], 1)
+        self.assertEqual(calls["uninstall"], [])
 
     def test_presence_helper_signature_mismatch_uninstalls_and_reinstalls(
         self,

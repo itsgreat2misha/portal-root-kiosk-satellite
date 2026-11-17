@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import provision_portal  # noqa: E402
 from provision_portal import (  # noqa: E402
+    AUTOROOT_HELPER_PACKAGE,
     AUTOROOT_REMOTE_DIR,
     EXPLOIT_SENTINEL_PACKAGE,
     SHIZUKU_HELPER_PACKAGE,
@@ -576,6 +577,90 @@ class AutorootStagingTest(unittest.TestCase):
         # its own copy of the keypair.
         self.assertIn("SHIZUKU_HELPER_REMOVED", output)
         self.assertIn("AUTOROOT_STAGED_OK", output)
+
+    def test_staging_force_run_retries_stale_signed_helper(self) -> None:
+        # Regression (Nov 17, 2026): in a --force run the staging
+        # install of the autoroot helper hard-failed with
+        # INSTALL_FAILED_UPDATE_INCOMPATIBLE on a device whose helper
+        # was signed by the lost pre-Nov-16 keystore, because --force
+        # stripped the package name the signature-mismatch retry is
+        # gated on. Unlike the other staging tests, the install seam
+        # is NOT mocked here: the real wrapper and feature run against
+        # the fake device, whose first helper install refuses the
+        # signature change and whose second succeeds.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary,
+                shizuku=True,
+                autoroot=True,
+                custom_payload=pathlib.Path("daemon.bin"),
+                force=True,
+            )
+            apk = pathlib.Path(temporary) / "helper.apk"
+            apk.write_bytes(b"apk")
+            runner = pathlib.Path(temporary) / "run.sh"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            install_outputs = iter(
+                [
+                    "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: "
+                    "Package dev.portal.autoroothelper signatures do "
+                    "not match previously installed version]\n",
+                    "Success\n",
+                ]
+            )
+            install_pushes: list[str] = []
+            uninstalls: list[str] = []
+
+            def adb_run(args, timeout=None, check=False):
+                if (
+                    args
+                    and args[0] == "shell"
+                    and "pm install" in args[1]
+                ):
+                    output = next(install_outputs)
+                    return subprocess.CompletedProcess(
+                        args, 0 if "Success" in output else 1, output, ""
+                    )
+                if args[:3] == ["shell", "pm", "path"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, "package:/data/app/~~s/base.apk\n", ""
+                    )
+                if args and args[0] == "push":
+                    if args[2].endswith("portal-autoroot-helper-install.apk"):
+                        install_pushes.append(args[2])
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args and args[0] == "uninstall":
+                    uninstalls.append(args[1])
+                    return subprocess.CompletedProcess(
+                        args, 0, "Success\n", ""
+                    )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    provision_portal, "AUTOROOT_HELPER_LOCAL", apk
+                ),
+                mock.patch.object(
+                    provision_portal, "AUTOROOT_RUNNER_LOCAL", runner
+                ),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+                mock.patch.object(provisioner, "settle_package_state"),
+                mock.patch.object(
+                    provisioner,
+                    "package_sets",
+                    return_value=(set(), set()),
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                provisioner.stage_autoroot_payload()
+        output = stdout.getvalue()
+        self.assertIn("APK_INSTALL_RETRY", output)
+        self.assertIn("AUTOROOT_STAGED_OK", output)
+        self.assertEqual(uninstalls, [AUTOROOT_HELPER_PACKAGE])
+        self.assertEqual(len(install_pushes), 2)
 
 
 if __name__ == "__main__":
