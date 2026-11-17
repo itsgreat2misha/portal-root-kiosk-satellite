@@ -381,6 +381,13 @@ backend property to be set and the gate to be observed being read from
 the override; if that cannot be positively established, the run records
 the OTA block as unverified instead of reporting success.
 
+On Aloha, `--disable-updates` also sets otad's own `otad.nodemon`
+property for the current boot. With it set, the daemon's loop never
+reaches its update path at all, so it makes no periodic check-ins
+either. The property is not persistent: when autoroot is staged, the
+helper re-asserts it after every boot for as long as updates stay
+disabled.
+
 The provisioner verifies the disabled packages and requires Meta's own service
 to report the value from the local override on two boots. It refuses to replace
 an unrelated existing override. The original file state is recorded under

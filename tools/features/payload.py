@@ -49,6 +49,7 @@ EXPLOIT_SENTINEL_LOCAL = (
 EXPLOIT_SENTINEL_PACKAGE = "dev.portal.exploitsentinel"
 CUSTOM_PAYLOAD_DST_REMOTE = "/data/local/tmp/portal-root-daemon"
 CUSTOM_PAYLOAD_PORT = 37373
+OTA_NODEMON_PROPERTY = "otad.nodemon"
 UID1000_RUNTIME_PACKAGE = "dev.portal.uid1000runtime"
 UID1000_RUNTIME_APK_LOCAL = (
     ROOT / "uid1000-helper/build/portal-uid1000-runtime.apk"
@@ -62,6 +63,8 @@ class PayloadConfig:
     shizuku: bool
     skip_shizuku_root: bool
     autoroot: bool
+    disable_updates: bool
+    enable_updates: bool
     disable_camera_light: bool
     restore_camera_light: bool
     restore_presence_fps: bool
@@ -417,6 +420,7 @@ class PayloadFeature:
 
     def apply_post_payload_root_steps(self) -> None:
         """Extra root-backed steps that need the payload serving first."""
+        self._apply_ota_nodemon()
         shizuku_root_ok = False
         if self._config.shizuku and not self._config.skip_shizuku_root:
             self._start_shizuku_as_root()
@@ -443,6 +447,66 @@ class PayloadFeature:
                     f"PAYLOAD_DAEMON_STOP_FAILED error={exc}",
                     flush=True,
                 )
+
+    def _apply_ota_nodemon(self) -> None:
+        """Set otad's nodemon property for the current boot (Aloha).
+
+        Part of --disable-updates: otad re-reads the property on
+        every loop iteration and, while it is set, never calls its
+        update path at all, so the daemon neither checks in nor
+        applies updates. The property is not persistent, so this
+        covers only the boot the run is on; the autoroot helper
+        re-asserts it on later boots when the staged config asks
+        for that (see _ota_nodemon_desired). Best-effort by design:
+        the OTA override verification does not depend on this
+        property, so a failure is reported, never raised.
+        """
+        target = self._target()
+        if not self._config.disable_updates:
+            return
+        if target is None or target.device != "aloha":
+            return
+        code, _ = self.daemon_exec(f"setprop {OTA_NODEMON_PROPERTY} true")
+        value = self._adb_run(
+            ["shell", "getprop", OTA_NODEMON_PROPERTY], timeout=5
+        ).stdout.strip()
+        if code == 0 and value == "true":
+            print(
+                f"OTA_NODEMON_SET property={OTA_NODEMON_PROPERTY} "
+                "value=true",
+                flush=True,
+            )
+        else:
+            print(
+                f"OTA_NODEMON_SET_FAILED property={OTA_NODEMON_PROPERTY} "
+                f"value={value!r} exit={code}",
+                flush=True,
+            )
+
+    def _ota_nodemon_desired(self) -> bool:
+        """Whether the staged autoroot config should re-assert
+        otad.nodemon after every boot.
+
+        Aloha only: the nodemon gate is an Aloha otad property. A
+        run that disables updates sets it; a run that re-enables
+        updates clears it; a run that does neither preserves the
+        value a previous staging left on the device, so staging
+        autoroot for an unrelated feature cannot silently drop
+        the re-assert.
+        """
+        target = self._target()
+        if target is None or target.device != "aloha":
+            return False
+        if self._config.disable_updates:
+            return True
+        if self._config.enable_updates:
+            return False
+        existing = self._adb_run(
+            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
+        ).stdout
+        return any(
+            line.strip() == "OTA_NODEMON=1" for line in existing.splitlines()
+        )
 
     def stage_autoroot_payload(self) -> None:
         """Stage the on-device autoroot runner and its boot helper.
@@ -604,6 +668,8 @@ class PayloadFeature:
                 f"SIMPLEPERF={simpleperf_remote}\n"
                 f"KASLR_OFFSETS={offsets}\n"
             )
+            if self._ota_nodemon_desired():
+                conf += "OTA_NODEMON=1\n"
             local_conf = pathlib.Path(temp) / "autoroot.conf"
             local_conf.write_text(conf, encoding="utf-8")
             self._adb_run(

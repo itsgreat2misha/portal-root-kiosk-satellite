@@ -126,6 +126,7 @@ from features.payload import (
     CUSTOM_PAYLOAD_PORT,
     EXPLOIT_SENTINEL_LOCAL,
     EXPLOIT_SENTINEL_PACKAGE,
+    OTA_NODEMON_PROPERTY,
     UID1000_RUNTIME_APK_LOCAL,
     UID1000_RUNTIME_PACKAGE,
     PayloadConfig,
@@ -407,6 +408,8 @@ class PortalProvisioner:
                 shizuku=self.shizuku,
                 skip_shizuku_root=self.skip_shizuku_root,
                 autoroot=self.autoroot,
+                disable_updates=self.disable_updates,
+                enable_updates=self.enable_updates,
                 disable_camera_light=self.disable_camera_light,
                 restore_camera_light=self.restore_camera_light,
                 restore_presence_fps=self.restore_presence_fps,
@@ -1710,6 +1713,7 @@ class PortalProvisioner:
         accounts = self.meta_accounts()
         authenticators = self.disabled_meta_authenticators()
         ota_dump = shell("dumpsys", "facebook.aloha.otaservice", timeout=15)
+        ota_nodemon = shell("getprop", OTA_NODEMON_PROPERTY, timeout=5)
         private_dns_mode = shell("settings", "get", "global", "private_dns_mode")
         private_dns_host = shell(
             "settings", "get", "global", "private_dns_specifier"
@@ -2007,6 +2011,7 @@ class PortalProvisioner:
                 "update_url": (
                     (parse_ota_config(ota_dump) or {}).get("kOtaJsonUrl")
                 ),
+                "nodemon": ota_nodemon or None,
                 "restored_marker": ota_restored,
             },
             "debloat": {
@@ -3463,6 +3468,52 @@ class PortalProvisioner:
             ota_backend_value=value,
         ).provision()
         return True
+
+    def sync_ota_nodemon_autoroot_conf(self) -> None:
+        """Keep the staged autoroot config's OTA_NODEMON key in step
+        with this run's updates request.
+
+        The autoroot helper re-asserts otad.nodemon after every boot
+        only while the staged config carries OTA_NODEMON=1 (see
+        PayloadFeature._ota_nodemon_desired for the staging-time
+        decision). A later run that changes the updates state
+        without re-staging autoroot — a bare --enable-updates is the
+        common case — would otherwise leave the helper asserting a
+        property the user just turned off. Runs that request no
+        updates change leave the config untouched.
+        """
+        if not (self.disable_updates or self.enable_updates):
+            return
+        if not self.target or self.target.device != "aloha":
+            return
+        if not self.autoroot_staged():
+            return
+        existing = self.adb_run(
+            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
+        ).stdout
+        if not existing.strip():
+            return
+        lines = [
+            line
+            for line in existing.splitlines()
+            if not line.startswith("OTA_NODEMON=")
+        ]
+        if self.disable_updates:
+            lines.append("OTA_NODEMON=1")
+        updated = "".join(f"{line}\n" for line in lines)
+        if updated == existing:
+            return
+        self.push_text_atomic(updated, AUTOROOT_CONF_REMOTE)
+        self.adb_run(
+            ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
+            timeout=5,
+            check=True,
+        )
+        print(
+            "OTA_NODEMON_CONF_SYNC "
+            f"value={'1' if self.disable_updates else '0'}",
+            flush=True,
+        )
 
     def debloat_preflight(self) -> bool:
         return self.settings_feature.debloat_preflight()
@@ -5827,6 +5878,7 @@ class PortalProvisioner:
         self.ota_already_configured = (
             self.ota_preflight() if self.disable_updates else False
         )
+        self.sync_ota_nodemon_autoroot_conf()
         with self.bootstrap_guard("disable_updates"):
             if (
                 self.disable_updates
