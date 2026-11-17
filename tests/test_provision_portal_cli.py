@@ -2485,6 +2485,26 @@ class OtaPlatformBackendTest(unittest.TestCase):
             "persist.sys.mobileconfigutil.usePlatformMobileConfig", fops
         )
 
+    def test_fops_ota_block_early_returns_log(self) -> None:
+        # The OTA block install path's early returns log the failing
+        # operation and errno, so the captured per-attempt log names
+        # the failure instead of recovering nothing on those paths.
+        for relative in (
+            "exploit/src/fops.c",
+            "exploit/targets/portal-ripley-2041515800015050/fops.c",
+        ):
+            fops = (ROOT / relative).read_text()
+            self.assertIn(
+                "OTA block existing override is not a regular file",
+                fops,
+            )
+            self.assertIn(
+                "OTA block absence marker write failed", fops
+            )
+            self.assertIn("OTA block temp file open failed", fops)
+        shared = (ROOT / "exploit/src/fops.c").read_text()
+        self.assertIn("OTA backend property value rejected", shared)
+
 
 OTA_DUMP_HEAD = (
     "----------\n"
