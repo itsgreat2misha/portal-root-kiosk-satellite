@@ -65,6 +65,19 @@ the fork diverged from upstream:
   daemon's config with retries (a dump cut off while the daemon is
   starting no longer reads as a stock value) and require both the
   gate and polling to be off.
+- OTA block and presence profile actions leaked into the main flow's
+  standard-install attempts on targets where a dedicated phase owns
+  them. When the dedicated phase's verification stayed unverified,
+  the main flow continued with the action still marked unconfigured,
+  so its attempts carried the action under init's credential; the
+  native action writes inside an app-private directory, failed with
+  EACCES, and every race those attempts won was discarded. Both keys
+  are now phase-gated to the dedicated phases on targets that have
+  one; targets without a dedicated credential phase are unchanged.
+  Attempts now log their credential source and GHOSTLOCK_* keys, the
+  watch verdict names the failed action next to its step number, and
+  the action child's log output is captured through shared memory
+  into the per-attempt log.
 
 ### Changed
 
