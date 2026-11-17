@@ -56,6 +56,16 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A `--force` run hard-failed the autoroot staging install with
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` when the on-device helper
+  was signed by an older build host's keystore: the provisioner
+  wrapper nulled the package name to bypass the byte-identical
+  install skip, and the signature-mismatch retry is gated on that
+  same name, so the retry was silently disarmed for every install
+  in a force run. `--force` now bypasses only the skip (an explicit
+  flag into the install seam); the package always goes through, so
+  the retry stays armed for the provisioner's own packages in
+  every run mode.
 - `--remove-meta-accounts` aborted at final verification when the
   alohausers package itself was disabled (a legitimate prior state:
   a user trial, another tool), wasting the run's completed race

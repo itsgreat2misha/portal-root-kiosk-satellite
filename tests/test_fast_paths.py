@@ -604,20 +604,28 @@ class ForceTest(unittest.TestCase):
         self.assertTrue(arguments.force)
 
     def test_force_bypasses_apk_install_skip(self) -> None:
+        # --force bypasses only the byte-identical skip, via the
+        # skip_if_identical flag; the package itself always goes
+        # through, because it also gates the signature-mismatch
+        # retry (nulling it disarmed the retry for every install in
+        # a force run — the autoroot staging install hit that on a
+        # stale old-keystore helper, Nov 17, 2026).
         with tempfile.TemporaryDirectory() as temporary:
-            for force, expected_package in ((False, "pkg"), (True, None)):
+            for force, expected_skip in ((False, True), (True, False)):
                 with self.subTest(force=force):
                     provisioner = make_provisioner(
                         temporary, force=force
                     )
                     seen: list = []
                     provisioner.shizuku_feature.install_apk_preserving_verifier = (  # noqa: E501
-                        lambda apk, tag, package=None: seen.append(package)
+                        lambda apk, tag, package=None, *, skip_if_identical=True: seen.append(  # noqa: E501
+                            (package, skip_if_identical)
+                        )
                     )
                     provisioner.install_apk_preserving_verifier(
                         pathlib.Path("x.apk"), "tag", "pkg"
                     )
-                    self.assertEqual(seen, [expected_package])
+                    self.assertEqual(seen, [("pkg", expected_skip)])
 
 
 class ShizukuEndStateDevice:

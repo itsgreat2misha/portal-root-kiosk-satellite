@@ -3134,14 +3134,18 @@ class PortalProvisioner:
         tag: str,
         package: str | None = None,
     ) -> None:
-        if self.force:
-            # --force: bypass the byte-identical install skip (the
-            # feature only skips when it is given a package to compare
-            # against), so every install of the provisioner's own
-            # packages is genuine.
-            package = None
         result = self.shizuku_feature.install_apk_preserving_verifier(
-            apk, tag, package
+            apk,
+            tag,
+            package,
+            # --force bypasses only the byte-identical install skip,
+            # so every install of the provisioner's own packages is
+            # genuine. The package still goes through: it also gates
+            # the signature-mismatch retry, and nulling it here used
+            # to disarm that retry for every install in a force run —
+            # the autoroot staging install hard-failed on a stale
+            # old-keystore helper that way (Nov 17, 2026).
+            skip_if_identical=not self.force,
         )
         self.package_verifier_before_install_disabled = (
             self.shizuku_feature.package_verifier_before_install_disabled

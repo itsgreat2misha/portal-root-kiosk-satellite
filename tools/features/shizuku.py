@@ -292,9 +292,22 @@ class ShizukuFeature:
         apk: pathlib.Path,
         tag: str,
         package: str | None = None,
+        *,
+        skip_if_identical: bool = True,
     ) -> None:
-        """Install an APK while restoring Meta's certificate verifier state."""
-        if package is not None and self.installed_apk_matches(apk, package, tag):
+        """Install an APK while restoring Meta's certificate verifier state.
+
+        skip_if_identical=False (the provisioner's --force) bypasses
+        only the byte-identical skip below. The package still gates
+        the signature-mismatch retry further down, which must stay
+        armed in every run: a stale copy signed by an older build
+        host can be present no matter how the run was invoked.
+        """
+        if (
+            package is not None
+            and skip_if_identical
+            and self.installed_apk_matches(apk, package, tag)
+        ):
             print(
                 f"APK_INSTALL_SKIP package={package} reason=identical",
                 flush=True,
