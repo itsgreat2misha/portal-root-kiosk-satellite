@@ -35,6 +35,7 @@ from provision_portal import (  # noqa: E402
     ADB_ENABLED_SETTING,
     DEFAULT_CUSTOM_PAYLOAD_LOCAL,
     MHA_AUDIO_VERIFIED_LOG,
+    META_AUTHENTICATOR_COMPONENTS,
     REMOTE_WIPE_COMPONENTS,
     SHIZUKU_HELPER_PACKAGE,
     SIGNATURE_MISMATCH_RETRY_PACKAGES,
@@ -739,6 +740,166 @@ class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
 
         ensure.assert_called_once_with()
         self.assertEqual(order[:2], ["adb-framework", "accounts"])
+
+    def test_meta_account_preflight_detects_disabled_package(self) -> None:
+        # A package-disabled alohausers (user trial, another tool) is
+        # not the designed end state (package enabled, authenticators
+        # disabled): preflight must not call it clean even when no
+        # accounts remain and the authenticators already read
+        # disabled, or the run would skip the action and still fail
+        # the strict final verification.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555",
+                1,
+                pathlib.Path(temporary),
+                remove_meta_accounts=True,
+            )
+            package_state = {"disabled": True}
+
+            def adb_run(
+                arguments: list[str],
+                timeout: float | None = None,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout, check
+                if arguments[1:4] == ["pm", "list", "packages"]:
+                    output = (
+                        "package:com.facebook.alohaservices.alohausers\n"
+                        if package_state["disabled"]
+                        else ""
+                    )
+                    return subprocess.CompletedProcess(arguments, 0, output)
+                return subprocess.CompletedProcess(
+                    arguments, 0, "# portal-meta-accounts-before-v1\n"
+                )
+
+            with (
+                mock.patch.object(
+                    provisioner, "ensure_adb_framework_enabled"
+                ),
+                mock.patch.object(
+                    provisioner, "meta_accounts", return_value=[]
+                ),
+                mock.patch.object(
+                    provisioner,
+                    "disabled_meta_authenticators",
+                    return_value=set(META_AUTHENTICATOR_COMPONENTS),
+                ),
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+                mock.patch.object(
+                    provisioner.settings_feature, "verify_retained_platform"
+                ),
+            ):
+                self.assertFalse(provisioner.meta_accounts_preflight())
+                self.assertTrue(provisioner.meta_accounts_package_disabled)
+                # The unchanged strict verification still rejects the
+                # package-disabled state...
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "alohausers package was disabled instead of its "
+                    "authenticators",
+                ):
+                    provisioner.verify_meta_accounts_removed()
+                # ...and passes once the action's device-side enable
+                # has normalized the package state.
+                package_state["disabled"] = False
+                provisioner.verify_meta_accounts_removed()
+
+    def test_meta_account_env_requests_package_enable_only_when_disabled(
+        self,
+    ) -> None:
+        aloha = next(t for t in TARGETS if t.device == "aloha")
+        for package_disabled in (True, False):
+            with self.subTest(package_disabled=package_disabled):
+                with tempfile.TemporaryDirectory() as temporary:
+                    provisioner = PortalProvisioner(
+                        "192.0.2.1:5555",
+                        1,
+                        pathlib.Path(temporary),
+                        remove_meta_accounts=True,
+                    )
+                    provisioner.target = aloha
+                    provisioner.meta_accounts_package_disabled = (
+                        package_disabled
+                    )
+                    # Staged by the run before any attempt is built.
+                    provisioner.uid1000_runtime_apk_remote = (
+                        "/data/local/tmp/portal-uid1000-runtime.apk"
+                    )
+                    provisioner.uid1000_runtime_library_remote = (
+                        "/data/local/tmp/libportal-uid1000.so"
+                    )
+
+                    def adb_run(
+                        arguments: list[str],
+                        timeout: float | None = None,
+                        check: bool = False,
+                    ) -> subprocess.CompletedProcess[str]:
+                        del timeout, check
+                        value = (
+                            "1204"
+                            if arguments[:2] == ["shell", "pidof"]
+                            else "1000"
+                        )
+                        return subprocess.CompletedProcess(
+                            arguments, 0, value + "\n"
+                        )
+
+                    with mock.patch.object(
+                        provisioner, "adb_run", side_effect=adb_run
+                    ):
+                        environment = provisioner.build_exploit_environment(
+                            0x1000, 0x2000, 1
+                        )
+                    self.assertEqual(
+                        environment["GHOSTLOCK_REMOVE_META_ACCOUNTS"], "1"
+                    )
+                    if package_disabled:
+                        self.assertEqual(
+                            environment[
+                                "GHOSTLOCK_META_ACCOUNTS_ENABLE_PACKAGE"
+                            ],
+                            "1",
+                        )
+                    else:
+                        self.assertNotIn(
+                            "GHOSTLOCK_META_ACCOUNTS_ENABLE_PACKAGE",
+                            environment,
+                        )
+
+    def test_fops_meta_accounts_package_enable_precedes_authenticator_state(
+        self,
+    ) -> None:
+        # The package enable runs in the action's own credential
+        # context, before any authenticator state is applied, and a
+        # failed enable fails the action there (no completion
+        # marker) instead of surfacing later as the host
+        # verification's abort.
+        for relative in (
+            "exploit/src/fops.c",
+            "exploit/targets/portal-ripley-2041515800015050/fops.c",
+        ):
+            fops = (ROOT / relative).read_text()
+            self.assertIn("GHOSTLOCK_META_ACCOUNTS_ENABLE_PACKAGE", fops)
+            self.assertIn(
+                "META_ACCOUNTS_PACKAGE_ENABLED prior=disabled", fops
+            )
+            self.assertIn(
+                "META_ACCOUNTS_PACKAGE_ENABLE_FAILED prior=disabled", fops
+            )
+            function = fops[fops.index("static int remove_meta_accounts"):]
+            enable_at = function.index(
+                "GHOSTLOCK_META_ACCOUNTS_ENABLE_PACKAGE"
+            )
+            failed_at = function.index("META_ACCOUNTS_PACKAGE_ENABLE_FAILED")
+            disable_at = function.index(
+                "run_pm_disable_component(components[i])"
+            )
+            self.assertLess(enable_at, disable_at)
+            self.assertIn("return 0;", function[failed_at:disable_at])
 
     def test_framework_enable_must_persist(self) -> None:
         def adb_run(

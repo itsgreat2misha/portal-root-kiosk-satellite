@@ -262,6 +262,7 @@ class SettingsFeature:
         self._read_remote_wipe_backup = read_remote_wipe_backup
         self._ensure_remote_wipe_backup = ensure_remote_wipe_backup
         self.meta_accounts_absent = False
+        self.meta_accounts_package_disabled = False
 
     @property
     def _config(self) -> SettingsConfig:
@@ -355,6 +356,12 @@ class SettingsFeature:
             )
             return set() if match is None else set(match.group(1).split())
 
+    def alohausers_package_disabled(self) -> bool:
+            output = self._adb_run(
+                ["shell", "pm", "list", "packages", "-d"], timeout=15, check=True
+            ).stdout
+            return "package:com.facebook.alohaservices.alohausers" in output
+
     def meta_accounts_preflight(self) -> bool:
             # Meta's Debug page is tied to the owner profile and can become empty
             # after account cleanup. Keep Android's own ADB framework active so a
@@ -363,11 +370,15 @@ class SettingsFeature:
             accounts = self._meta_accounts()
             self.meta_accounts_absent = not accounts
             disabled = self._disabled_meta_authenticators()
+            self.meta_accounts_package_disabled = (
+                self.alohausers_package_disabled()
+            )
             hardware_class = META_HARDWARE_AUTHENTICATOR.split("/", 1)[1]
             already_clean = (
                 not accounts
                 and set(META_AUTHENTICATOR_COMPONENTS) <= disabled
                 and hardware_class not in disabled
+                and not self.meta_accounts_package_disabled
             )
             existing = self._adb_run(
                 ["shell", "cat", META_ACCOUNT_BACKUP_REMOTE], timeout=5
