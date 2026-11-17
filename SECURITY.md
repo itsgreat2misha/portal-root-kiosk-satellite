@@ -35,9 +35,11 @@ that do matter:
   FORK.md for the design discussion.
 - Wireless ADB persistence intentionally keeps TCP 5555 reachable on
   the local network. Only enable it on networks you trust.
-- Helper APKs built from this repository are signed with your local
-  Android debug key, like any from-source build; protect that keystore
-  accordingly.
+- Helper APKs built from this repository are signed with the project
+  debug key committed at the repository root (`debug.keystore`); the
+  build verifies the keystore's certificate fingerprint and refuses
+  to sign with any other key, because devices reject
+  signature-mismatched updates.
 
 ## Supported versions
 

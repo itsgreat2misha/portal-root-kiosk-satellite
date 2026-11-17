@@ -5,4 +5,7 @@ NDK ?= $(if $(ANDROID_NDK_HOME),$(ANDROID_NDK_HOME),$(if $(ANDROID_NDK_ROOT),$(A
 BUILD_TOOLS ?= $(SDK)/build-tools/37.0.0
 ANDROID_JAR ?= $(SDK)/platforms/android-36/android.jar
 D8 ?= $(BUILD_TOOLS)/d8
-KEYSTORE ?= $(HOME)/.android/debug.keystore
+# The project debug keystore is committed at the repository root so every
+# build signs with the same key; the per-user keystore is only a fallback
+# for a tree that does not carry it.
+KEYSTORE ?= $(if $(wildcard $(abspath ../debug.keystore)),$(abspath ../debug.keystore),$(HOME)/.android/debug.keystore)

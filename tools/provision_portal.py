@@ -144,6 +144,17 @@ PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
 ANDROID_PLATFORM_VERSION = "android-36"
+# The project debug signing key, committed at the repository root so
+# every build signs the helper APKs with the same key. A device refuses
+# a signature-mismatched update, so building with any other key (for
+# example a locally regenerated ~/.android/debug.keystore) would strand
+# every already-provisioned device; the build-environment check enforces
+# this fingerprint and never lets a replacement key be generated.
+PROJECT_DEBUG_KEYSTORE = ROOT / "debug.keystore"
+PROJECT_DEBUG_KEYSTORE_SHA256 = (
+    "7E:65:E6:8E:F9:4A:31:A5:27:7A:D5:B4:70:75:A0:32:"
+    "9F:74:2E:F7:7C:6C:33:96:56:50:FE:44:25:85:8D:07"
+)
 PROVISIONER_BANNER = rf"""
 +----------------------------------------------------------------+
 |                                                                |
@@ -6402,6 +6413,33 @@ class PortalProvisioner:
         self.run_standard_install(use_exploit_sentinel)
 
 
+def keystore_certificate_sha256(keystore: pathlib.Path) -> str:
+    """Return the SHA-256 fingerprint of a keystore's signing certificate."""
+    result = subprocess.run(
+        [
+            "keytool",
+            "-list",
+            "-v",
+            "-keystore",
+            str(keystore),
+            "-storepass",
+            "android",
+            "-alias",
+            "androiddebugkey",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = re.search(r"SHA256:\s*([0-9A-Fa-f:]+)", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise ProvisionError(
+            f"could not read the signing certificate of {keystore} with "
+            "keytool; refusing to build with an unverified signing key"
+        )
+    return match.group(1).upper()
+
+
 def android_build_environment(
     target: PortalTarget | None = None,
     *,
@@ -6496,6 +6534,32 @@ def android_build_environment(
             + "\n- ".join(details)
         )
 
+    keystore_value = environment.get("KEYSTORE")
+    if keystore_value:
+        keystore = pathlib.Path(keystore_value).expanduser()
+    elif PROJECT_DEBUG_KEYSTORE.is_file():
+        keystore = PROJECT_DEBUG_KEYSTORE
+    else:
+        keystore = pathlib.Path.home() / ".android" / "debug.keystore"
+    if not keystore.is_file():
+        raise ProvisionError(
+            f"Android debug keystore not found: {keystore}. The build "
+            "signs every helper APK with the project debug key and never "
+            "generates a replacement: a fresh key would be refused as an "
+            "update by every already-provisioned device. Restore the "
+            "committed debug.keystore or point KEYSTORE at it."
+        )
+    keystore_fingerprint = keystore_certificate_sha256(keystore)
+    if keystore_fingerprint != PROJECT_DEBUG_KEYSTORE_SHA256:
+        raise ProvisionError(
+            f"Android debug keystore fingerprint mismatch: {keystore} "
+            f"has SHA-256 {keystore_fingerprint}, but this build must "
+            f"sign with the project debug key "
+            f"{PROJECT_DEBUG_KEYSTORE_SHA256}. Refusing to build: APKs "
+            "signed with a different key are rejected as updates by "
+            "already-provisioned devices."
+        )
+
     environment.update(
         {
             "SDK": str(sdk),
@@ -6505,6 +6569,7 @@ def android_build_environment(
             "BUILD_TOOLS": str(build_tools),
             "ANDROID_JAR": str(android_jar),
             "D8": str(d8),
+            "KEYSTORE": str(keystore),
         }
     )
     return environment
