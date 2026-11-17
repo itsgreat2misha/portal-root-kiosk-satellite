@@ -3477,14 +3477,15 @@ class PortalProvisioner:
         """Keep the staged autoroot config's OTA_NODEMON key in step
         with this run's updates request.
 
-        The autoroot helper re-asserts otad.nodemon after every boot
-        only while the staged config carries OTA_NODEMON=1 (see
-        PayloadFeature._ota_nodemon_desired for the staging-time
-        decision). A later run that changes the updates state
-        without re-staging autoroot — a bare --enable-updates is the
-        common case — would otherwise leave the helper asserting a
-        property the user just turned off. Runs that request no
-        updates change leave the config untouched.
+        The staged autoroot payload re-asserts otad.nodemon after
+        every boot only while the staged config carries
+        OTA_NODEMON=1 (see PayloadFeature._ota_nodemon_desired for
+        the staging-time decision). A later run that changes the
+        updates state without re-staging autoroot — a bare
+        --enable-updates is the common case — would otherwise leave
+        the payload asserting a property the user just turned off.
+        Runs that request no updates change leave the config
+        untouched.
         """
         if not (self.disable_updates or self.enable_updates):
             return
@@ -4160,6 +4161,28 @@ class PortalProvisioner:
                     environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"] = "1"
         if self.enable_updates and self.ota_backend_value is None:
             environment["GHOSTLOCK_RESTORE_OTA_BLOCK"] = "1"
+        # The nodemon action belongs to the standard-install
+        # attempts: their action child clones init's credential (no
+        # per-phase credential source, no preserved shell domain),
+        # which is the only context the property service accepts
+        # otad.nodemon writes from (probe, 2026-11-17: an init-cloned
+        # child set the property in two runs; the shell domain was
+        # refused everywhere, so the root-daemon set shipped earlier
+        # could never land). The dedicated OTA phase's child clones
+        # the OTA installer credential and the payload phase's child
+        # preserves the shell domain, so the key stays out of both;
+        # in the payload phase and in on-device autoroot the native
+        # payload runs the same action in a dedicated init-cloned
+        # child instead, keyed there by the staged runner from
+        # autoroot.conf, not by this environment.
+        if (
+            self.disable_updates
+            and self.target.device == "aloha"
+            and not credential_action
+            and not preserve_shell_domain
+            and not self._in_custom_payload_phase
+        ):
+            environment["GHOSTLOCK_OTA_NODEMON"] = "1"
         if self.optimize_presence and not self.presence_already_configured:
             # Same phase rule as the OTA block: on targets with a
             # dedicated presence installer credential the profile

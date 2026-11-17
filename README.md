@@ -384,8 +384,13 @@ the OTA block as unverified instead of reporting success.
 On Aloha, `--disable-updates` also sets otad's own `otad.nodemon`
 property for the current boot. With it set, the daemon's loop never
 reaches its update path at all, so it makes no periodic check-ins
-either. The property is not persistent: when autoroot is staged, the
-helper re-asserts it after every boot for as long as updates stay
+either. The property service accepts the write only from init's
+SELinux context, so the native payload performs the set in an
+action child carrying that context during the standard install
+phase, and the run reports the child's own read-back
+(`OTA_NODEMON_SET` / `OTA_NODEMON_SET_FAILED`). The property is
+not persistent: when autoroot is staged, the staged payload
+re-asserts it after every boot for as long as updates stay
 disabled.
 
 The provisioner verifies the disabled packages and requires Meta's own service

@@ -187,7 +187,6 @@ public final class AutorootService extends Service {
             // below.
             completeBudgetAttempt(state);
             writeState(state);
-            reassertOtaNodemon(conf);
             return;
         }
         if (daemonServingRoot()) {
@@ -204,7 +203,6 @@ public final class AutorootService extends Service {
             state.put("done_boot", bootId);
             completeBudgetAttempt(state);
             writeState(state);
-            reassertOtaNodemon(conf);
             return;
         }
 
@@ -360,7 +358,6 @@ public final class AutorootService extends Service {
             state.put("done_boot", bootId);
             completeBudgetAttempt(state, budget);
             writeState(state);
-            reassertOtaNodemon(conf);
             return;
         }
         Log.w(TAG, "attempt " + attempts + " did not bring the daemon up");
@@ -368,27 +365,6 @@ public final class AutorootService extends Service {
         publishStatus("FAILED", attempts, maxAttempts, "attempt failed");
         completeBudgetAttempt(state, budget);
         rebootForCleanAttempt(attempts, maxAttempts);
-    }
-
-    // Re-assert otad's nodemon property for this boot when the
-    // staged config asks for it (OTA_NODEMON=1, written at staging
-    // time when the provisioner disables updates on Aloha). The
-    // property is not persistent, so it must be re-applied after
-    // every boot; otad re-reads it on every loop iteration and,
-    // while it is set, never calls its update path - no check-ins,
-    // no update application. Runs only once root is established.
-    // Best effort: a failure is logged and never blocks recovery.
-    private void reassertOtaNodemon(Map<String, String> conf) {
-        if (!"1".equals(conf.get("OTA_NODEMON"))) {
-            return;
-        }
-        try {
-            String value = shell("setprop otad.nodemon true; "
-                    + "getprop otad.nodemon").trim();
-            logFile("otad.nodemon re-assert value=" + value);
-        } catch (Exception error) {
-            Log.w(TAG, "otad.nodemon re-assert failed", error);
-        }
     }
 
     // ---- attempt watchdog ----------------------------------------------

@@ -51,65 +51,158 @@ def completed(args, stdout: str = "", returncode: int = 0):
     return subprocess.CompletedProcess(args, returncode, stdout, "")
 
 
-class PostPayloadNodemonTest(unittest.TestCase):
-    """The in-run set: daemon EXEC + independent getprop read-back."""
+class NodemonEnvGatingTest(unittest.TestCase):
+    """GHOSTLOCK_OTA_NODEMON phase gating in build_exploit_environment.
 
-    def run_steps(self, provisioner, daemon_result, getprop_value: str):
-        def adb_run(args, timeout=None, check=False):
-            if args[:3] == ["shell", "getprop", "otad.nodemon"]:
-                return completed(args, getprop_value + "\n")
-            return completed(args)
+    The key may appear only in the standard-install attempts, whose
+    action child clones init's credential (no per-phase credential
+    source, no preserved shell domain): the only context the
+    property service accepts otad.nodemon writes from. The dedicated
+    OTA phase clones the OTA installer credential, the backend phase
+    clones system_server, and the payload phase preserves the shell
+    domain, so the key stays out of all three.
+    """
 
-        stdout = io.StringIO()
-        with (
-            mock.patch.object(
-                provisioner.payload_feature,
-                "daemon_exec",
-                return_value=daemon_result,
-            ) as daemon_exec,
-            mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
-            contextlib.redirect_stdout(stdout),
-        ):
-            provisioner.apply_post_payload_root_steps()
-        return daemon_exec, stdout.getvalue()
+    def build_environment(self, provisioner):
+        calls: list[list[str]] = []
 
-    def test_set_and_marker_on_aloha_disable_updates(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = make_provisioner(temporary, disable_updates=True)
-            daemon_exec, output = self.run_steps(provisioner, (0, ""), "true")
-        daemon_exec.assert_called_once_with("setprop otad.nodemon true")
-        self.assertIn("OTA_NODEMON_SET property=otad.nodemon value=true", output)
+        def adb_run(arguments, timeout=None, check=False):
+            del timeout, check
+            calls.append(arguments)
+            value = (
+                "1204" if arguments[:2] == ["shell", "pidof"] else "1000"
+            )
+            return completed(arguments, value + "\n")
 
-    def test_readback_mismatch_reports_failure_without_raising(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = make_provisioner(temporary, disable_updates=True)
-            daemon_exec, output = self.run_steps(provisioner, (0, ""), "false")
-        daemon_exec.assert_called_once_with("setprop otad.nodemon true")
-        self.assertIn("OTA_NODEMON_SET_FAILED", output)
-        self.assertIn("value='false'", output)
+        with mock.patch.object(provisioner, "adb_run", side_effect=adb_run):
+            environment = provisioner.build_exploit_environment(
+                0x1000, 0x2000, 1
+            )
+        return environment, calls
 
-    def test_daemon_failure_reports_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = make_provisioner(temporary, disable_updates=True)
-            _daemon_exec, output = self.run_steps(provisioner, (1, ""), "true")
-        self.assertIn("OTA_NODEMON_SET_FAILED", output)
-        self.assertIn("exit=1", output)
-
-    def test_skipped_without_disable_updates(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            provisioner = make_provisioner(temporary)
-            daemon_exec, output = self.run_steps(provisioner, (0, ""), "true")
-        daemon_exec.assert_not_called()
-        self.assertNotIn("OTA_NODEMON", output)
-
-    def test_skipped_on_omni(self) -> None:
+    def test_combined_aloha_env_carries_the_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             provisioner = make_provisioner(
-                temporary, target=OMNI, disable_updates=True
+                temporary, audio=True, disable_updates=True
             )
-            daemon_exec, output = self.run_steps(provisioner, (0, ""), "true")
-        daemon_exec.assert_not_called()
-        self.assertNotIn("OTA_NODEMON", output)
+            environment, calls = self.build_environment(provisioner)
+        self.assertEqual(environment["GHOSTLOCK_OTA_NODEMON"], "1")
+        self.assertNotIn("GHOSTLOCK_ACTION_CREDENTIAL_PID", environment)
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
+        self.assertFalse(
+            any(call[:2] == ["shell", "pidof"] for call in calls),
+            "combined attempts must not resolve a credential identity",
+        )
+        # Sanity: the combined environment really was built, with
+        # the run's other actions present.
+        self.assertEqual(environment["GHOSTLOCK_AUDIO_PERSIST"], "1")
+
+    def test_dedicated_ota_phase_env_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, disable_updates=True)
+            environment, calls = self.build_environment(provisioner)
+        self.assertIn(["shell", "pidof", "installd"], calls)
+        self.assertEqual(environment["GHOSTLOCK_OTA_BLOCK"], "1")
+        self.assertNotIn("GHOSTLOCK_OTA_NODEMON", environment)
+
+    def test_backend_phase_env_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, disable_updates=True, ota_backend_value="true"
+            )
+            environment, _calls = self.build_environment(provisioner)
+        self.assertEqual(environment["GHOSTLOCK_OTA_BACKEND_VALUE"], "true")
+        self.assertNotIn("GHOSTLOCK_OTA_NODEMON", environment)
+
+    def test_payload_phase_env_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary,
+                disable_updates=True,
+                custom_payload=pathlib.Path("daemon.bin"),
+            )
+            provisioner._in_custom_payload_phase = True
+            environment, _calls = self.build_environment(provisioner)
+        self.assertEqual(environment["GHOSTLOCK_CUSTOM_PAYLOAD"], "1")
+        self.assertEqual(
+            environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"], "1"
+        )
+        self.assertNotIn("GHOSTLOCK_OTA_NODEMON", environment)
+
+    def test_omni_env_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, target=OMNI, audio=True, disable_updates=True
+            )
+            environment, _calls = self.build_environment(provisioner)
+        self.assertNotIn("GHOSTLOCK_OTA_NODEMON", environment)
+
+    def test_no_disable_updates_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, audio=True)
+            environment, _calls = self.build_environment(provisioner)
+        self.assertNotIn("GHOSTLOCK_OTA_NODEMON", environment)
+
+
+class NodemonNativeActionTest(unittest.TestCase):
+    """The native action's context contract, pinned in source."""
+
+    def test_action_markers_and_dispatch(self) -> None:
+        fops = (ROOT / "exploit/src/fops.c").read_text(encoding="utf-8")
+        self.assertIn("OTA_NODEMON_SET property=%s value=true", fops)
+        self.assertIn("OTA_NODEMON_SET_FAILED", fops)
+        self.assertIn('getenv("GHOSTLOCK_OTA_NODEMON")', fops)
+        self.assertIn("spawn_configfs_nodemon_child()", fops)
+        self.assertIn("install_nodemon_child_context(fd)", fops)
+        self.assertIn("collect_configfs_nodemon_child()", fops)
+
+    def test_child_context_helper_clears_the_phase_entries(self) -> None:
+        root = (ROOT / "exploit/src/root.c").read_text(encoding="utf-8")
+        self.assertIn("run_ota_nodemon_action()", root)
+        helper = root[root.index("int install_nodemon_child_context"):]
+        for name in (
+            "GHOSTLOCK_ADBD_PID",
+            "GHOSTLOCK_ACTION_CREDENTIAL_PID",
+            "GHOSTLOCK_ACTION_PRESERVE_SELINUX",
+            "GHOSTLOCK_ACTION_EXPECT_UID",
+        ):
+            self.assertIn(name, helper)
+
+
+class NodemonRunnerTest(unittest.TestCase):
+    """The staged runner turns the conf key into the payload env key."""
+
+    def test_runner_exports_the_key_from_the_conf(self) -> None:
+        runner = (ROOT / "autoroot-helper" / "run.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "grep -q '^OTA_NODEMON=1$' \"$DIR/autoroot.conf\"", runner
+        )
+        self.assertIn("export GHOSTLOCK_OTA_NODEMON=1", runner)
+        # The conf is read before the env files are sourced (after
+        # sourcing, every command runs under the exploit preload),
+        # and the export lands inside the attempt subshell.
+        conf_read = runner.index('"$DIR/autoroot.conf"')
+        env_source = runner.index('. "$ENV_FILE"')
+        export = runner.index("export GHOSTLOCK_OTA_NODEMON=1")
+        self.assertLess(conf_read, env_source)
+        self.assertLess(env_source, export)
+
+
+class NodemonHelperRemovalTest(unittest.TestCase):
+    """The helper's shell-domain setprop re-assert is gone: the
+    property service refuses the write from that domain, so the
+    re-assert only ever logged refusals."""
+
+    def test_helper_no_longer_sets_the_property(self) -> None:
+        service = (
+            ROOT
+            / "autoroot-helper/src/dev/portal/autoroothelper"
+            / "AutorootService.java"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("reassertOtaNodemon", service)
+        self.assertNotIn("setprop otad.nodemon", service)
 
 
 class AutorootConfNodemonTest(unittest.TestCase):
