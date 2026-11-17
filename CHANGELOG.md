@@ -47,12 +47,17 @@ the fork diverged from upstream:
   set, otad's loop never calls its update path, so the daemon makes
   no periodic check-ins and applies no updates; this is independent
   of the MobileConfig override, whose verification is unchanged.
-  The property is not persistent, so the autoroot helper re-asserts
-  it after every boot when the staged config records updates as
-  disabled (`OTA_NODEMON=1`, cleared by `--enable-updates`,
-  preserved across unrelated re-staging). The run reports the set
-  (`OTA_NODEMON_SET` / `OTA_NODEMON_SET_FAILED`) and `--status`
-  reports the property's current value.
+  The property service accepts the write only from init's SELinux
+  context, so the native payload performs the set in an action
+  child carrying that context (the standard-install phase's own
+  child, or a dedicated child when the main child preserves the
+  shell domain), and the run reports the child's read-back
+  (`OTA_NODEMON_SET` / `OTA_NODEMON_SET_FAILED`); `--status`
+  reports the property's current value. The property is not
+  persistent, so the staged autoroot payload re-asserts it after
+  every boot when the staged config records updates as disabled
+  (`OTA_NODEMON=1`, cleared by `--enable-updates`, preserved
+  across unrelated re-staging).
 
 ### Fixed
 

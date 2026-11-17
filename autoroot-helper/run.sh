@@ -38,10 +38,27 @@ else
     ENV_FILE="$DIR/env-odd.sh"
 fi
 
+# The staged config records whether updates are disabled
+# (OTA_NODEMON=1, written at staging time and kept in step with
+# the updates state by the provisioner). While it is set, every
+# attempt asks the payload to set otad's nodemon property for this
+# boot: the attempt's action child preserves the shell domain,
+# which the property service refuses, so the payload runs the set
+# in a dedicated child carrying init's context. Read the config
+# here, before the env is sourced, for the same ordering reason
+# given above.
+NODEMON_ENV=""
+if grep -q '^OTA_NODEMON=1$' "$DIR/autoroot.conf" 2>/dev/null; then
+    NODEMON_ENV=1
+fi
+
 (
     . "$ENV_FILE"
     export GHOSTLOCK_KASLR_BASE="$KASLR"
     export GHOSTLOCK_P0_MEMSTART="$MEMSTART"
+    if [ -n "$NODEMON_ENV" ]; then
+        export GHOSTLOCK_OTA_NODEMON=1
+    fi
     exec /system/bin/true
 ) >> "$LOG" 2>&1
 
