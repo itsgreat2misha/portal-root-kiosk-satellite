@@ -78,6 +78,12 @@ the fork diverged from upstream:
   watch verdict names the failed action next to its step number, and
   the action child's log output is captured through shared memory
   into the per-attempt log.
+- OTA block install: three early returns in the native install
+  function (existing override not a regular file, absence-marker
+  write failure, temp-file open failure) returned failure without
+  logging, so the captured per-attempt log had nothing to recover
+  on exactly those paths. They now log the failing operation and
+  errno, as does the OTA backend function's invalid-value return.
 
 ### Changed
 
