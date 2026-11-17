@@ -229,6 +229,15 @@ AUTOROOT_DISABLE_FLAG_REMOTE = "/data/local/tmp/portal-autoroot.disable"
 # later run can tell its own leftover (a run that died before restoring)
 # from a flag a user set deliberately, whose content is left untouched.
 AUTOROOT_GUARD_TOKEN = "portal-provisioner-guard-v1"
+# The flag probe answers with one of these tokens instead of relying
+# on the test command's exit code alone (see _autoroot_flag_present).
+AUTOROOT_FLAG_PRESENT_TOKEN = "portal-flag-present"
+AUTOROOT_FLAG_ABSENT_TOKEN = "portal-flag-absent"
+# Delays (seconds) between the guard restore's apply+verify rounds.
+# An adbd disruption at restore time (Run 34) clears in seconds, so
+# the restore rides it out briefly instead of reporting against a
+# transport that was never actually read.
+AUTOROOT_GUARD_RESTORE_DELAYS = (0.0, 2.0, 5.0, 10.0)
 # Nesting depth of the autoroot guard across PortalProvisioner instances
 # in this process: bootstrap phases run nested provision() calls against
 # the same device, and only the outermost run owns the flag lifecycle.
@@ -1014,18 +1023,52 @@ class PortalProvisioner:
     # state it found is restored on every exit path.
 
     def _autoroot_flag_present(self) -> bool:
+        # The probe answers with an explicit token, never a bare
+        # exit code: during an adbd disruption (Run 34: the run's
+        # own adb_enabled write restarting adbd) a bare `test -f`
+        # returned a plain non-zero with no error text while the
+        # command never executed, and the guard release read that
+        # as "absent" - it printed AUTOROOT_GUARD_RESTORED over a
+        # flag that was still on disk. Only an answer carrying a
+        # token is believed; anything else is a transport failure
+        # the caller surfaces, never a state.
         result = self.adb_run(
-            ["shell", "test", "-f", AUTOROOT_DISABLE_FLAG_REMOTE],
+            [
+                "shell",
+                "test",
+                "-f",
+                AUTOROOT_DISABLE_FLAG_REMOTE,
+                "&&",
+                "echo",
+                AUTOROOT_FLAG_PRESENT_TOKEN,
+                "||",
+                "echo",
+                AUTOROOT_FLAG_ABSENT_TOKEN,
+            ],
             timeout=15,
         )
-        if result.returncode == 0:
+        answers = result.stdout.split()
+        if AUTOROOT_FLAG_PRESENT_TOKEN in answers:
             return True
-        if result.stdout.strip().startswith("error:"):
-            raise ProvisionError(
-                "adb transport error checking the autoroot disable "
-                f"flag: {result.stdout.strip()}"
+        if AUTOROOT_FLAG_ABSENT_TOKEN in answers:
+            return False
+        raise ProvisionError(
+            "could not determine the autoroot disable flag state: "
+            f"adb answered {result.stdout.strip()!r} "
+            f"(rc={result.returncode})"
+        )
+
+    def _apply_autoroot_flag_state(self, present: bool) -> None:
+        if present:
+            self.adb_run(
+                ["shell", "touch", AUTOROOT_DISABLE_FLAG_REMOTE],
+                timeout=15,
             )
-        return False
+        else:
+            self.adb_run(
+                ["shell", "rm", "-f", AUTOROOT_DISABLE_FLAG_REMOTE],
+                timeout=15,
+            )
 
     def _engage_autoroot_guard(self) -> None:
         global _autoroot_guard_depth
@@ -1118,28 +1161,33 @@ class PortalProvisioner:
             return
         self._autoroot_guard_prior = None
         _autoroot_guard_depth -= 1
+        # Apply, then verify against the flag's actual state, in a
+        # bounded retry loop: the Run 34 restore issued its rm into
+        # an adbd disruption, the rm never landed, and the old
+        # exit-code check read the broken transport as success.
+        # Each round re-applies (the apply is idempotent) and only
+        # a verified read of the wanted state ends the loop; the
+        # delays ride out a disruption that clears in seconds. A
+        # restore that never verifies reports RESTORE_FAILED with
+        # the last observed problem - the log line and the device
+        # end state cannot silently disagree again.
+        want_present = prior == "present"
         problem: str | None = None
-        try:
-            if prior == "absent":
-                self.adb_run(
-                    ["shell", "rm", "-f", AUTOROOT_DISABLE_FLAG_REMOTE],
-                    timeout=15,
-                )
-                if self._autoroot_flag_present():
-                    problem = "the disable flag is still present"
-            else:
-                if not self._autoroot_flag_present():
-                    self.adb_run(
-                        ["shell", "touch", AUTOROOT_DISABLE_FLAG_REMOTE],
-                        timeout=15,
-                    )
-                if not self._autoroot_flag_present():
-                    problem = (
-                        "the pre-existing disable flag could not be "
-                        "restored"
-                    )
-        except (ProvisionError, OSError) as exc:
-            problem = f"device unreachable during restore ({exc})"
+        for delay in AUTOROOT_GUARD_RESTORE_DELAYS:
+            if delay:
+                time.sleep(delay)
+            problem = (
+                "the pre-existing disable flag could not be restored"
+                if want_present
+                else "the disable flag is still present"
+            )
+            try:
+                self._apply_autoroot_flag_state(want_present)
+                if self._autoroot_flag_present() == want_present:
+                    problem = None
+                    break
+            except (ProvisionError, OSError) as exc:
+                problem = f"device unreachable during restore ({exc})"
         if problem is None:
             print(f"AUTOROOT_GUARD_RESTORED prior={prior}", flush=True)
             return

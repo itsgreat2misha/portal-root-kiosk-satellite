@@ -67,6 +67,24 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A winning autoroot attempt whose process tree wedged (spinning
+  or ptrace-stopped) held the Shizuku handoff for ~13 minutes
+  until the processes happened to exit: the service now sweeps
+  the attempt's leftover process tree after every attempt's
+  verdict (the root daemon and Shizuku server are never swept),
+  and the handoff's post-starter wait is bounded by a 120 s
+  wall-clock deadline with a re-sweep and one retry before the
+  handoff is left for the next service start. Autoroot helper
+  1.8.
+- The autoroot guard's restore could print
+  `AUTOROOT_GUARD_RESTORED` over a disable flag that was still
+  on disk: issued into an adbd disruption (Run 34), its rm never
+  landed and the exit-code presence check read the broken
+  transport as "absent". The flag probe now answers with an
+  explicit token (a tokenless answer is a transport failure,
+  never a state), and the restore applies and verifies in a
+  bounded retry loop, reporting `AUTOROOT_GUARD_RESTORE_FAILED`
+  whenever the wanted end state is not verified on the device.
 - The autoroot failure budget counted clean race losses as
   incomplete attempts whenever the loss's reboot outran the
   helper service's own verdict write (three such boots stood a
