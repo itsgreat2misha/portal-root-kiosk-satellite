@@ -9,6 +9,17 @@ must match it.
 
 ## [Unreleased]
 
+### Fixed
+
+- Autoroot: `daemonServingRoot()` retries briefly (3 attempts, 500 ms apart) and,
+  when it still fails, records the reason and the loopback port state in the
+  service log (`daemon check failed reason=… port=…`). On aloha builds a
+  `"attempt failed … did not bring the daemon up"` line previously had no
+  evidence attached: the daemon's own `--identity-log` cannot be written because
+  uid 0 is denied file creation in `/data/local/tmp` on those builds, so the
+  service log was the only place to look and it said nothing.
+
+
 Pre-release development toward 1.0.0 in this fork. Highlights since
 the fork diverged from upstream:
 
