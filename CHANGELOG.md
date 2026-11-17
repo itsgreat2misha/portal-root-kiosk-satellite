@@ -35,6 +35,13 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A failed run's error cleanup uninstalled the exploit sentinel
+  package even when autoroot staging was in place (staged by that
+  run or an earlier one). Staged autoroot replays the exploit on
+  every boot and needs the sentinel, so the device was left with
+  autoroot that could never win until a later host run reinstalled
+  the package. The failure paths now retain the sentinel whenever
+  autoroot is staged, matching the success path.
 - Aloha OTA block: the local MobileConfig override was never read by
   the native OTA daemon, because the native MobileConfig util selects
   a legacy backend service that does not exist on Aloha (upstream
