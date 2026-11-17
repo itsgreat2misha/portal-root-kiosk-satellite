@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import provision_portal  # noqa: E402
 from provision_portal import (  # noqa: E402
+    AUTOROOT_REMOTE_DIR,
     SHIZUKU_HELPER_PACKAGE,
     PortalProvisioner,
     ProvisionError,
@@ -720,3 +721,172 @@ class PostPayloadDaemonStopTest(unittest.TestCase):
         with self.assertRaises(ProvisionError):
             provisioner.apply_post_payload_root_steps()
         self.assertEqual(calls, ['start'])
+
+
+class SentinelRetentionOnFailureTest(unittest.TestCase):
+    """Regression: a failed run's error cleanup uninstalled the
+    exploit sentinel even while autoroot staging was in place.
+    Staged autoroot replays the exploit on every boot and needs the
+    sentinel package, so the removal left it permanently unable to
+    win. The sentinel's end state now follows the success path's
+    rule on the failure path too: retained whenever autoroot is
+    staged (by this run or an earlier one), removed only when not."""
+
+    def _failed_install(self, provisioner):
+        """Drive run_standard_install through one losing attempt and
+        return (stdout, uninstall mock) after it raises."""
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(provisioner, "prepare_exploit_users"),
+            mock.patch.object(provisioner, "stage"),
+            mock.patch.object(
+                provisioner, "reboot", return_value=("", "boot-1")
+            ),
+            mock.patch.object(provisioner, "kaslr_base", return_value=0x1000),
+            mock.patch.object(provisioner, "memstart", return_value=0x2000),
+            mock.patch.object(provisioner, "exploit", return_value=False),
+            mock.patch.object(
+                provisioner, "connect_after_reboot", return_value="boot-2"
+            ),
+            mock.patch.object(
+                provisioner, "uninstall_exploit_sentinel"
+            ) as uninstall,
+            contextlib.redirect_stdout(stdout),
+            self.assertRaisesRegex(
+                ProvisionError, "provisioning failed after 1 attempts"
+            ),
+        ):
+            provisioner.run_standard_install(use_exploit_sentinel=True)
+        return stdout.getvalue(), uninstall
+
+    def _staged_adb(self, staged: bool):
+        def adb_run(arguments, timeout=None, check=False):
+            del timeout, check
+            return subprocess.CompletedProcess(
+                arguments, 0 if staged else 1, ""
+            )
+
+        return adb_run
+
+    def test_failed_install_retains_sentinel_when_autoroot_requested(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            output, uninstall = self._failed_install(provisioner)
+            uninstall.assert_not_called()
+            self.assertIn("EXPLOIT_SENTINEL_RETAINED reason=autoroot", output)
+
+    def test_failed_install_retains_sentinel_when_autoroot_pre_staged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary)
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=self._staged_adb(True)
+            ):
+                output, uninstall = self._failed_install(provisioner)
+            uninstall.assert_not_called()
+            self.assertIn("EXPLOIT_SENTINEL_RETAINED reason=autoroot", output)
+
+    def test_failed_install_removes_sentinel_when_autoroot_not_staged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary)
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=self._staged_adb(False)
+            ):
+                output, uninstall = self._failed_install(provisioner)
+            uninstall.assert_called_once_with(best_effort=True)
+            self.assertNotIn("EXPLOIT_SENTINEL_RETAINED", output)
+
+    def test_autoroot_staged_probes_the_staged_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary)
+            seen = []
+
+            def adb_run(arguments, timeout=None, check=False):
+                del timeout, check
+                seen.append([str(argument) for argument in arguments])
+                return subprocess.CompletedProcess(arguments, 0, "")
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                self.assertTrue(provisioner.autoroot_staged())
+            self.assertEqual(
+                seen,
+                [["shell", "test", "-f", f"{AUTOROOT_REMOTE_DIR}/run.sh"]],
+            )
+            with mock.patch.object(
+                provisioner,
+                "adb_run",
+                side_effect=self._staged_adb(False),
+            ):
+                self.assertFalse(provisioner.autoroot_staged())
+
+    def test_autoroot_staged_short_circuits_on_this_runs_request(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            with mock.patch.object(
+                provisioner,
+                "adb_run",
+                side_effect=AssertionError("adb probed despite --autoroot"),
+            ):
+                self.assertTrue(provisioner.autoroot_staged())
+
+    def test_successful_install_still_removes_sentinel_at_phase_end(
+        self,
+    ) -> None:
+        # The install loop's phase-end removal is unchanged: in the
+        # combined flow the sentinel is re-staged for the payload
+        # phase, whose own exit path applies the retention rule.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(provisioner, "prepare_exploit_users"),
+                mock.patch.object(provisioner, "stage"),
+                mock.patch.object(
+                    provisioner, "reboot", return_value=("", "boot-1")
+                ),
+                mock.patch.object(
+                    provisioner, "kaslr_base", return_value=0x1000
+                ),
+                mock.patch.object(
+                    provisioner, "memstart", return_value=0x2000
+                ),
+                mock.patch.object(provisioner, "exploit", return_value=True),
+                mock.patch.object(
+                    provisioner,
+                    "connect_after_reboot",
+                    return_value="boot-2",
+                ),
+                mock.patch.object(
+                    provisioner, "uninstall_exploit_sentinel"
+                ) as uninstall,
+                mock.patch.object(
+                    provisioner, "finalize_buffered_shizuku_key"
+                ),
+                mock.patch.object(
+                    provisioner,
+                    "configure_ota_backend_phase",
+                    return_value=False,
+                ),
+                mock.patch.object(provisioner, "verify_across_two_reboots"),
+                contextlib.redirect_stdout(stdout),
+            ):
+                provisioner.run_standard_install(use_exploit_sentinel=True)
+            uninstall.assert_called_once_with()
+            self.assertNotIn(
+                "EXPLOIT_SENTINEL_RETAINED", stdout.getvalue()
+            )

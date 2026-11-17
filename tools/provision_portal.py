@@ -1127,6 +1127,22 @@ class PortalProvisioner:
                 return "autoroot-helper-missing"
         return None
 
+    def autoroot_staged(self) -> bool:
+        """Whether autoroot staging is in place on the device, staged
+        by this run or an earlier one. Staged autoroot replays the
+        exploit on every boot and needs the exploit sentinel package
+        installed, so a run that finds staging in place must leave
+        the sentinel installed on every exit path."""
+        if self.autoroot:
+            return True
+        return (
+            self.adb_run(
+                ["shell", "test", "-f", f"{AUTOROOT_REMOTE_DIR}/run.sh"],
+                timeout=5,
+            ).returncode
+            == 0
+        )
+
     def _channel_blocker(self, state: dict[str, object]) -> str | None:
         """Eligibility for the root-channel apply path; None when the
         delta can be applied without racing. Any requested action
@@ -5307,7 +5323,13 @@ class PortalProvisioner:
             if self.exploit_users_created:
                 self.cleanup_exploit_users(best_effort=True)
             if use_exploit_sentinel and not sentinel_removed:
-                self.uninstall_exploit_sentinel(best_effort=True)
+                if self.autoroot_staged():
+                    print(
+                        "EXPLOIT_SENTINEL_RETAINED reason=autoroot",
+                        flush=True,
+                    )
+                else:
+                    self.uninstall_exploit_sentinel(best_effort=True)
             if self.uid1000_runtime_package_installed:
                 self.uninstall_uid1000_runtime_payload(best_effort=True)
         raise ProvisionError(f"provisioning failed after {self.attempts} attempts")
@@ -6070,7 +6092,7 @@ class PortalProvisioner:
             try:
                 self.apply_custom_payload()
             finally:
-                if use_exploit_sentinel and not self.autoroot:
+                if use_exploit_sentinel and not self.autoroot_staged():
                     self.uninstall_exploit_sentinel(best_effort=True)
                     sentinel_removed = True
                 elif use_exploit_sentinel:
