@@ -36,6 +36,7 @@ public final class AutorootActivity extends Activity {
     private Button stopButton;
     private Button disableButton;
     private Button runNowButton;
+    private Button reenableButton;
     private Handler handler;
     private boolean autoShown;
     private boolean finishScheduled;
@@ -101,6 +102,16 @@ public final class AutorootActivity extends Activity {
                 AutorootService.ACTION_RUN_NOW));
         root.addView(runNowButton);
 
+        // Shown only in the stood-down state: the failure budget
+        // turned autoroot off after repeated crashed/frozen boots,
+        // and this screen is where the user re-enables it (the
+        // stand-down notification opens this screen too).
+        reenableButton = new Button(this);
+        reenableButton.setText("Re-enable autoroot");
+        reenableButton.setOnClickListener(v -> sendAction(
+                AutorootService.ACTION_REENABLE));
+        root.addView(reenableButton);
+
         Button closeButton = new Button(this);
         closeButton.setText("Close");
         closeButton.setOnClickListener(v -> finish());
@@ -141,6 +152,8 @@ public final class AutorootActivity extends Activity {
         int max = prefs.getInt(AutorootService.PREF_MAX, 0);
         String detail = prefs.getString(AutorootService.PREF_DETAIL, "");
         boolean disabled = prefs.getBoolean(AutorootService.PREF_DISABLED, false);
+        boolean stoodDown = prefs.getBoolean(
+                AutorootService.PREF_STOOD_DOWN, false);
 
         boolean running = "WORKING".equals(phase) || "ATTEMPT".equals(phase);
         String status;
@@ -167,10 +180,38 @@ public final class AutorootActivity extends Activity {
             case "FAILED":
                 status = "Autoroot attempt failed";
                 break;
+            case "STOOD_DOWN":
+                status = "Autoroot stopped itself";
+                break;
             default:
                 status = "Autoroot idle";
                 break;
         }
+        if (stoodDown) {
+            // The stand-down is its own state, distinct from the
+            // user's disable toggle: the normal controls are
+            // meaningless while it holds, so the only action
+            // offered is re-enabling, with the risk stated.
+            status = "Autoroot stopped itself";
+            statusView.setText(status);
+            detailView.setText(
+                    "Autoroot crashed or froze during its last 3 boots"
+                    + " in a row, so it turned itself off. It will not"
+                    + " run again on its own.\n\n"
+                    + "Re-enabling starts autoroot again, at your own"
+                    + " risk: if the fault is still there, the device"
+                    + " may crash or freeze again. Autoroot will turn"
+                    + " itself off again after 3 more bad boots.");
+            stopButton.setVisibility(View.GONE);
+            disableButton.setVisibility(View.GONE);
+            runNowButton.setVisibility(View.GONE);
+            reenableButton.setVisibility(View.VISIBLE);
+            return;
+        }
+        reenableButton.setVisibility(View.GONE);
+        stopButton.setVisibility(View.VISIBLE);
+        disableButton.setVisibility(View.VISIBLE);
+        runNowButton.setVisibility(View.VISIBLE);
         statusView.setText(status);
         detailView.setText(running
                 ? "Please do not use the device yet - it may reboot "

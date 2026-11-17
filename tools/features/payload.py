@@ -618,7 +618,9 @@ class PayloadFeature:
             )
         # A fresh provision starts a fresh autoroot session: drop any state
         # an earlier staging left behind, so an exhausted attempt budget or
-        # a stale session window cannot block recovery after this run.
+        # a stale session window cannot block recovery after this run. The
+        # failure budget's stand-down lives in the same file, so a re-stage
+        # clears it too.
         self._adb_run(
             ["shell", "rm", "-f", f"{AUTOROOT_REMOTE_DIR}/state"],
             timeout=5,

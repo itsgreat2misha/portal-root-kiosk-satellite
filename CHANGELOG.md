@@ -32,6 +32,16 @@ the fork diverged from upstream:
   output stream ended (`INSTALL_ATTEMPT_EXIT`), and a KernelSnitch
   mm_struct leak failure is classified as an attempt failure instead
   of ending the attempt silently.
+- Autoroot failure budget: the on-device helper counts only truly
+  incomplete attempts across boots (an attempt that started but
+  never recorded a verdict - the crash/freeze signature; clean race
+  losses never count) and stands itself down after 3 in a row,
+  posting a persistent notification instead of crash-looping the
+  device on every boot. The user can re-enable autoroot from the
+  helper screen, where the risk is stated; the budget re-arms after
+  a re-enable, and a provisioner re-stage also clears the
+  stand-down. Provision runs report a found stand-down
+  (`AUTOROOT_STOOD_DOWN`) when they connect.
 
 ### Fixed
 
