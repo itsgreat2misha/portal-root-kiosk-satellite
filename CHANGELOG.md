@@ -42,6 +42,16 @@ the fork diverged from upstream:
   autoroot that could never win until a later host run reinstalled
   the package. The failure paths now retain the sentinel whenever
   autoroot is staged, matching the success path.
+- An abort landing after a phase's own cleanup had already removed
+  the exploit sentinel (run37b: a verification failure after the
+  install loop's phase-end removal) still stranded staged autoroot,
+  because no later phase re-staged the package. A run-exit guarantee
+  now enforces the sentinel's end state on every exit of the
+  outermost run: when autoroot is staged, the sentinel is left
+  installed, reinstalled when a phase-end removal was the last word,
+  and a failed reinstall fails the run instead of being swallowed.
+  This closes the phase-end-removal case flagged as ambiguous in the
+  earlier sentinel-retention fix.
 - Aloha OTA block: the local MobileConfig override was never read by
   the native OTA daemon, because the native MobileConfig util selects
   a legacy backend service that does not exist on Aloha (upstream
