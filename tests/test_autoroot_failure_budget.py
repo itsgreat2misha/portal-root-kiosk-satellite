@@ -11,9 +11,15 @@ forever across boots. The budget counts only truly incomplete
 attempts - the service writes an in-progress mark when an attempt
 starts and a verdict when one completes (win or clean loss), so a
 later boot that finds the mark still set knows the attempt never
-completed. At 3 consecutive incomplete boots the service stands
+completed. At 5 consecutive incomplete boots the service stands
 down, posts a persistent notification, and waits for the user to
 re-enable it on the device (or for a host re-stage).
+
+One accounting refinement is pinned here too: a clean loss whose
+reboot outran the service's verdict write is recovered from the
+race's own verdict in attempt.log (the mark records the attempt's
+log offset, and a fail verdict found there counts the attempt as
+completed), so only attempts that left no verdict anywhere count.
 
 The accounting itself is pure Java (FailureBudget). When a JDK is
 available these tests compile and execute the real decision
@@ -52,16 +58,16 @@ public final class BudgetHarness {
     // One verdict-less boot against a budget whose previous
     // attempt died mid-flight: mark, then the next boot accounts.
     private static void incompleteBoot(FailureBudget budget) {
-        budget.attemptStarted();
+        budget.attemptStarted(-1);
         budget.accountBoot();
     }
 
     public static void main(String[] args) {
-        check(FailureBudget.THRESHOLD == 3, "threshold is not 3");
+        check(FailureBudget.THRESHOLD == 5, "threshold is not 5");
 
         // A fresh budget (what a host re-stage leaves behind: the
         // state file is deleted) starts clean.
-        FailureBudget fresh = new FailureBudget(0, false, false);
+        FailureBudget fresh = new FailureBudget(0, false, false, -1);
         check(fresh.incompleteStreak() == 0, "fresh streak not 0");
         check(!fresh.attemptOpen(), "fresh budget has an open mark");
         check(!fresh.stoodDown(), "fresh budget stood down");
@@ -70,10 +76,10 @@ public final class BudgetHarness {
         // Clean losses never increment: five boots, each starting
         // and completing an attempt (a win or a clean loss - the
         // accounting cannot and must not distinguish them).
-        FailureBudget clean = new FailureBudget(0, false, false);
+        FailureBudget clean = new FailureBudget(0, false, false, -1);
         for (int i = 0; i < 5; i++) {
             check(!clean.accountBoot(), "clean boot counted");
-            clean.attemptStarted();
+            clean.attemptStarted(-1);
             clean.attemptCompleted();
             check(clean.incompleteStreak() == 0,
                     "clean loss incremented the streak");
@@ -82,8 +88,8 @@ public final class BudgetHarness {
 
         // A verdict-less boot increments by exactly one and
         // consumes the mark.
-        FailureBudget died = new FailureBudget(0, false, false);
-        died.attemptStarted();
+        FailureBudget died = new FailureBudget(0, false, false, -1);
+        died.attemptStarted(-1);
         check(died.accountBoot(), "verdict-less boot not counted");
         check(died.incompleteStreak() == 1, "streak not 1");
         check(!died.attemptOpen(), "mark not consumed at boot");
@@ -94,7 +100,7 @@ public final class BudgetHarness {
         // A completed attempt resets the streak.
         incompleteBoot(died);
         check(died.incompleteStreak() == 2, "streak not 2");
-        died.attemptStarted();
+        died.attemptStarted(-1);
         died.attemptCompleted();
         check(died.incompleteStreak() == 0,
                 "completed attempt did not reset the streak");
@@ -102,28 +108,79 @@ public final class BudgetHarness {
         check(died.incompleteStreak() == 1,
                 "streak not 1 after reset plus one incomplete");
 
-        // Three consecutive incomplete boots stand down; two do not.
-        FailureBudget loop = new FailureBudget(0, false, false);
+        // A loss verdict recovered from attempt.log counts the
+        // attempt as completed: the mark clears, the streak
+        // resets, and the recorded offset is consumed with the
+        // mark, so the same verdict can never be applied twice.
+        FailureBudget recovered = new FailureBudget(0, false, false, -1);
+        incompleteBoot(recovered);
+        incompleteBoot(recovered);
+        check(recovered.incompleteStreak() == 2, "streak not 2");
+        recovered.attemptStarted(4096);
+        check(recovered.openLogOffset() == 4096,
+                "log offset not recorded with the mark");
+        check(recovered.accountBoot(true),
+                "recovered loss verdict changed nothing");
+        check(recovered.incompleteStreak() == 0,
+                "recovered loss verdict did not reset the streak");
+        check(!recovered.attemptOpen(),
+                "recovered verdict left the mark open");
+        check(recovered.openLogOffset() == -1,
+                "recovered verdict did not consume the offset");
+        check(!recovered.accountBoot(true),
+                "stale verdict applied with no open attempt");
+        check(recovered.incompleteStreak() == 0,
+                "stale verdict moved the streak");
+
+        // An open mark whose log holds no verdict still counts,
+        // offset or not: the recovery is scoped, not a blanket
+        // pardon for every open mark.
+        recovered.attemptStarted(8192);
+        check(recovered.accountBoot(false),
+                "verdict-less mark with an offset not counted");
+        check(recovered.incompleteStreak() == 1, "streak not 1");
+        check(recovered.openLogOffset() == -1,
+                "counted mark did not consume the offset");
+
+        // Completing an attempt and re-enabling both clear the
+        // recorded offset along with the mark.
+        recovered.attemptStarted(123);
+        recovered.attemptCompleted();
+        check(recovered.openLogOffset() == -1,
+                "completion kept the log offset");
+        recovered.attemptStarted(456);
+        recovered.reenable();
+        check(recovered.openLogOffset() == -1,
+                "re-enable kept the log offset");
+
+        // Five consecutive incomplete boots stand down; four do
+        // not.
+        FailureBudget loop = new FailureBudget(0, false, false, -1);
         incompleteBoot(loop);
         check(!loop.stoodDown(), "stood down at 1");
         incompleteBoot(loop);
-        check(!loop.stoodDown(), "stood down at 2");
         incompleteBoot(loop);
-        check(loop.incompleteStreak() == 3, "streak not 3");
-        check(loop.stoodDown(), "not stood down at 3");
+        incompleteBoot(loop);
+        check(loop.incompleteStreak() == 4, "streak not 4");
+        check(!loop.stoodDown(), "stood down at 4");
+        incompleteBoot(loop);
+        check(loop.incompleteStreak() == 5, "streak not 5");
+        check(loop.stoodDown(), "not stood down at 5");
         // The stand-down persists across quiet boots.
         check(!loop.accountBoot(), "quiet stood-down boot changed state");
         check(loop.stoodDown(), "stand-down did not persist");
 
         // Re-enable clears the counter and the stand-down, and the
-        // budget re-arms: 3 more incomplete boots stand down again.
+        // budget re-arms: 5 more incomplete boots stand down again.
         loop.reenable();
         check(loop.incompleteStreak() == 0, "re-enable kept the streak");
         check(!loop.attemptOpen(), "re-enable kept an open mark");
         check(!loop.stoodDown(), "re-enable kept the stand-down");
         incompleteBoot(loop);
         incompleteBoot(loop);
-        check(!loop.stoodDown(), "re-armed budget stood down at 2");
+        incompleteBoot(loop);
+        incompleteBoot(loop);
+        check(!loop.stoodDown(), "re-armed budget stood down at 4");
         incompleteBoot(loop);
         check(loop.stoodDown(), "re-armed budget did not stand down");
 
@@ -178,18 +235,38 @@ class FailureBudgetWiringTest(unittest.TestCase):
         self.activity = ACTIVITY_JAVA.read_text(encoding="utf-8")
 
     def test_threshold_and_state_keys(self) -> None:
-        self.assertIn("THRESHOLD = 3", self.budget)
+        self.assertIn("THRESHOLD = 5", self.budget)
         # The budget state lives in the autoroot state file, under
         # its own keys - alongside, not as, the disable flag.
         self.assertIn('KEY_STREAK = "budget_streak"', self.budget)
         self.assertIn('KEY_OPEN = "budget_open"', self.budget)
         self.assertIn('KEY_STOOD_DOWN = "budget_stood_down"', self.budget)
+        self.assertIn('KEY_LOG_OFFSET = "budget_log_offset"', self.budget)
         self.assertNotIn("portal-autoroot.disable", self.budget)
 
+    def test_threshold_prose_says_five_everywhere(self) -> None:
+        # Every user-facing or documented surface of the threshold
+        # moved from 3 to 5 with the constant; nothing still says 3.
+        self.assertIn("last 5 boots", self.activity)
+        self.assertIn("5 more bad boots", self.activity)
+        self.assertNotIn("last 3 boots", self.activity)
+        self.assertNotIn("3 more bad boots", self.activity)
+        self.assertIn("after 5 in a row", self.service)
+        self.assertNotIn("after 3 in a row", self.service)
+        self.assertNotIn("after 3 more incomplete", self.service)
+        provisioner = (ROOT / "tools" / "provision_portal.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("After 5 consecutive verdict-less", provisioner)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("After 5 such boots", readme)
+        self.assertIn("after 5 more bad boots", readme)
+        self.assertNotIn("After 3 such boots", readme)
+
     def test_accounting_and_gate_run_before_any_racing(self) -> None:
-        account = self.service.index("budget.accountBoot()")
+        account = self.service.index("budget.accountBoot(lossVerdictRecovered)")
         gate = self.service.index("if (budget.stoodDown())")
-        mark = self.service.index("budget.attemptStarted()")
+        mark = self.service.index("budget.attemptStarted(attemptLogSizeForBudget())")
         race = self.service.index("runAttemptWithWatchdog(kaslr")
         self.assertLess(account, gate)
         self.assertLess(gate, mark)
@@ -197,6 +274,21 @@ class FailureBudgetWiringTest(unittest.TestCase):
         # The stood-down return publishes the phase the activity
         # renders and refreshes the notification.
         self.assertIn('publishStatus("STOOD_DOWN"', self.service)
+
+    def test_loss_verdict_recovery_is_wired(self) -> None:
+        # The accounting consults attempt.log for the open
+        # attempt's own race verdict, scoped to the offset recorded
+        # with the mark, and only a fail verdict recovers.
+        self.assertIn("attemptVerdict(budget.openLogOffset())", self.service)
+        self.assertIn("AttemptWatchdog.VERDICT_FAIL", self.service)
+        self.assertIn("loss verdict recovered", self.service)
+        # The offset is persisted with the budget state and loaded
+        # back, so the recovery survives the reboot between the
+        # attempt and its accounting.
+        self.assertIn("FailureBudget.KEY_LOG_OFFSET", self.service)
+        # An unmeasurable offset disables recovery for the attempt
+        # rather than consulting the log from a guessed position.
+        self.assertIn("attemptLogSizeForBudget()", self.service)
 
     def test_verdict_recorded_on_controlled_exits(self) -> None:
         # Every controlled exit after the mark records the verdict

@@ -1067,7 +1067,7 @@ class PortalProvisioner:
     def _report_autoroot_stood_down(self) -> None:
         """Surface a failure-budget stand-down found on the device.
 
-        After 3 consecutive verdict-less (crashed or frozen)
+        After 5 consecutive verdict-less (crashed or frozen)
         attempts the on-device helper stops racing and records the
         stand-down in its state file; a provision run is the next
         host connection, so report it here, where the run already

@@ -35,7 +35,7 @@ the fork diverged from upstream:
 - Autoroot failure budget: the on-device helper counts only truly
   incomplete attempts across boots (an attempt that started but
   never recorded a verdict - the crash/freeze signature; clean race
-  losses never count) and stands itself down after 3 in a row,
+  losses never count) and stands itself down after 5 in a row,
   posting a persistent notification instead of crash-looping the
   device on every boot. The user can re-enable autoroot from the
   helper screen, where the risk is stated; the budget re-arms after
@@ -61,6 +61,17 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The autoroot failure budget counted clean race losses as
+  incomplete attempts whenever the loss's reboot outran the
+  helper service's own verdict write (three such boots stood a
+  healthy unit down in live testing). The race's verdict is
+  already in attempt.log by then, so the in-progress mark now
+  records the attempt's attempt.log offset and boot-time
+  accounting recovers a fail verdict from the log, counting the
+  attempt as the completed loss it was; the offset is consumed
+  with the mark, so a recovered verdict can never cover for a
+  later attempt. The stand-down threshold also rises from 3 to 5
+  consecutive truly incomplete boots.
 - A `--force` run hard-failed the autoroot staging install with
   `INSTALL_FAILED_UPDATE_INCOMPATIBLE` when the on-device helper
   was signed by an older build host's keystore: the provisioner

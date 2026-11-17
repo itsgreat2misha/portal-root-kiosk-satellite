@@ -1273,12 +1273,12 @@ Shizuku and the autoroot helper.
 
 The helper also keeps a failure budget across boots. An attempt that
 starts but never finishes (the device crashed or froze mid-attempt)
-counts against it; ordinary failed attempts do not. After 3 such boots
+counts against it; ordinary failed attempts do not. After 5 such boots
 in a row the helper turns autoroot off by itself and posts a
 notification, instead of crash-looping the Portal on every boot. Open
 the helper from the notification to re-enable autoroot; the screen
 states the risk first, and the budget re-arms, so a fault that is still
-there turns autoroot off again after 3 more bad boots. Re-running the
+there turns autoroot off again after 5 more bad boots. Re-running the
 provisioner also clears the stand-down, and a provision run reports one
 when it finds it.
 

@@ -195,13 +195,13 @@ public final class AutorootActivity extends Activity {
             status = "Autoroot stopped itself";
             statusView.setText(status);
             detailView.setText(
-                    "Autoroot crashed or froze during its last 3 boots"
+                    "Autoroot crashed or froze during its last 5 boots"
                     + " in a row, so it turned itself off. It will not"
                     + " run again on its own.\n\n"
                     + "Re-enabling starts autoroot again, at your own"
                     + " risk: if the fault is still there, the device"
                     + " may crash or freeze again. Autoroot will turn"
-                    + " itself off again after 3 more bad boots.");
+                    + " itself off again after 5 more bad boots.");
             stopButton.setVisibility(View.GONE);
             disableButton.setVisibility(View.GONE);
             runNowButton.setVisibility(View.GONE);
