@@ -54,7 +54,7 @@ package dev.portal.autoroothelper;
  * testable off-device.
  */
 final class FailureBudget {
-    static final int THRESHOLD = 5;
+    static final int THRESHOLD = 10;
 
     static final String KEY_STREAK = "budget_streak";
     static final String KEY_OPEN = "budget_open";

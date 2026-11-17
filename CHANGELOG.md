@@ -35,7 +35,7 @@ the fork diverged from upstream:
 - Autoroot failure budget: the on-device helper counts only truly
   incomplete attempts across boots (an attempt that started but
   never recorded a verdict - the crash/freeze signature; clean race
-  losses never count) and stands itself down after 5 in a row,
+  losses never count) and stands itself down after 10 in a row,
   posting a persistent notification instead of crash-looping the
   device on every boot. The user can re-enable autoroot from the
   helper screen, where the risk is stated; the budget re-arms after
@@ -65,6 +65,17 @@ the fork diverged from upstream:
   keystore instead of letting a replacement key be generated, since
   devices refuse signature-mismatched APK updates.
 
+### Changed
+
+- The autoroot failure-budget stand-down threshold rises from 5 to
+  10 consecutive truly incomplete boots. Live sessions showed the
+  verdict-less (crash/freeze) loss shape is common enough on a
+  healthy unit that a streak of 5 was within reach of ordinary bad
+  luck; 10 keeps the cross-boot bound on a deterministically
+  wedging unit while making a false stand-down far less likely.
+  The helper screen, the stand-down notification and the docs state
+  the new number. Autoroot helper 1.9 (versionCode 10).
+
 ### Fixed
 
 - A winning autoroot attempt whose process tree wedged (spinning
@@ -75,7 +86,7 @@ the fork diverged from upstream:
   and the handoff's post-starter wait is bounded by a 120 s
   wall-clock deadline with a re-sweep and one retry before the
   handoff is left for the next service start. Autoroot helper
-  1.8.
+  1.9 (versionCode 10) in this release.
 - The autoroot guard's restore could print
   `AUTOROOT_GUARD_RESTORED` over a disable flag that was still
   on disk: issued into an adbd disruption (Run 34), its rm never

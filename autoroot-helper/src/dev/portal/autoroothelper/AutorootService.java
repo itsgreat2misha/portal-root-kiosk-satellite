@@ -47,7 +47,7 @@ import java.util.zip.ZipInputStream;
  * per-session cap survives the reboots a failed attempt can cause.
  * The same state file carries the cross-boot failure budget (see
  * FailureBudget): attempts that never complete - the crash/freeze
- * signature - are counted across boots, and after 5 in a row the
+ * signature - are counted across boots, and after 10 in a row the
  * service stands down instead of looping the fault forever.
  */
 public final class AutorootService extends Service {
@@ -619,7 +619,7 @@ public final class AutorootService extends Service {
      * User re-enable from the helper screen (the notification's
      * target): clears the counter and the stand-down, removes the
      * notification, and starts a session. The budget re-arms - a
-     * persisting fault stands down again after 5 more incomplete
+     * persisting fault stands down again after 10 more incomplete
      * boots. No provisioner run is needed; a host re-stage also
      * clears the state (it deletes the state file).
      */
