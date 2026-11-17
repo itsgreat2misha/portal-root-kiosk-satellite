@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import provision_portal  # noqa: E402
 from provision_portal import (  # noqa: E402
     AUTOROOT_REMOTE_DIR,
+    EXPLOIT_SENTINEL_PACKAGE,
     SHIZUKU_HELPER_PACKAGE,
     PortalProvisioner,
     ProvisionError,
@@ -890,3 +891,190 @@ class SentinelRetentionOnFailureTest(unittest.TestCase):
             self.assertNotIn(
                 "EXPLOIT_SENTINEL_RETAINED", stdout.getvalue()
             )
+
+    # ---- run-exit guarantee (provision level) ----------------------
+    #
+    # The phase-level rules above do not cover an abort raised after
+    # a phase's own cleanup has already run: run37b's verification
+    # failure landed after the install loop's phase-end removal, no
+    # later phase re-staged the sentinel, and staged autoroot was
+    # stranded. provision() therefore enforces the sentinel's end
+    # state on every exit of the outermost run.
+
+    @contextlib.contextmanager
+    def _drive_provision(self, provisioner, stages, sentinel_present):
+        """Run provision() with connect, the autoroot guard, and the
+        stage body stubbed. The sentinel's presence is faked at the
+        pm path probe; every other adb command fails with rc=1, so
+        the staged-runner probe reads as absent unless the run
+        requested autoroot itself. Yields (stdout, prepare, release).
+        """
+
+        def adb_run(arguments, timeout=None, check=False):
+            del timeout, check
+            arguments = [str(argument) for argument in arguments]
+            if arguments[1:3] == ["pm", "path"]:
+                if sentinel_present:
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        f"package:/data/app/{EXPLOIT_SENTINEL_PACKAGE}"
+                        "/base.apk",
+                    )
+                return subprocess.CompletedProcess(arguments, 1, "")
+            return subprocess.CompletedProcess(arguments, 1, "")
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(provisioner, "connect"),
+            mock.patch.object(provisioner, "_engage_autoroot_guard"),
+            mock.patch.object(
+                provisioner, "_release_autoroot_guard"
+            ) as release,
+            mock.patch.object(
+                provisioner, "_provision_stages", side_effect=stages
+            ),
+            mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ),
+            mock.patch.object(
+                provisioner, "prepare_exploit_sentinel"
+            ) as prepare,
+            contextlib.redirect_stdout(stdout),
+        ):
+            yield stdout, prepare, release
+
+    def test_abort_after_phase_end_removal_restages_sentinel(
+        self,
+    ) -> None:
+        # run37b's shape: the stages abort (there, a verification
+        # failure) after the last phase-end removal, with autoroot
+        # staged and the sentinel gone. The exit guarantee must
+        # reinstall it, and the original error must still propagate.
+        def stages() -> None:
+            raise ProvisionError("accounts verification failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            with self._drive_provision(
+                provisioner, stages, sentinel_present=False
+            ) as (stdout, prepare, release):
+                with self.assertRaisesRegex(
+                    ProvisionError, "accounts verification failed"
+                ):
+                    provisioner.provision()
+            prepare.assert_called_once_with()
+            self.assertIn(
+                "EXPLOIT_SENTINEL_RESTAGED reason=autoroot",
+                stdout.getvalue(),
+            )
+            release.assert_called_once_with(succeeded=False)
+
+    def test_provision_exit_without_staged_autoroot_installs_nothing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary)
+            with self._drive_provision(
+                provisioner, lambda: None, sentinel_present=False
+            ) as (stdout, prepare, release):
+                provisioner.provision()
+            prepare.assert_not_called()
+            self.assertNotIn("EXPLOIT_SENTINEL_RESTAGED", stdout.getvalue())
+            self.assertNotIn("EXPLOIT_SENTINEL_RETAINED", stdout.getvalue())
+            release.assert_called_once_with(succeeded=True)
+
+    def test_successful_exit_with_sentinel_present_skips_reinstall(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            with self._drive_provision(
+                provisioner, lambda: None, sentinel_present=True
+            ) as (stdout, prepare, release):
+                provisioner.provision()
+            prepare.assert_not_called()
+            self.assertIn(
+                "EXPLOIT_SENTINEL_RETAINED reason=autoroot",
+                stdout.getvalue(),
+            )
+            release.assert_called_once_with(succeeded=True)
+
+    def test_restage_failure_on_successful_exit_fails_the_run(
+        self,
+    ) -> None:
+        # A run whose stages succeeded must not report success while
+        # leaving staged autoroot stranded: the failed reinstall is
+        # the run's failure.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            with self._drive_provision(
+                provisioner, lambda: None, sentinel_present=False
+            ) as (stdout, prepare, release):
+                prepare.side_effect = ProvisionError(
+                    "sentinel install failed"
+                )
+                with self.assertRaisesRegex(
+                    ProvisionError, "sentinel install failed"
+                ):
+                    provisioner.provision()
+            release.assert_called_once_with(succeeded=False)
+
+    def test_restage_failure_on_abort_is_reported_not_masked(
+        self,
+    ) -> None:
+        # On an abort the original error stays the run's error; the
+        # failed reinstall is reported in the log, not swallowed and
+        # not substituted for the original failure.
+        def stages() -> None:
+            raise ProvisionError("accounts verification failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            with self._drive_provision(
+                provisioner, stages, sentinel_present=False
+            ) as (stdout, prepare, release):
+                prepare.side_effect = ProvisionError(
+                    "sentinel install failed"
+                )
+                with self.assertRaisesRegex(
+                    ProvisionError, "accounts verification failed"
+                ):
+                    provisioner.provision()
+            self.assertIn(
+                "EXPLOIT_SENTINEL_RESTAGE_FAILED", stdout.getvalue()
+            )
+            self.assertIn("sentinel install failed", stdout.getvalue())
+            release.assert_called_once_with(succeeded=False)
+
+    def test_nested_run_leaves_sentinel_end_state_to_outer_run(
+        self,
+    ) -> None:
+        # A bootstrap phase's nested provision() must not enforce
+        # the guarantee mid-run; the outermost run owns the
+        # sentinel's end state, as it owns the guard's flag.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, shizuku=True, autoroot=True
+            )
+            provisioner._autoroot_guard_nested = True
+            with (
+                mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    side_effect=AssertionError("nested run probed adb"),
+                ),
+                mock.patch.object(
+                    provisioner, "prepare_exploit_sentinel"
+                ) as prepare,
+            ):
+                provisioner._ensure_sentinel_for_staged_autoroot()
+            prepare.assert_not_called()

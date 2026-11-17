@@ -1199,6 +1199,42 @@ class PortalProvisioner:
             == 0
         )
 
+    def _ensure_sentinel_for_staged_autoroot(self) -> None:
+        """Run-exit guarantee for the exploit sentinel.
+
+        Phases remove the sentinel at their ends, and the failure
+        paths patched earlier only cover aborts raised inside those
+        phases: an abort landing after a phase-end removal (run37b:
+        a verification failure after the install loop's removal, with
+        no later phase to re-stage it) still left staged autoroot
+        with no sentinel to replay and no way to ever win.
+        provision() calls this on every exit of the outermost run:
+        when autoroot is staged, leave the sentinel installed —
+        reinstall it when a removal was the last word, otherwise
+        record the retention. A failed reinstall raises, so a run
+        never reports success while stranding staged autoroot."""
+        if self._autoroot_guard_nested:
+            # A bootstrap phase's nested provision(): the outermost
+            # run owns the sentinel's end state, as it owns the
+            # autoroot guard's flag lifecycle.
+            return
+        if not self.uses_exploit_sentinel():
+            return
+        if not self.autoroot_staged():
+            return
+        path = self.adb_run(
+            ["shell", "pm", "path", EXPLOIT_SENTINEL_PACKAGE],
+            timeout=10,
+        ).stdout
+        if path.startswith("package:"):
+            print(
+                "EXPLOIT_SENTINEL_RETAINED reason=autoroot",
+                flush=True,
+            )
+            return
+        self.prepare_exploit_sentinel()
+        print("EXPLOIT_SENTINEL_RESTAGED reason=autoroot", flush=True)
+
     def _channel_blocker(self, state: dict[str, object]) -> str | None:
         """Eligibility for the root-channel apply path; None when the
         delta can be applied without racing. Any requested action
@@ -5475,6 +5511,23 @@ class PortalProvisioner:
         self._engage_autoroot_guard()
         try:
             self._provision_stages()
+        except BaseException:
+            # The run is already failing; still enforce the sentinel
+            # exit guarantee, but never let its own failure mask the
+            # original error — report it in the log instead.
+            try:
+                self._ensure_sentinel_for_staged_autoroot()
+            except Exception as exc:
+                print(
+                    "EXPLOIT_SENTINEL_RESTAGE_FAILED "
+                    f"error={exc}; staged autoroot cannot win "
+                    "until the sentinel is reinstalled",
+                    flush=True,
+                )
+            self._release_autoroot_guard(succeeded=False)
+            raise
+        try:
+            self._ensure_sentinel_for_staged_autoroot()
         except BaseException:
             self._release_autoroot_guard(succeeded=False)
             raise
