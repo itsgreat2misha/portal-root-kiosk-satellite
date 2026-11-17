@@ -58,6 +58,12 @@ the fork diverged from upstream:
   every boot when the staged config records updates as disabled
   (`OTA_NODEMON=1`, cleared by `--enable-updates`, preserved
   across unrelated re-staging).
+- Project debug signing key: the debug keystore is committed at the
+  repository root (`debug.keystore`) and every build must sign with
+  it. The build-environment check verifies the active keystore's
+  certificate fingerprint and fails on a mismatch or a missing
+  keystore instead of letting a replacement key be generated, since
+  devices refuse signature-mismatched APK updates.
 
 ### Fixed
 

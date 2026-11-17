@@ -496,6 +496,12 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
                     clear=True,
                 ),
                 mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256",
+                    return_value=(
+                        provision_portal_module.PROJECT_DEBUG_KEYSTORE_SHA256
+                    ),
+                ),
             ):
                 environment = android_build_environment()
 
@@ -539,6 +545,12 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
                     clear=True,
                 ),
                 mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256",
+                    return_value=(
+                        provision_portal_module.PROJECT_DEBUG_KEYSTORE_SHA256
+                    ),
+                ),
             ):
                 # Without autoroot the NDK simpleperf is not required
                 # for a non-bundled target; with autoroot it is, so a
@@ -569,6 +581,145 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
                     "no Portal changes were made.*ANDROID_SDK_ROOT",
                 ):
                     android_build_environment()
+
+    def _fake_sdk(self, temporary: str) -> pathlib.Path:
+        sdk = pathlib.Path(temporary) / "sdk"
+        ndk = sdk / "ndk" / "28.2.13676358"
+        toolchain = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+        build_tools = sdk / "build-tools" / "37.0.0"
+        platform = sdk / "platforms" / "android-36"
+        for path in (
+            toolchain / "aarch64-linux-android29-clang",
+            toolchain / "armv7a-linux-androideabi28-clang",
+            toolchain / "armv7a-linux-androideabi29-clang",
+            build_tools / "aapt",
+            build_tools / "apksigner",
+            build_tools / "zipalign",
+            build_tools / "d8",
+            platform / "android.jar",
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        return sdk
+
+    def test_repo_debug_keystore_is_preferred(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = self._fake_sdk(temporary)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ANDROID_SDK_ROOT": str(sdk)},
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256",
+                    return_value=(
+                        provision_portal_module.PROJECT_DEBUG_KEYSTORE_SHA256
+                    ),
+                ) as reader,
+            ):
+                environment = android_build_environment()
+
+        self.assertEqual(environment["KEYSTORE"], str(ROOT / "debug.keystore"))
+        reader.assert_called_once_with(ROOT / "debug.keystore")
+
+    def test_explicit_keystore_overrides_repo_keystore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = self._fake_sdk(temporary)
+            custom = pathlib.Path(temporary) / "custom.keystore"
+            custom.touch()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ANDROID_SDK_ROOT": str(sdk), "KEYSTORE": str(custom)},
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256",
+                    return_value=(
+                        provision_portal_module.PROJECT_DEBUG_KEYSTORE_SHA256
+                    ),
+                ),
+            ):
+                environment = android_build_environment()
+
+        self.assertEqual(environment["KEYSTORE"], str(custom))
+
+    def test_keystore_fingerprint_mismatch_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = self._fake_sdk(temporary)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ANDROID_SDK_ROOT": str(sdk)},
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256",
+                    return_value=(
+                        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+                        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ProvisionError, "keystore fingerprint mismatch"
+                ):
+                    android_build_environment()
+
+    def test_missing_keystore_fails_instead_of_regenerating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = self._fake_sdk(temporary)
+            absent = pathlib.Path(temporary) / "absent.keystore"
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ANDROID_SDK_ROOT": str(sdk), "KEYSTORE": str(absent)},
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch(
+                    "provision_portal.keystore_certificate_sha256"
+                ) as reader,
+            ):
+                with self.assertRaisesRegex(
+                    ProvisionError, "keystore not found"
+                ):
+                    android_build_environment()
+
+            reader.assert_not_called()
+
+    def test_keystore_certificate_sha256_parses_keytool_output(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            "Certificate fingerprints:\n"
+            "\t SHA1: 5D:0B:1C:2D:3E:4F:50:61:72:83:94:A5:B6:C7:D8:E9:"
+            "FA:0B:1C:2D\n"
+            "\t SHA256: 7e:65:e6:8e:f9:4a:31:a5:27:7a:d5:b4:70:75:a0:32:"
+            "9f:74:2e:f7:7c:6c:33:96:56:50:fe:44:25:85:8d:07\n",
+        )
+        with mock.patch("provision_portal.subprocess.run", return_value=completed):
+            fingerprint = provision_portal_module.keystore_certificate_sha256(
+                pathlib.Path("debug.keystore")
+            )
+
+        self.assertEqual(
+            fingerprint, provision_portal_module.PROJECT_DEBUG_KEYSTORE_SHA256
+        )
+
+    def test_keystore_certificate_sha256_rejects_unreadable_keystore(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess([], 1, "")
+        with mock.patch("provision_portal.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(ProvisionError, "unverified signing key"):
+                provision_portal_module.keystore_certificate_sha256(
+                    pathlib.Path("debug.keystore")
+                )
 
 class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
     def test_standalone_flag_needs_no_root_action(self) -> None:
