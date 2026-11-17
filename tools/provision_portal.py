@@ -356,6 +356,7 @@ class PortalProvisioner:
         self.restore_remote_wipe = restore_remote_wipe
         self.remove_meta_accounts = remove_meta_accounts
         self.meta_accounts_absent = False
+        self.meta_accounts_package_disabled = False
         self.meta_accounts_already_clean = False
         self.optimize_presence = optimize_presence
         self.presence_already_configured = False
@@ -3265,6 +3266,9 @@ class PortalProvisioner:
     def meta_accounts_preflight(self) -> bool:
         result = self.settings_feature.meta_accounts_preflight()
         self.meta_accounts_absent = self.settings_feature.meta_accounts_absent
+        self.meta_accounts_package_disabled = (
+            self.settings_feature.meta_accounts_package_disabled
+        )
         return result
 
     def audio_preflight(self) -> bool:
@@ -4120,6 +4124,14 @@ class PortalProvisioner:
                     "GHOSTLOCK_META_ACCOUNT_CTL_JAR": ACCOUNT_CTL_REMOTE,
                 }
             )
+            if self.meta_accounts_package_disabled:
+                # The alohausers package itself is disabled (a
+                # legitimate prior state: a user trial, another
+                # tool). The action normalizes it device-side before
+                # applying the authenticator state; shell pm enable
+                # is denied for uid 2000 on this build, so the host
+                # cannot do it from here.
+                environment["GHOSTLOCK_META_ACCOUNTS_ENABLE_PACKAGE"] = "1"
             if self.target.meta_accounts_skip_force_stop:
                 environment["GHOSTLOCK_META_ACCOUNTS_SKIP_FORCE_STOP"] = "1"
             if self.meta_accounts_local_only:

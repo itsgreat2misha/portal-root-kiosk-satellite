@@ -35,6 +35,18 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- `--remove-meta-accounts` aborted at final verification when the
+  alohausers package itself was disabled (a legitimate prior state:
+  a user trial, another tool), wasting the run's completed race
+  work. Preflight now detects the disabled package and no longer
+  treats the device as already clean; the native action then
+  enables the package from its own credential context (shell
+  `pm enable` is denied for uid 2000 on this build) before applying
+  the authenticator state, logging
+  `META_ACCOUNTS_PACKAGE_ENABLED prior=disabled`. The final
+  verification is unchanged and now passes because the action
+  produces the designed state (package enabled, authenticators
+  disabled); a failed enable fails the action at that point.
 - A failed run's error cleanup uninstalled the exploit sentinel
   package even when autoroot staging was in place (staged by that
   run or an earlier one). Staged autoroot replays the exploit on
