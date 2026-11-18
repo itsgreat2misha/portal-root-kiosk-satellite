@@ -121,6 +121,7 @@ class RunState:
         actions: dict[str, object],
         first_boot: str | None = None,
         second_boot: str | None = None,
+        autoroot_key_sha256: str | None = None,
     ) -> None:
         state = {
             "schema": 1,
@@ -137,6 +138,13 @@ class RunState:
                 "second_boot": second_boot,
             },
         }
+        if autoroot_key_sha256 is not None:
+            # Additive field (schema stays 1; readers ignore keys
+            # they do not know): the SHA-256 of the public key the
+            # run staged into the autoroot helper, recorded so a
+            # later "key is not authorized" failure names the key
+            # generation that was live.
+            state["autoroot_key_sha256"] = autoroot_key_sha256
         self._log_dir.mkdir(parents=True, exist_ok=True)
         local = self._log_dir / "portal-provision-state-v1.json"
         local.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")

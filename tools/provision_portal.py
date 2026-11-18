@@ -588,6 +588,8 @@ class PortalProvisioner:
         if self.verify_boots not in (1, 2):
             raise ProvisionError('--verify-boots must be 1 or 2')
         self.shizuku_public_key: pathlib.Path | None = None
+        self.shizuku_key_source: str | None = None
+        self.staged_autoroot_key_sha256: str | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
         self.uid1000_runtime_library_remote: str | None = None
@@ -1490,9 +1492,14 @@ class PortalProvisioner:
         """Apply the drifted delta through the device's existing root
         setup: the same shell-level applies, package installs, and
         autoroot staging the race run performs, minus the races
-        themselves (their persistent products — the authorized helper
-        key, root-mode Shizuku, the lock repair — are already in
-        place and were just verified). No reboots. Any failure logs
+        themselves (their persistent products — root-mode Shizuku,
+        the lock repair — are already in place). The helper key is
+        NOT assumed authorized: this path cannot write adb_keys, so
+        install must produce the already-authorized pair (the
+        helper's own, or seeded from the autoroot helper's copy);
+        a freshly generated pair aborts to the race run below, and
+        staging independently compares the pair it copies against
+        the last authorized key. No reboots. Any failure logs
         the fallback and returns False so the caller continues into
         the normal race run; every apply here is idempotent, so
         re-applying there is safe."""
@@ -1537,6 +1544,16 @@ class PortalProvisioner:
                 self.validate_uid1000_payload()
             if self.shizuku:
                 self.install_shizuku_payload()
+            if self.autoroot and self.shizuku_key_source == "keygen":
+                # A freshly generated pair has no surviving copy and
+                # no authorization; only a race win can authorize it,
+                # and staging it here would strand autoroot recovery
+                # on a key adb_keys does not hold. Fall back to the
+                # race run instead of staging it.
+                raise ProvisionError(
+                    "channel apply generated a new helper keypair "
+                    "that only a race win can authorize"
+                )
             if (
                 self.needs_uid1000_payload()
                 and self.target
@@ -1890,6 +1907,7 @@ class PortalProvisioner:
             actions=actions,
             first_boot=first_boot,
             second_boot=second_boot,
+            autoroot_key_sha256=self.staged_autoroot_key_sha256,
         )
 
     @staticmethod
@@ -2441,6 +2459,11 @@ class PortalProvisioner:
                 ),
                 "boot_helper_installed": SHIZUKU_HELPER_PACKAGE in installed,
                 "key_authorized_by_provisioner": exists(SHIZUKU_SAVED_KEY_REMOTE),
+                "staged_autoroot_key_sha256": (
+                    manifest.get("autoroot_key_sha256")
+                    if isinstance(manifest, dict)
+                    else None
+                ),
                 "server_running": bool(shizuku_process),
                 "server_user": (
                     shizuku_process.split()[0] if shizuku_process else None
@@ -3394,6 +3417,7 @@ class PortalProvisioner:
     def install_shizuku_payload(self) -> None:
         self.shizuku_feature.install_shizuku_payload()
         self.shizuku_public_key = self.shizuku_feature.shizuku_public_key
+        self.shizuku_key_source = self.shizuku_feature.shizuku_key_source
 
     def installed_apk_matches(
         self, apk: pathlib.Path, package: str, tag: str
@@ -5201,7 +5225,11 @@ class PortalProvisioner:
         return self.shizuku_feature.start_shizuku_as_root()
 
     def stage_autoroot_payload(self) -> None:
-        return self.payload_feature.stage_autoroot_payload()
+        result = self.payload_feature.stage_autoroot_payload()
+        self.staged_autoroot_key_sha256 = (
+            self.payload_feature.staged_autoroot_key_sha256
+        )
+        return result
 
     @staticmethod
     def audio_processing_disabled_observed(
