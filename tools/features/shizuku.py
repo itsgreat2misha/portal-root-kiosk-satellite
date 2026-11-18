@@ -95,6 +95,8 @@ class ShizukuFeature:
         resolve_shizuku_apk: Callable[..., pathlib.Path],
         install_apk_preserving_verifier: Callable[..., None],
         verify_package_verifier_state: Callable[..., None],
+        authorized_shizuku_key: Callable[[], str | None],
+        authorized_shizuku_key_already: Callable[[], bool],
         shizuku_apk: pathlib.Path | None,
     ):
         self._adb_run = adb_run
@@ -109,6 +111,8 @@ class ShizukuFeature:
         self._resolve_shizuku_apk = resolve_shizuku_apk
         self._install_apk_preserving_verifier = install_apk_preserving_verifier
         self._verify_package_verifier_state = verify_package_verifier_state
+        self._authorized_shizuku_key = authorized_shizuku_key
+        self._authorized_shizuku_key_already = authorized_shizuku_key_already
         self.shizuku_apk = shizuku_apk
         self.shizuku_public_key: pathlib.Path | None = None
         # Where the pair install_shizuku_payload ended up with came
@@ -116,8 +120,9 @@ class ShizukuFeature:
         # (copied from the autoroot helper's already-authorized pair),
         # or "keygen" (freshly generated; no race has authorized it
         # yet). The channel apply path refuses to stage a "keygen"
-        # pair: it cannot authorize one, and staging it would strand
-        # autoroot recovery on a key adb_keys does not hold.
+        # pair, or one that is not the recorded authorized key: it
+        # cannot authorize one, and staging it would strand autoroot
+        # recovery on a key adb_keys does not hold.
         self.shizuku_key_source: str | None = None
         self.package_verifier_before_install_disabled: bool | None = None
 
@@ -496,6 +501,58 @@ class ShizukuFeature:
             check=True,
         )
         print("SHIZUKU_KEY_MARKER_OK source=post-reboot")
+
+    def refresh_shizuku_key_marker(self) -> None:
+        """Converge the on-device saved marker onto the reused pair.
+
+        Non-buffered targets only (buffered targets' marker is the
+        host-pushed finalize above). The marker is written by the
+        native authorize from the staged scratch file at a win, so
+        in the reuse path it can lag the helper's live pair by a
+        generation: a run that rotated the helper's pair and aborted
+        before its staging could leave the marker naming a key that
+        matches no surviving record (Nov 18, 2026 Mini abort). When
+        a win in THIS run proved the pair install read from the
+        helper was already authorized (already=1), the marker is
+        simply stale: rewrite it from the same host copy install
+        staged, so helper, staged file, and marker end the install
+        phase on one generation. Every other case leaves the marker
+        untouched — a fresh append (already=0) is the native
+        authorize's own save to make, and a seeded or keygen'd pair
+        has no already-authorized reuse to converge.
+        """
+        target = self._target()
+        if target is None or target.buffer_root_staged_sources:
+            return
+        if self.shizuku_key_source != "existing":
+            return
+        recorded = self._authorized_shizuku_key()
+        if recorded is None or not self._authorized_shizuku_key_already():
+            return
+        if self.shizuku_public_key is None:
+            return
+        staged = self.shizuku_public_key.read_text(
+            encoding="ascii"
+        ).strip()
+        if recorded != staged:
+            return
+        self._adb_run(
+            ["shell", "rm", "-f", SHIZUKU_SAVED_KEY_REMOTE], timeout=5
+        )
+        self._adb_run(
+            ["push", str(self.shizuku_public_key), SHIZUKU_SAVED_KEY_REMOTE],
+            timeout=30,
+            check=True,
+        )
+        self._adb_run(
+            ["shell", "chmod", "0600", SHIZUKU_SAVED_KEY_REMOTE],
+            timeout=5,
+            check=True,
+        )
+        print(
+            "SHIZUKU_KEY_MARKER_REFRESHED source=reuse-convergence",
+            flush=True,
+        )
 
     def verify_shizuku(self, wait_seconds: int = 120) -> None:
         self._verify_package_verifier_state()

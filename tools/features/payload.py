@@ -32,10 +32,7 @@ import time
 from typing import Callable
 
 from device_session import ProvisionError
-from features.shizuku import (
-    SHIZUKU_HELPER_PACKAGE,
-    SHIZUKU_SAVED_KEY_REMOTE,
-)
+from features.shizuku import SHIZUKU_HELPER_PACKAGE
 from portal_targets import PortalTarget
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -98,6 +95,8 @@ class PayloadFeature:
         stage_simpleperf: Callable[..., None],
         presence_fps_action_requested: Callable[[], bool],
         stop_root_daemon: Callable[..., None],
+        authorized_shizuku_key: Callable[[], str | None],
+        read_saved_shizuku_key_marker: Callable[[], str | None],
         autoroot_helper_local: Callable[[], pathlib.Path],
         autoroot_runner_local: Callable[[], pathlib.Path],
         adb_framework_boot_installed_remote: str,
@@ -118,6 +117,8 @@ class PayloadFeature:
         self._stage_simpleperf = stage_simpleperf
         self._presence_fps_action_requested = presence_fps_action_requested
         self._stop_root_daemon = stop_root_daemon
+        self._authorized_shizuku_key = authorized_shizuku_key
+        self._read_saved_shizuku_key_marker = read_saved_shizuku_key_marker
         self._autoroot_helper_local = autoroot_helper_local
         self._autoroot_runner_local = autoroot_runner_local
         self._adb_framework_boot_installed_remote = (
@@ -485,25 +486,32 @@ class PayloadFeature:
         """Return the public key staging is about to copy into the
         autoroot helper, refusing a pair that was never authorized.
 
-        The saved-marker file holds the last public key a race win
-        authorized (pushed by finalize_buffered_shizuku_key on
-        buffered targets, saved by the native authorize itself on
-        the others), so it is updated in the same run that
-        authorizes a new pair, before staging can run. A pair that
-        differs from the marker was therefore never authorized —
-        staging it would leave the autoroot helper holding a key
-        adb_keys does not contain, and recovery would die on its
-        first unguarded boot with "key is not authorized". Fail
-        loudly instead; on the channel path this raise is what
+        The reference is the key this run's install loop authorized:
+        the provisioner records the staged host copy at the win whose
+        authorize reported ok. That record is authoritative because
+        it is the exact key the authorize checked against adb_keys,
+        read from the same file stage() pushed. The on-device saved
+        marker is only the fallback for runs that authorized nothing
+        (channel path, payload-only runs): its writer is the native
+        authorize saving the staged scratch file, a chain that can
+        lag the helper's live pair in the reuse path — a run that
+        rotated the helper and aborted leaves the marker a generation
+        behind, and judging the helper's pair against it aborted a
+        Mini run whose pair was in fact authorized (Nov 18, 2026).
+        A pair that differs from the reference was therefore never
+        authorized — staging it would leave the autoroot helper
+        holding a key adb_keys does not contain, and recovery would
+        die on its first unguarded boot with "key is not authorized".
+        Fail loudly instead; on the channel path this raise is what
         routes the run back to the race, whose install loop can
-        authorize the pair. With no marker there is no recorded
+        authorize the pair. With no reference there is no recorded
         authorization to contradict (first provision, or after
-        --remove-shizuku deleted it), and the comparison is skipped;
-        it is likewise skipped when the helper's key does not read
-        back in the well-formed shape install validates, which is
-        install's failure to surface, not staging's. This is a pure
-        host-side file comparison: the shell-domain root channel
-        cannot read adb_keys itself.
+        --remove-shizuku deleted the marker), and the comparison is
+        skipped; it is likewise skipped when the helper's key does
+        not read back in the well-formed shape install validates,
+        which is install's failure to surface, not staging's. This
+        is a pure host-side comparison: the shell-domain root
+        channel cannot read adb_keys itself.
         """
         public = self._adb_run(
             [
@@ -517,19 +525,27 @@ class PayloadFeature:
         ).stdout.strip()
         if not re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", public):
             return None
-        marker = self._adb_run(
-            ["shell", "cat", SHIZUKU_SAVED_KEY_REMOTE],
-            timeout=10,
-        ).stdout.strip()
-        if marker and marker != public:
-            raise ProvisionError(
-                "autoroot staging would copy an ADB keypair that "
-                "was never authorized: staged key sha256="
-                f"{hashlib.sha256(public.encode('utf-8')).hexdigest()} "
-                "does not match the last authorized key sha256="
-                f"{hashlib.sha256(marker.encode('utf-8')).hexdigest()} "
-                f"({SHIZUKU_SAVED_KEY_REMOTE}); a race win must "
-                "authorize the new key before it can be staged"
+        reference = self._authorized_shizuku_key()
+        source = "run-record"
+        if reference is None:
+            reference = self._read_saved_shizuku_key_marker()
+            source = "saved-marker"
+        if reference is not None:
+            if reference != public:
+                raise ProvisionError(
+                    "autoroot staging would copy an ADB keypair that "
+                    "was never authorized: staged key sha256="
+                    f"{hashlib.sha256(public.encode('utf-8')).hexdigest()} "
+                    "does not match the authorized key sha256="
+                    f"{hashlib.sha256(reference.encode('utf-8')).hexdigest()} "
+                    f"(source={source}); a race win must "
+                    "authorize the new key before it can be staged"
+                )
+            print(
+                "AUTOROOT_KEY_AUTHORIZED "
+                f"source={source} "
+                f"sha256={hashlib.sha256(public.encode('utf-8')).hexdigest()}",
+                flush=True,
             )
         return public
 

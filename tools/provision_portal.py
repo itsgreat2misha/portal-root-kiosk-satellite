@@ -502,6 +502,10 @@ class PortalProvisioner:
                 lambda: self.presence_fps_action_requested()
             ),
             stop_root_daemon=lambda *a, **k: self.stop_root_daemon(*a, **k),
+            authorized_shizuku_key=lambda: self.authorized_shizuku_key,
+            read_saved_shizuku_key_marker=(
+                lambda: self.read_saved_shizuku_key_marker()
+            ),
             autoroot_helper_local=lambda: AUTOROOT_HELPER_LOCAL,
             autoroot_runner_local=lambda: AUTOROOT_RUNNER_LOCAL,
             adb_framework_boot_installed_remote=(
@@ -528,6 +532,10 @@ class PortalProvisioner:
             ),
             verify_package_verifier_state=(
                 lambda *a, **k: self.verify_package_verifier_state(*a, **k)
+            ),
+            authorized_shizuku_key=lambda: self.authorized_shizuku_key,
+            authorized_shizuku_key_already=(
+                lambda: self.authorized_shizuku_key_already
             ),
             shizuku_apk=self.shizuku_apk,
         )
@@ -614,6 +622,15 @@ class PortalProvisioner:
             raise ProvisionError('--verify-boots must be 1 or 2')
         self.shizuku_public_key: pathlib.Path | None = None
         self.shizuku_key_source: str | None = None
+        # The public key a race win in THIS run authorized (the staged
+        # host copy at that win), and whether that authorize found it
+        # already in adb_keys. Autoroot staging judges the pair it
+        # copies against this record; the on-device saved marker is
+        # only the fallback for runs that authorized nothing, because
+        # its writer (the native save from the staged scratch file)
+        # can lag the helper's live pair in the reuse path.
+        self.authorized_shizuku_key: str | None = None
+        self.authorized_shizuku_key_already: bool = False
         self.staged_autoroot_key_sha256: str | None = None
         self.presence_public_key: pathlib.Path | None = None
         self.uid1000_runtime_apk_remote: str | None = None
@@ -1522,9 +1539,10 @@ class PortalProvisioner:
         NOT assumed authorized: this path cannot write adb_keys, so
         install must produce the already-authorized pair (the
         helper's own, or seeded from the autoroot helper's copy);
-        a freshly generated pair aborts to the race run below, and
-        staging independently compares the pair it copies against
-        the last authorized key. No reboots. Any failure logs
+        a freshly generated pair, or one that is not the recorded
+        authorized key, aborts to the race run below, and staging
+        independently compares the pair it copies against the
+        recorded authorized key. No reboots. Any failure logs
         the fallback and returns False so the caller continues into
         the normal race run; every apply here is idempotent, so
         re-applying there is safe."""
@@ -1579,6 +1597,35 @@ class PortalProvisioner:
                     "channel apply generated a new helper keypair "
                     "that only a race win can authorize"
                 )
+            if self.autoroot and self.shizuku_public_key is not None:
+                # The same refusal one generation later: a reused
+                # pair that is not the recorded authorized key (this
+                # run's authorize record, or the on-device saved
+                # marker for a run that authorized nothing) has no
+                # proven authorization either. When no record can be
+                # read there is nothing to contradict the pair, and
+                # staging's own comparison stays the backstop.
+                reference = (
+                    self.authorized_shizuku_key
+                    or self.read_saved_shizuku_key_marker()
+                )
+                prepared = None
+                try:
+                    prepared = self.shizuku_public_key.read_text(
+                        encoding="ascii"
+                    ).strip()
+                except OSError:
+                    pass
+                if (
+                    reference is not None
+                    and prepared is not None
+                    and reference != prepared
+                ):
+                    raise ProvisionError(
+                        "channel apply prepared a helper keypair "
+                        "that is not the recorded authorized key; "
+                        "only a race win can authorize it"
+                    )
             if (
                 self.needs_uid1000_payload()
                 and self.target
@@ -3705,6 +3752,35 @@ class PortalProvisioner:
     def finalize_buffered_shizuku_key(self) -> None:
         return self.shizuku_feature.finalize_buffered_shizuku_key()
 
+    def refresh_shizuku_key_marker(self) -> None:
+        return self.shizuku_feature.refresh_shizuku_key_marker()
+
+    def read_saved_shizuku_key_marker(self) -> str | None:
+        """The on-device saved marker's public key, or None when no
+        channel can read it.
+
+        The native authorize saves the marker root-owned 0600 on
+        non-buffered targets, where a plain shell cat silently
+        returns nothing unless adbd happens to be in root mode; read
+        it through the payload root daemon while a win has it up,
+        and fall back to the shell cat (the marker is host-pushed and
+        shell-readable on buffered targets, and after a host-side
+        refresh). An unreadable marker is not an error: it means
+        there is no recorded authorization to judge against.
+        """
+        try:
+            code, output = self.daemon_exec(
+                f"cat {SHIZUKU_SAVED_KEY_REMOTE}", timeout=10
+            )
+            if code == 0 and output.strip():
+                return output.strip()
+        except (OSError, ProvisionError):
+            pass
+        marker = self.adb_run(
+            ["shell", "cat", SHIZUKU_SAVED_KEY_REMOTE], timeout=10
+        ).stdout.strip()
+        return marker or None
+
     def finalize_buffered_uid1000_markers(self) -> None:
         return self.payload_feature.finalize_buffered_uid1000_markers()
 
@@ -5269,6 +5345,32 @@ class PortalProvisioner:
                         # the property does not survive the reboots
                         # between this phase and the run's end.
                         self.ota_nodemon_set_this_run = True
+                    authorize_match = re.search(
+                        r"Shizuku ADB key authorize already=(\d+) ok=(\d+)",
+                        line,
+                    )
+                    if authorize_match and authorize_match.group(2) == "1":
+                        # This win authorized the key stage() staged
+                        # for the attempt: the host log-dir copy
+                        # install prepared from the helper. Record it
+                        # (and whether adb_keys already held it) —
+                        # autoroot staging judges the pair it copies
+                        # against this record, not against the
+                        # on-device saved marker, whose native writer
+                        # saves the staged scratch file and can lag
+                        # the helper's live pair in the reuse path.
+                        if self.shizuku_public_key is not None:
+                            try:
+                                self.authorized_shizuku_key = (
+                                    self.shizuku_public_key.read_text(
+                                        encoding="ascii"
+                                    ).strip()
+                                )
+                                self.authorized_shizuku_key_already = (
+                                    authorize_match.group(1) == "1"
+                                )
+                            except OSError:
+                                pass
                     if (
                         self.target.post_scheduler_timeout_seconds > 0
                         and "post-scheduler checkpoint complete" in line
@@ -6162,6 +6264,7 @@ class PortalProvisioner:
                     sentinel_removed = True
                 if self.shizuku:
                     self.finalize_buffered_shizuku_key()
+                    self.refresh_shizuku_key_marker()
                 if self.needs_uid1000_payload():
                     self.finalize_buffered_uid1000_markers()
                 if (
