@@ -339,6 +339,87 @@ class ManifestCorrectionTest(unittest.TestCase):
             self.assertEqual(provisioner.writes, [])
 
 
+class VerifiedManifestCorrectionTest(unittest.TestCase):
+    """The mirror correction: a run's mid-run provenance
+    verification marks the OTA action unverified in the disabled
+    posture before the end-state judgment runs, so a judged-done
+    verdict must clear that mark — and, at the final report,
+    repair a manifest that already recorded "unverified" — or the
+    manifest would contradict the judgment and the device could
+    never qualify for the no-op path."""
+
+    def done_provisioner(self, temporary: str, state) -> PortalProvisioner:
+        provisioner = deferred_provisioner(temporary)
+        provisioner.ota_preflight = lambda: False
+        provisioner.alohausers_package_disabled = lambda: True
+        provisioner._ota_nodemon_conf_staged = lambda: True
+        provisioner._ota_override_present = lambda: True
+        provisioner.ota_nodemon_set_this_run = True
+        provisioner.adb_run = (
+            lambda arguments, timeout=None, check=False: completed(
+                arguments, "\n"
+            )
+        )
+        provisioner.ota_unverified = True
+        provisioner.read_state = lambda: state
+        provisioner.writes = []
+        provisioner.write_state = lambda status, fb=None, sb=None: (
+            provisioner.writes.append((status, fb, sb))
+        )
+        return provisioner
+
+    def test_done_judgment_repairs_unverified_manifest(self) -> None:
+        state = {
+            "status": "complete",
+            "actions": {"disable_updates": "unverified"},
+            "verification": {"first_boot": "b1", "second_boot": "b2"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.done_provisioner(temporary, state)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                provisioner.report_deferred_failures()
+            self.assertFalse(provisioner.ota_unverified)
+            self.assertEqual(
+                provisioner.writes, [("complete", "b1", "b2")]
+            )
+            self.assertIn(
+                "OTA_MANIFEST_CORRECTED action=disable_updates "
+                "recorded=done",
+                output.getvalue(),
+            )
+
+    def test_provisional_done_clears_flag_without_manifest_write(
+        self,
+    ) -> None:
+        state = {
+            "status": "complete",
+            "actions": {"disable_updates": "unverified"},
+            "verification": {"first_boot": "b1", "second_boot": "b2"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.done_provisioner(temporary, state)
+            provisioner._payload_phase_pending = True
+            provisioner.report_deferred_failures()
+            self.assertFalse(provisioner.ota_unverified)
+            self.assertEqual(provisioner.deferred_phase_failures, [])
+            self.assertEqual(provisioner.writes, [])
+
+    def test_done_judgment_no_write_when_manifest_already_done(
+        self,
+    ) -> None:
+        state = {
+            "status": "complete",
+            "actions": {"disable_updates": True},
+            "verification": {"first_boot": "b1", "second_boot": "b2"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.done_provisioner(temporary, state)
+            provisioner.report_deferred_failures()
+            self.assertFalse(provisioner.ota_unverified)
+            self.assertEqual(provisioner.writes, [])
+
+
 class BootstrapGuardTest(unittest.TestCase):
     def test_singleton_run_keeps_fail_fast(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1873,6 +1873,17 @@ class PortalProvisioner:
                 "reason=end-state-verified",
                 flush=True,
             )
+            if self.ota_unverified:
+                # The run's own mid-run verification marked the
+                # action unverified (in the disabled posture its
+                # provenance check cannot pass) before the end-state
+                # judgment judged it done. Clear the mark so the
+                # run's remaining manifest writes record the judged
+                # result, and at the final report repair a manifest
+                # that already recorded "unverified".
+                self.ota_unverified = False
+                if final:
+                    self._correct_manifest_for_verified_ota()
             return
         if not final:
             return
@@ -2002,6 +2013,40 @@ class PortalProvisioner:
         print(
             "OTA_MANIFEST_CORRECTED action=disable_updates "
             "recorded=unverified",
+            flush=True,
+        )
+
+    def _correct_manifest_for_verified_ota(self) -> None:
+        """Re-write a completed manifest that recorded the OTA
+        action "unverified" now that the final judgment judges it
+        done (the mid-run provenance verification marks it
+        unverified in the disabled posture, before the end-state
+        judgment runs), preserving the recorded verification
+        boots, so the device can qualify for the no-op path on
+        later runs (write_state records the action done while
+        ota_unverified is clear)."""
+        try:
+            state = self.read_state()
+        except ProvisionError:
+            state = None
+        if not state or state.get("status") != "complete":
+            return
+        actions = state.get("actions")
+        if not isinstance(actions, dict):
+            return
+        if actions.get("disable_updates") != "unverified":
+            return
+        first_boot = second_boot = None
+        verification = state.get("verification")
+        if isinstance(verification, dict):
+            if isinstance(verification.get("first_boot"), str):
+                first_boot = verification["first_boot"]
+            if isinstance(verification.get("second_boot"), str):
+                second_boot = verification["second_boot"]
+        self.write_state("complete", first_boot, second_boot)
+        print(
+            "OTA_MANIFEST_CORRECTED action=disable_updates "
+            "recorded=done",
             flush=True,
         )
 

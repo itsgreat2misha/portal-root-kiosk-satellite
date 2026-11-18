@@ -124,6 +124,11 @@ the fork diverged from upstream:
   done, any one false leaves it `unverified`, and a completed
   manifest that claimed it done is corrected in place
   (`OTA_MANIFEST_CORRECTED`), preserving the verification boots.
+  The correction runs in both directions: a manifest the run's own
+  mid-run provenance verification recorded as `unverified` is
+  likewise repaired when the end-state judgment judges the action
+  done, so the record matches the judgment and the device can
+  qualify for the no-op path on later runs.
 - The Shizuku/autoroot ADB keypair could rotate away from the
   authorized key and strand recovery: the two helpers share one
   keypair, autoroot staging removes the Shizuku helper, and the
