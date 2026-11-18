@@ -122,6 +122,7 @@ class RunState:
         first_boot: str | None = None,
         second_boot: str | None = None,
         autoroot_key_sha256: str | None = None,
+        desired_state: dict[str, str] | None = None,
     ) -> None:
         state = {
             "schema": 1,
@@ -145,6 +146,15 @@ class RunState:
             # later "key is not authorized" failure names the key
             # generation that was live.
             state["autoroot_key_sha256"] = autoroot_key_sha256
+        if desired_state:
+            # Additive field (schema stays 1; readers ignore keys
+            # they do not know): the end state a run observed as
+            # already in place and asks future boots to keep -
+            # currently the alohausers-disabled posture on aloha.
+            # Autoroot staging derives the matching autoroot.conf
+            # keys from it and the helper enforces them per boot
+            # (C3-A, 2026-11-18).
+            state["desired_state"] = desired_state
         self._log_dir.mkdir(parents=True, exist_ok=True)
         local = self._log_dir / "portal-provision-state-v1.json"
         local.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")

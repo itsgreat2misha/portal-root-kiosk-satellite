@@ -1280,7 +1280,21 @@ the helper from the notification to re-enable autoroot; the screen
 states the risk first, and the budget re-arms, so a fault that is still
 there turns autoroot off again after 10 more bad boots. Re-running the
 provisioner also clears the stand-down, and a provision run reports one
-when it finds it.
+when it finds it. A unit standing down keeps whatever state drifted
+until autoroot runs again: the drift pass below is part of the
+root-recovery flow, not a separate watchdog.
+
+After root is up on a boot, the helper also runs a recorded-state
+drift pass: it compares the live device against the end state the
+provisioner recorded in `autoroot.conf` and repairs what drifted -
+Private DNS through its own ADB shell channel, and, on the Portal+,
+the disabled `alohausers` package posture through the root daemon
+before that window closes. `otad.nodemon` is checked read-only (no
+on-device channel can set it after the win; the staged payload's
+win-time set remains the enforcement). Each item logs `DRIFT_OK`,
+`DRIFT_REPAIRED` or `DRIFT_UNREPAIRED` in the helper's service log;
+the pass never blocks root recovery and never touches the failure
+budget.
 
 Autoroot attempts carry the same race risks as host-driven attempts,
 without anyone watching: a failed attempt reboots the Portal, and an

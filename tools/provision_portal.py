@@ -389,6 +389,18 @@ class PortalProvisioner:
         # invocation, and the judgment that ends the run happens in
         # the final report after it.
         self._payload_phase_pending = False
+        # The alohausers package state observed at this run's start
+        # (before any phase of the run could change it), and whether
+        # the end-of-run posture apply already ran. Together with
+        # the start manifest they decide the recorded desired state
+        # (C3-A): a run that STARTS with the package disabled while
+        # removing Meta accounts records the disabled posture as the
+        # desired end state instead of treating it as drift.
+        self._alohausers_disabled_at_start: bool | None = None
+        self._posture_apply_attempted = False
+        # The live Private DNS values behind the most recent
+        # _dns_drift verdict, for the fast-path drift log line.
+        self._dns_drift_live: tuple[str, str] | None = None
         # Process whose credential the most recently built exploit
         # environment's action child clones, if any; reported by
         # exploit() alongside the environment's action keys.
@@ -468,6 +480,9 @@ class PortalProvisioner:
                 restore_presence_fps=self.restore_presence_fps,
                 restore_presence_profile=self.restore_presence_profile,
                 presence_fps_cap=self.presence_fps_cap,
+                privacy_dns=self.privacy_dns,
+                dhcp_dns=self.dhcp_dns,
+                restore_privacy_dns=self.restore_privacy_dns,
             ),
             adb_run=lambda *a, **k: self.adb_run(*a, **k),
             target=lambda: self.target,
@@ -506,6 +521,10 @@ class PortalProvisioner:
             read_saved_shizuku_key_marker=(
                 lambda: self.read_saved_shizuku_key_marker()
             ),
+            read_private_dns_backup=lambda *a, **k: (
+                self.read_private_dns_backup(*a, **k)
+            ),
+            desired_state=lambda: self._desired_state(),
             autoroot_helper_local=lambda: AUTOROOT_HELPER_LOCAL,
             autoroot_runner_local=lambda: AUTOROOT_RUNNER_LOCAL,
             adb_framework_boot_installed_remote=(
@@ -608,6 +627,9 @@ class PortalProvisioner:
                 self.read_remote_wipe_backup(required=required)
             ),
             ensure_remote_wipe_backup=lambda: self.ensure_remote_wipe_backup(),
+            alohausers_desired_disabled=lambda: (
+                self._desired_state().get("alohausers_package") == "disabled"
+            ),
         )
         self.run_state = RunState(
             ROOT,
@@ -1424,7 +1446,17 @@ class PortalProvisioner:
             return "adb-framework-bootstrap"
         if self.audio and not self.audio_channel_preflight():
             return "audio-not-configured"
-        if self.disable_updates and not self.ota_preflight():
+        if (
+            self.disable_updates
+            and not self.ota_preflight()
+            and not self._recorded_posture_ota_trusted(state)
+        ):
+            # In the recorded alohausers-disabled posture the live
+            # dump reads unconfigured by design; the manifest's
+            # posture-judged completion is the trust record (C3-A).
+            # The verify step re-checks the posture criteria
+            # directly, so a device that left the posture still
+            # fails there rather than passing on the record alone.
             return "ota-not-configured"
         if self.remove_meta_accounts and not self.meta_accounts_preflight():
             return "meta-accounts-not-clean"
@@ -1676,22 +1708,34 @@ class PortalProvisioner:
                 # state, so live drift routes to the channel path,
                 # whose final verification performs the repair.
                 drift = self._dns_drift(state)
-                if drift is None:
+                if drift is not None:
+                    live = self._dns_drift_live
                     print(
-                        "PROVISION_NOOP reason=already-provisioned "
-                        f"tool_revision={state.get('tool_revision')} "
-                        f"logs={self.log_dir}",
+                        "PRIVACY_DNS_DRIFT "
+                        f"recorded_mode={drift[0]} "
+                        f"recorded_hostname={drift[1]} "
+                        f"live_mode={live[0] if live else 'unreadable'} "
+                        f"live_hostname={live[1] if live else 'unreadable'}",
                         flush=True,
                     )
-                    return True
-                print(
-                    "PRIVACY_DNS_DRIFT "
-                    f"recorded_mode={drift[0]} "
-                    f"recorded_hostname={drift[1]}",
-                    flush=True,
-                )
-                self._dns_repair_expectation = drift
-                blocker = "dns-drift"
+                    self._dns_repair_expectation = drift
+                    blocker = "dns-drift"
+                else:
+                    # The recorded alohausers posture is part of
+                    # the no-op decision too (C3-A): the package
+                    # re-enabled outside a run is drift the
+                    # channel path's verification repairs, not a
+                    # state a no-op may pass over.
+                    posture = self._posture_drift(state)
+                    if posture is None:
+                        print(
+                            "PROVISION_NOOP reason=already-provisioned "
+                            f"tool_revision={state.get('tool_revision')} "
+                            f"logs={self.log_dir}",
+                            flush=True,
+                        )
+                        return True
+                    blocker = posture
             else:
                 blocker = root_blocker
         print(f"PROVISION_NOOP_SKIP reason={blocker}", flush=True)
@@ -1727,6 +1771,160 @@ class PortalProvisioner:
             self._start_state = self.read_state()
         except ProvisionError:
             self._start_state = None
+
+    def _observe_start_package_state(self) -> None:
+        """Record the alohausers package state as this run found
+        it. Called once the target is known and before any phase
+        of the run can change the package; the desired-state
+        recording rule keys off this observation, never off the
+        end state (a run that removes Meta accounts ends with the
+        package enabled by construction, which would erase the
+        very posture it started from)."""
+        if self._alohausers_disabled_at_start is not None:
+            return
+        if self.target is None or self.target.device != "aloha":
+            return
+        try:
+            self._alohausers_disabled_at_start = (
+                self.alohausers_package_disabled()
+            )
+        except ProvisionError:
+            self._alohausers_disabled_at_start = None
+
+    def _desired_state(self) -> dict[str, str]:
+        """The desired state this run's manifest writes record
+        (C3-A): end state observed as already in place that future
+        boots should keep, currently the alohausers-disabled
+        posture on aloha.
+
+        Recording rule: a run that requests Meta-account removal
+        and STARTS with the package disabled records the desire;
+        one that starts enabled records nothing (absence = no
+        posture desire, and the run's own finalize restores the
+        package enabled). A run that does not request removal
+        preserves a desire recorded by an earlier run, so an
+        unrelated re-provision never erases the posture record."""
+        desired: dict[str, str] = {}
+        start = self._start_state
+        if isinstance(start, dict):
+            recorded = start.get("desired_state")
+            if isinstance(recorded, dict):
+                value = recorded.get("alohausers_package")
+                if value in ("disabled", "enabled"):
+                    desired["alohausers_package"] = value
+        if (
+            self.target is not None
+            and self.target.device == "aloha"
+            and self.remove_meta_accounts
+            and self._alohausers_disabled_at_start is not None
+        ):
+            if self._alohausers_disabled_at_start:
+                desired["alohausers_package"] = "disabled"
+            else:
+                desired.pop("alohausers_package", None)
+        return desired
+
+    @staticmethod
+    def _recorded_posture_ota_trusted(
+        state: dict[str, object] | None,
+    ) -> bool:
+        """Whether a manifest's disable_updates completion may be
+        trusted as OTA-blocked without re-deriving the block from
+        the live config dump: it was recorded under the C3-B
+        posture judgment (the manifest carries the alohausers-
+        disabled desire, which only a posture-judged run records).
+        In the posture the dump reads unconfigured BY DESIGN -
+        otad's own settings and the MobileConfig override are inert
+        behind the disabled package - so re-deriving OTA from the
+        dump refuses every posture device forever (the C3-B run-8
+        no-op refusal)."""
+        if not isinstance(state, dict):
+            return False
+        actions = state.get("actions")
+        if not isinstance(actions, dict):
+            return False
+        if actions.get("disable_updates") is not True:
+            return False
+        desired = state.get("desired_state")
+        return (
+            isinstance(desired, dict)
+            and desired.get("alohausers_package") == "disabled"
+        )
+
+    def _posture_drift(
+        self, state: dict[str, object] | None
+    ) -> str | None:
+        """The recorded alohausers posture when the live package
+        state has drifted from it; None when it holds, nothing is
+        recorded, or the live state cannot be read (an unreadable
+        package state is surfaced by the spot-checks that gate the
+        no-op, not guessed at here)."""
+        if not isinstance(state, dict):
+            return None
+        desired = state.get("desired_state")
+        if not isinstance(desired, dict):
+            return None
+        if desired.get("alohausers_package") != "disabled":
+            return None
+        if self.target is None or self.target.device != "aloha":
+            return None
+        try:
+            disabled = self.alohausers_package_disabled()
+        except ProvisionError:
+            return None
+        return None if disabled else "alohausers-enabled"
+
+    def _apply_recorded_posture(self) -> None:
+        """End-of-run posture apply (C3-A): when this run's
+        manifest records the alohausers-disabled desire, put the
+        package back into that state through the payload daemon
+        after the final verification and with no reboot after it,
+        so the write gets its settle by construction (a package
+        write followed within about a minute by crash-reboots was
+        silently lost in C3-B validation). A failure is deferred,
+        never silent: the run must not report complete while the
+        device sits outside its recorded end state."""
+        if self._posture_apply_attempted:
+            return
+        self._posture_apply_attempted = True
+        if self._desired_state().get("alohausers_package") != "disabled":
+            return
+        if self.target is None or self.target.device != "aloha":
+            return
+        if self.custom_payload != DEFAULT_CUSTOM_PAYLOAD_LOCAL:
+            print(
+                "ALOHAUSERS_POSTURE_DEFERRED reason=no-daemon-channel",
+                flush=True,
+            )
+            return
+        if self.alohausers_package_disabled():
+            print("ALOHAUSERS_POSTURE_OK state=already-disabled", flush=True)
+            return
+        try:
+            code, _output = self.daemon_exec(
+                "pm disable --user 0 "
+                "com.facebook.alohaservices.alohausers"
+            )
+        except (OSError, ProvisionError) as exc:
+            code = -1
+            _output = str(exc)
+        if code == 0 and self.alohausers_package_disabled():
+            print(
+                "ALOHAUSERS_POSTURE_APPLIED "
+                "package=com.facebook.alohaservices.alohausers "
+                "state=disabled",
+                flush=True,
+            )
+            return
+        self.deferred_phase_failures.append(
+            "alohausers_posture: end-of-run posture apply did not "
+            f"verify (daemon exit={code})"
+        )
+        print(
+            "ALOHAUSERS_POSTURE_APPLY_FAILED "
+            f"daemon_exit={code}",
+            flush=True,
+        )
 
     def _recorded_dns_expectation(
         self, state: dict[str, object] | None
@@ -1765,17 +1963,35 @@ class PortalProvisioner:
     ) -> tuple[str, str] | None:
         """The recorded DNS expectation when the live state has
         drifted from it; None when it matches or nothing is
-        recorded. An unreadable live state counts as drift: the
-        no-op decision must never pass over state it could not
-        check, and the repair path surfaces a real I/O failure if
-        there is one."""
+        recorded. A single mismatching sample is confirmed with
+        one re-read after a short delay before it counts as drift:
+        the C3-B run-8 no-op refusal (2026-11-18) was a lone
+        disagreeing read on a device whose DNS had been verified
+        minutes earlier and that no writer had touched since -
+        most likely a transient empty or garbled settings read,
+        and a gate that treats one sample as truth refuses a
+        healthy device. A state that is unreadable on BOTH reads
+        still counts as drift: the no-op decision must never pass
+        over state it could not check, and the repair path
+        surfaces a real I/O failure if there is one. The live
+        values behind the verdict are kept on
+        self._dns_drift_live for the caller's log line."""
         expectation = self._recorded_dns_expectation(state)
         if expectation is None:
             return None
+        self._dns_drift_live = None
         try:
             live = self.read_private_dns_state()
         except ProvisionError:
-            return expectation
+            live = None
+        if live == expectation:
+            return None
+        time.sleep(2)
+        try:
+            live = self.read_private_dns_state()
+        except ProvisionError:
+            live = None
+        self._dns_drift_live = live
         if live == expectation:
             return None
         return expectation
@@ -1785,18 +2001,24 @@ class PortalProvisioner:
     ) -> None:
         """Enforce the invariant against a starting manifest: on
         drift, re-write the recorded state, log the repair, and
-        re-read before the run may call itself complete."""
+        re-read before the run may call itself complete. The
+        drift verdict goes through _dns_drift's confirmed read,
+        so a lone transient sample never triggers a repair write
+        either."""
         expectation = self._recorded_dns_expectation(state)
         if expectation is None:
             return
-        live = self.read_private_dns_state()
-        if live == expectation:
+        if self._dns_drift(state) is None:
+            live = self._dns_drift_live or self.read_private_dns_state()
             print(
                 "PRIVACY_DNS_RECORDED_OK "
                 f"mode={live[0]} hostname={live[1]}",
                 flush=True,
             )
             return
+        live = self._dns_drift_live
+        if live is None:
+            live = ("unreadable", "unreadable")
         print(
             "PRIVACY_DNS_DRIFT "
             f"recorded_mode={expectation[0]} "
@@ -2203,6 +2425,7 @@ class PortalProvisioner:
             first_boot=first_boot,
             second_boot=second_boot,
             autoroot_key_sha256=self.staged_autoroot_key_sha256,
+            desired_state=self._desired_state() or None,
         )
 
     @staticmethod
@@ -4140,6 +4363,77 @@ class PortalProvisioner:
             flush=True,
         )
 
+    def sync_drift_conf_keys(self) -> None:
+        """Keep the staged autoroot config's drift-pass keys in
+        step with this run's requests (C3-A), the same discipline
+        as sync_ota_nodemon_autoroot_conf: staging derives
+        DNS_MODE / DNS_SPECIFIER / ALOHAUSERS_DISABLED from the
+        run, but a later run that changes the DNS request or the
+        recorded posture without re-staging autoroot would
+        otherwise leave the helper enforcing the old recorded
+        state on every boot. Runs that mention neither item leave
+        the config untouched, as does a device with nothing
+        staged."""
+        dns_requested = bool(
+            self.dhcp_dns or self.privacy_dns or self.restore_privacy_dns
+        )
+        posture_requested = bool(
+            self.remove_meta_accounts
+            and self.target is not None
+            and self.target.device == "aloha"
+        )
+        if not (dns_requested or posture_requested):
+            return
+        if not self.autoroot_staged():
+            return
+        existing = self.adb_run(
+            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
+        ).stdout
+        if not existing.strip():
+            return
+        lines = existing.splitlines()
+        if dns_requested:
+            resolved = self._recorded_dns_expectation(
+                {"actions": self.requested_actions()}
+            )
+            if resolved is not None:
+                lines = [
+                    line
+                    for line in lines
+                    if not line.startswith("DNS_MODE=")
+                    and not line.startswith("DNS_SPECIFIER=")
+                ]
+                lines.append(f"DNS_MODE={resolved[0]}")
+                lines.append(f"DNS_SPECIFIER={resolved[1]}")
+                print(
+                    "DRIFT_CONF_SYNC item=private_dns "
+                    f"mode={resolved[0]} specifier={resolved[1]}",
+                    flush=True,
+                )
+        if posture_requested:
+            desired = self._desired_state()
+            lines = [
+                line
+                for line in lines
+                if not line.startswith("ALOHAUSERS_DISABLED=")
+            ]
+            if desired.get("alohausers_package") == "disabled":
+                lines.append("ALOHAUSERS_DISABLED=1")
+            print(
+                "DRIFT_CONF_SYNC item=alohausers value="
+                f"{'1' if desired.get('alohausers_package') == 'disabled' else '0'}",
+                flush=True,
+            )
+        updated = "".join(f"{line}\n" for line in lines)
+        if updated == existing:
+            return
+        self.push_text_atomic(updated, AUTOROOT_CONF_REMOTE)
+        self.adb_run(
+            ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
+            timeout=5,
+            check=True,
+        )
+
     def debloat_preflight(self) -> bool:
         return self.settings_feature.debloat_preflight()
 
@@ -5556,6 +5850,12 @@ class PortalProvisioner:
                     clean_boot_id = self.connect_after_reboot(boot_id)
                     continue
                 self.verify_custom_payload()
+                # Terminal step for a run whose manifest records
+                # the alohausers-disabled posture (C3-A): restore
+                # the recorded end state through the daemon now,
+                # after the final verification and with no reboot
+                # after it, so the package write settles.
+                self._apply_recorded_posture()
                 self.apply_post_payload_root_steps()
                 self.write_state("complete")
                 print(
@@ -5740,7 +6040,9 @@ class PortalProvisioner:
             )
         print("OTA_RESTORE_OK packages=enabled override=restored")
 
-    def verify_ota_block(self, wait_seconds: int = 30) -> None:
+    def verify_ota_block(
+        self, wait_seconds: int = 30, via_channel: bool = False
+    ) -> None:
         disabled = self.adb_run(
             ["shell", "pm", "list", "packages", "-d", "-u"],
             timeout=10,
@@ -5760,6 +6062,31 @@ class PortalProvisioner:
             raise ProvisionError(f"OTA packages became enabled: {', '.join(missing)}")
 
         aloha = bool(self.target and self.target.device == "aloha")
+        if aloha and via_channel and self._recorded_posture_ota_trusted(
+            self._start_state
+        ):
+            # Channel-path verification on a posture device (C3-A):
+            # the config dump reads unconfigured BY DESIGN in the
+            # posture (otad's settings and the override sit inert
+            # behind the disabled alohausers package), so the dump
+            # loop below can never pass and must not be re-derived
+            # here. Verify the posture criteria directly instead -
+            # the same four checks the C3-B posture judgment uses.
+            # A device that left the posture fails these and falls
+            # back to the full dump verification.
+            posture_ok = self._judge_ota_posture()
+            if posture_ok:
+                print(
+                    "OTA_POSTURE_OK packages=disabled "
+                    "alohausers=disabled nodemon=true override=present",
+                    flush=True,
+                )
+                return
+            print(
+                "OTA_POSTURE_CHECK_FAILED; falling back to the "
+                "config-dump verification",
+                flush=True,
+            )
         if aloha:
             # A false gate in the service dump alone does not establish
             # that the block is in effect on Aloha: the native OTA
@@ -6040,7 +6367,7 @@ class PortalProvisioner:
             self.verify_audio_restored()
         if self.disable_updates:
             self.disable_ota_packages()
-            self.verify_ota_block()
+            self.verify_ota_block(via_channel=via_channel)
         if self.enable_updates:
             self.verify_ota_restored()
         if self.debloat:
@@ -6394,6 +6721,10 @@ class PortalProvisioner:
                 self.create_backup_bundle(self.backup_path)
             return
         self.verify_target()
+        # Observe the alohausers package state before any phase of
+        # this run can change it: the desired-state recording rule
+        # (C3-A) keys off the state the run STARTED from.
+        self._observe_start_package_state()
         self.adb_framework_boot_configured = (
             self.adb_framework_boot_preflight()
         )
@@ -6628,6 +6959,7 @@ class PortalProvisioner:
             self.ota_preflight() if self.disable_updates else False
         )
         self.sync_ota_nodemon_autoroot_conf()
+        self.sync_drift_conf_keys()
         with self.bootstrap_guard("disable_updates"):
             if (
                 self.disable_updates

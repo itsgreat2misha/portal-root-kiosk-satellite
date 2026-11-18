@@ -60,6 +60,8 @@ public final class AutorootService extends Service {
     private static final String SERVICE_LOG = DIR + "/service.log";
     private static final String DISABLE_FLAG = "/data/local/tmp/portal-autoroot.disable";
     private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
+    private static final String ALOHAUSERS_PACKAGE =
+            "com.facebook.alohaservices.alohausers";
     private static final int DAEMON_PORT = 37373;
     // Bound on the post-starter wait of one Shizuku handoff try.
     // The poll loop's individual shell calls can each stall for
@@ -189,6 +191,10 @@ public final class AutorootService extends Service {
 
         if (shizukuServingRoot()) {
             logFile("shizuku already root boot=" + bootId);
+            // Root is already up, so no race and no win window:
+            // the loopback shell is the only channel the drift
+            // pass has here (package repair waits for a win).
+            enforceRecordedState(false, conf);
             publishStatus("DONE", lastAttempt, lastMax, "root active (shizuku)");
             Map<String, String> state = readKeyValues(STATE);
             state.put("done_boot", bootId);
@@ -207,7 +213,11 @@ public final class AutorootService extends Service {
             // serving as root the daemon has no further job.
             logFile("daemon already up boot=" + bootId);
             publishStatus("DONE", lastAttempt, lastMax, "root active");
-            if (finishShizukuHandoff()) {
+            boolean handedOff = finishShizukuHandoff();
+            // The daemon window closes below; run the drift pass
+            // first so its package leg can use it.
+            enforceRecordedState(true, conf);
+            if (handedOff) {
                 stopDaemon();
             }
             Map<String, String> state = readKeyValues(STATE);
@@ -394,7 +404,11 @@ public final class AutorootService extends Service {
             Log.i(TAG, "daemon up after attempt " + attempts);
             logFile("daemon up attempt=" + attempts);
             publishStatus("DONE", attempts, maxAttempts, "root active");
-            if (finishShizukuHandoff()) {
+            boolean handedOff = finishShizukuHandoff();
+            // The daemon window closes below; run the drift pass
+            // first so its package leg can use it.
+            enforceRecordedState(true, conf);
+            if (handedOff) {
                 stopDaemon();
             }
             state.put("done_boot", bootId);
@@ -1260,6 +1274,163 @@ public final class AutorootService extends Service {
             return uidMatch.find() ? Integer.parseInt(uidMatch.group(1)) : -1;
         } catch (Exception error) {
             return -1;
+        }
+    }
+
+    // ---- recorded-state drift pass (C3-A) ---------------------------
+
+    /**
+     * Enforces the provisioner's recorded end state on this boot:
+     * Private DNS, the alohausers package posture, and a read-only
+     * otad.nodemon check, per DriftPolicy. Invoked at every
+     * root-established exit, after root is up and (on the win
+     * exits) before the daemon window closes.
+     *
+     * Fail-open by construction: every item is attempted inside
+     * its own try/catch, a failure is logged and never propagates,
+     * and the pass writes nothing but log lines - in particular it
+     * never touches the failure-budget state file, which is owned
+     * by the race accounting around it. It also never runs during
+     * a host provisioning run: the disable-guard flag check at the
+     * top of runAutoroot returns before any of the exits that call
+     * this, exactly as the race itself is suppressed there.
+     */
+    private void enforceRecordedState(boolean daemonAvailable,
+            Map<String, String> conf) {
+        try {
+            enforceRecordedDns(conf);
+        } catch (Exception e) {
+            logFile("DRIFT_REPAIR_FAILED item=private_dns error="
+                    + e.getClass().getSimpleName());
+        }
+        try {
+            enforceAlohausersPosture(conf, daemonAvailable);
+        } catch (Exception e) {
+            logFile("DRIFT_REPAIR_FAILED item=alohausers error="
+                    + e.getClass().getSimpleName());
+        }
+        try {
+            checkNodemon(conf);
+        } catch (Exception e) {
+            logFile("DRIFT_CHECK_FAILED item=otad_nodemon error="
+                    + e.getClass().getSimpleName());
+        }
+    }
+
+    private void enforceRecordedDns(Map<String, String> conf)
+            throws Exception {
+        String expectedMode = conf.get("DNS_MODE");
+        if (expectedMode == null) {
+            return;
+        }
+        String expectedSpecifier = conf.get("DNS_SPECIFIER");
+        String liveMode = shellSetting("private_dns_mode");
+        String liveSpecifier = shellSetting("private_dns_specifier");
+        int action = DriftPolicy.dnsAction(
+                expectedMode, expectedSpecifier, liveMode, liveSpecifier);
+        if (action == DriftPolicy.NONE) {
+            logFile("DRIFT_OK item=private_dns");
+            return;
+        }
+        if (action == DriftPolicy.REPORT_ONLY) {
+            logFile("DRIFT_UNREPAIRED item=private_dns"
+                    + " reason=live-state-unreadable");
+            return;
+        }
+        writePrivateDnsField("private_dns_mode", expectedMode);
+        writePrivateDnsField("private_dns_specifier", expectedSpecifier);
+        String afterMode = shellSetting("private_dns_mode");
+        String afterSpecifier = shellSetting("private_dns_specifier");
+        if (DriftPolicy.dnsAction(expectedMode, expectedSpecifier,
+                afterMode, afterSpecifier) == DriftPolicy.NONE) {
+            logFile("DRIFT_REPAIRED item=private_dns mode="
+                    + DriftPolicy.normalize(expectedMode)
+                    + " specifier="
+                    + DriftPolicy.normalize(expectedSpecifier));
+        } else {
+            logFile("DRIFT_REPAIR_FAILED item=private_dns mode="
+                    + afterMode + " specifier=" + afterSpecifier);
+        }
+    }
+
+    /** One settings read through the loopback shell; null on failure. */
+    private String shellSetting(String key) {
+        try {
+            String value = shell("settings get global " + key);
+            return value == null ? null : value.trim();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Writes one Private DNS field with the host's put-or-delete
+     * rule: the absent spellings delete the key, anything else is
+     * stored verbatim.
+     */
+    private void writePrivateDnsField(String key, String value)
+            throws Exception {
+        String normalized = DriftPolicy.normalize(value);
+        if ("null".equals(normalized)) {
+            shell("settings delete global " + key);
+        } else {
+            shell("settings put global " + key + " " + normalized);
+        }
+    }
+
+    private void enforceAlohausersPosture(Map<String, String> conf,
+            boolean daemonAvailable) throws Exception {
+        boolean desireDisabled = "1".equals(conf.get("ALOHAUSERS_DISABLED"));
+        if (!desireDisabled) {
+            return;
+        }
+        boolean liveDisabled = packageDisabled(ALOHAUSERS_PACKAGE);
+        int action = DriftPolicy.alohausersAction(
+                true, liveDisabled, daemonAvailable);
+        if (action == DriftPolicy.NONE) {
+            logFile("DRIFT_OK item=alohausers");
+            return;
+        }
+        if (action == DriftPolicy.REPORT_ONLY) {
+            logFile("DRIFT_UNREPAIRED item=alohausers"
+                    + " reason=no-root-channel");
+            return;
+        }
+        String result = daemonExec(
+                "pm disable --user 0 " + ALOHAUSERS_PACKAGE);
+        if (packageDisabled(ALOHAUSERS_PACKAGE)) {
+            logFile("DRIFT_REPAIRED item=alohausers state=disabled");
+        } else {
+            logFile("DRIFT_REPAIR_FAILED item=alohausers result="
+                    + (result == null ? "" : result.trim()));
+        }
+    }
+
+    private boolean packageDisabled(String pkg) throws Exception {
+        String listing = shell("pm list packages -d");
+        return listing != null
+                && listing.contains("package:" + pkg);
+    }
+
+    /**
+     * otad.nodemon is check-only on device: no post-win channel
+     * can set the property, so a staged-but-unset boot is
+     * reported, never repaired here.
+     */
+    private void checkNodemon(Map<String, String> conf) throws Exception {
+        boolean staged = "1".equals(conf.get("OTA_NODEMON"));
+        if (!staged) {
+            return;
+        }
+        String property = shell("getprop otad.nodemon");
+        boolean propertyTrue = property != null
+                && "true".equals(property.trim());
+        if (DriftPolicy.nodemonAction(true, propertyTrue)
+                == DriftPolicy.NONE) {
+            logFile("DRIFT_OK item=otad_nodemon");
+        } else {
+            logFile("DRIFT_UNREPAIRED item=otad_nodemon"
+                    + " reason=no-post-win-channel");
         }
     }
 

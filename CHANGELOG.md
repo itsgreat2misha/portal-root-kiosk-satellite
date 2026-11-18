@@ -14,6 +14,28 @@ the fork diverged from upstream:
 
 ### Added
 
+- Per-boot recorded-state drift pass (Phase C3-A): after autoroot
+  recovers root, the helper (1.12, versionCode 13) compares the
+  live device against the end state recorded in `autoroot.conf`
+  and repairs what drifted - Private DNS through its loopback ADB
+  shell (uid 2000, the same SettingsProvider parity the host
+  uses), the alohausers package posture through the root daemon
+  before its window closes, and `otad.nodemon` as a read-only
+  check (no post-win channel can set it). The pass is fail-open,
+  logs `DRIFT_OK` / `DRIFT_REPAIRED` / `DRIFT_UNREPAIRED` per
+  item, never touches the failure-budget state, and never runs
+  during a host provisioning run. Desired state rides new
+  `autoroot.conf` keys (`DNS_MODE`, `DNS_SPECIFIER`,
+  `ALOHAUSERS_DISABLED`) with the `OTA_NODEMON` preserve/sync
+  discipline, and the run manifest records it additively as
+  `desired_state` (schema unchanged, no new flag). A run that
+  removes Meta accounts and starts with the package disabled
+  records that posture as the desired end state: the final
+  accounts verification accepts it, an end-of-run apply through
+  the payload daemon restores it after the last verification
+  with no reboot after it, and later boots keep it. Live
+  validation of the alohausers leg is deferred until the aloha
+  test unit returns to the network.
 - On-device autoroot: after a one-time provisioning, the device
   re-roots itself after every reboot with no host attached (Shizuku
   started as root by the autoroot helper).
@@ -105,6 +127,20 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- Re-runs on a device in the recorded alohausers-disabled
+  posture refused themselves: the no-op and channel gates
+  re-derived the OTA block from the live MobileConfig dump,
+  which reads unconfigured by design while the package is
+  disabled, so a posture device could never take a fast path
+  again (found in C3-B validation). The gates now trust the
+  manifest's posture-judged completion, and the channel-path OTA
+  verification checks the four posture criteria directly,
+  falling back to the dump verification when the posture no
+  longer holds. The Private DNS no-op gate also confirms a lone
+  mismatching sample with one re-read before calling it drift -
+  a single disagreeing read on a device verified minutes earlier
+  refused a healthy unit - and logs the live values behind the
+  verdict either way.
 - A bootstrap phase's failure was judged where it happened in the
   run's ordering instead of against the device's end state: in the
   combined flow the OTA bootstrap's verification failure aborted
