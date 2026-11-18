@@ -569,6 +569,65 @@ class SettingsFeature:
             )
             print(f"PRIVACY_DNS_OK action={action} mode={mode} hostname={hostname}")
 
+    def read_private_dns_state(self) -> tuple[str, str]:
+            mode = self._adb_run(
+                ["shell", "settings", "get", "global", "private_dns_mode"],
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+            hostname = self._adb_run(
+                [
+                    "shell",
+                    "settings",
+                    "get",
+                    "global",
+                    "private_dns_specifier",
+                ],
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+            return mode, hostname
+
+    def write_private_dns_state(self, mode: str, hostname: str) -> None:
+            # The recorded-state repair write: same backup-first
+            # discipline as the applies, then each field is put or
+            # deleted to match the target value exactly ("null"/""
+            # means the setting is absent).
+            self.backup_private_dns()
+            for setting, value in (
+                ("private_dns_mode", mode),
+                ("private_dns_specifier", hostname),
+            ):
+                if value in ("", "null"):
+                    self._adb_run(
+                        ["shell", "settings", "delete", "global", setting],
+                        timeout=10,
+                        check=True,
+                    )
+                else:
+                    self._adb_run(
+                        ["shell", "settings", "put", "global", setting, value],
+                        timeout=10,
+                        check=True,
+                    )
+
+    def read_private_dns_backup(self) -> dict[str, object] | None:
+            # Non-raising backup read for the recorded-state check:
+            # an absent or unreadable backup means the recorded end
+            # state cannot be determined, never that it is stock.
+            result = self._adb_run(
+                ["shell", "cat", PRIVACY_BACKUP_REMOTE], timeout=5
+            )
+            if result.returncode != 0:
+                return None
+            try:
+                backup = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(backup, dict) or backup.get("schema") != 1:
+                return None
+            return backup
+
     def package_sets(self) -> tuple[set[str], set[str]]:
             installed_result = self._adb_run(
                 ["shell", "pm", "list", "packages"], timeout=15, check=True

@@ -2885,6 +2885,144 @@ def ota_config_dump(
     )
 
 
+class PhaseC2RestoreFpsGatingTest(unittest.TestCase):
+    """Phase C2 item 2: the restore keys and the presence FPS keys
+    follow the same phase-ownership predicates as their apply
+    counterparts (the PR #38 pattern). A key carried into a phase
+    whose credential cannot perform it fails inside the app-private
+    directory and discards won races (steps 17/19/21); a key gated
+    out of the owning phase would silently never apply."""
+
+    @staticmethod
+    def aloha_target():
+        return next(t for t in TARGETS if t.device == "aloha")
+
+    @staticmethod
+    def omni_target():
+        return next(t for t in TARGETS if t.device == "omni")
+
+    @staticmethod
+    def fake_adb(
+        arguments: list[str],
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout, check
+        return subprocess.CompletedProcess(arguments, 0, "1000\n")
+
+    def environment(self, temporary: str, target, **kwargs):
+        provisioner = PortalProvisioner(
+            "192.0.2.1:5555", 1, pathlib.Path(temporary), **kwargs
+        )
+        provisioner.target = target
+        # Normally prepared by the uid1000 staging step before any
+        # environment is built on embedded-helper targets.
+        provisioner.uid1000_runtime_apk_remote = "/data/local/tmp/rt.apk"
+        provisioner.uid1000_runtime_library_remote = "/data/local/tmp/rt.so"
+        with mock.patch.object(
+            provisioner, "adb_run", side_effect=self.fake_adb
+        ):
+            return provisioner.build_exploit_environment(0x1000, 0x2000, 1)
+
+    def test_dedicated_enable_updates_env_has_ota_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary, self.aloha_target(), enable_updates=True
+            )
+            self.assertEqual(environment["GHOSTLOCK_RESTORE_OTA_BLOCK"], "1")
+
+    def test_combined_enable_updates_env_omits_ota_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.aloha_target(),
+                enable_updates=True,
+                audio=True,
+            )
+            self.assertNotIn("GHOSTLOCK_RESTORE_OTA_BLOCK", environment)
+
+    def test_omni_combined_env_keeps_ota_restore(self) -> None:
+        # No dedicated OTA credential: the main flow owns the
+        # restore and must keep the key even in a combined run.
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.omni_target(),
+                enable_updates=True,
+                audio=True,
+            )
+            self.assertEqual(environment["GHOSTLOCK_RESTORE_OTA_BLOCK"], "1")
+
+    def test_dedicated_profile_restore_env_has_restore_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.aloha_target(),
+                restore_presence_profile=True,
+            )
+            self.assertEqual(
+                environment["GHOSTLOCK_RESTORE_PRESENCE_PROFILE"], "1"
+            )
+            self.assertEqual(environment["GHOSTLOCK_RESTORE_PRESENCE_FPS"], "1")
+            self.assertEqual(environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"], "1")
+
+    def test_combined_profile_restore_env_omits_restore_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.aloha_target(),
+                restore_presence_profile=True,
+                audio=True,
+            )
+            self.assertNotIn("GHOSTLOCK_RESTORE_PRESENCE_PROFILE", environment)
+            self.assertNotIn("GHOSTLOCK_RESTORE_PRESENCE_FPS", environment)
+            self.assertNotIn("GHOSTLOCK_PRESENCE_REMOVE_KEY", environment)
+
+    def test_dedicated_fps_env_has_cap_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.aloha_target(),
+                optimize_presence=True,
+                presence_fps_cap=5,
+            )
+            self.assertEqual(environment["GHOSTLOCK_PRESENCE_FPS_CAP"], "5")
+            self.assertEqual(environment["GHOSTLOCK_UID1000_PRESENCE_FPS"], "5")
+            self.assertEqual(environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"], "1")
+
+    def test_combined_fps_env_omits_cap_keeps_uid1000_fps(self) -> None:
+        # The cap keys belong to the dedicated FPS phase on
+        # installer-credential targets; GHOSTLOCK_UID1000_PRESENCE_
+        # FPS stays in the main flow by design (uid1000 runtime
+        # feature configuration + retained-FPS carriage).
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.aloha_target(),
+                audio=True,
+                optimize_presence=True,
+                presence_fps_cap=5,
+            )
+            self.assertNotIn("GHOSTLOCK_PRESENCE_FPS_CAP", environment)
+            self.assertNotIn("GHOSTLOCK_PRESENCE_REMOVE_KEY", environment)
+            self.assertEqual(environment["GHOSTLOCK_UID1000_PRESENCE_FPS"], "5")
+
+    def test_omni_combined_fps_env_keeps_cap_keys(self) -> None:
+        # No uid1000 installer credential: no dedicated FPS phase
+        # exists, so the main flow keeps the cap keys.
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self.environment(
+                temporary,
+                self.omni_target(),
+                audio=True,
+                presence_fps_cap=5,
+            )
+            self.assertEqual(environment["GHOSTLOCK_PRESENCE_FPS_CAP"], "5")
+            self.assertEqual(
+                environment["GHOSTLOCK_PRESENCE_PREF_ACTION"], "set:5"
+            )
+
+
 class OtaPollingOverrideTest(unittest.TestCase):
     """The OTA override also stops otad's update polling (port of
     upstream 5c2c531d): preflight and verification require the gate

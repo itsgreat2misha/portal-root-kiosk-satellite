@@ -64,6 +64,17 @@ the fork diverged from upstream:
   certificate fingerprint and fails on a mismatch or a missing
   keystore instead of letting a replacement key be generated, since
   devices refuse signature-mismatched APK updates.
+- Private DNS end-state invariant: a completed run's manifest
+  records the Private DNS end state it established, and every
+  later run enforces that record. Final verification compares the
+  live `private_dns_mode`/`private_dns_specifier` to the recorded
+  state even when the run requested no DNS change; on drift the
+  recorded state is re-written, the repair is logged
+  (`PRIVACY_DNS_DRIFT` / `PRIVACY_DNS_REPAIRED`), and the result
+  is re-read before the run completes. The no-op fast path reads
+  live DNS and may not pass over drift: drift routes to the
+  root-channel apply path, whose final verification performs the
+  repair.
 
 ### Changed
 
@@ -75,6 +86,22 @@ the fork diverged from upstream:
   wedging unit while making a false stand-down far less likely.
   The helper screen, the stand-down notification and the docs state
   the new number. Autoroot helper 1.9 (versionCode 10).
+- The race path and the root-channel path now run one shared
+  host shell-level apply sequence instead of two hand-mirrored
+  copies, so their end states cannot drift apart. As part of the
+  merge, the stages path's Private DNS write moves from before
+  the races to final verification, where a race crash-reboot can
+  no longer discard its SettingsProvider flush.
+- Exploit environment gating: `GHOSTLOCK_RESTORE_OTA_BLOCK`,
+  `GHOSTLOCK_RESTORE_PRESENCE_PROFILE`,
+  `GHOSTLOCK_RESTORE_PRESENCE_FPS` and the presence FPS cap keys
+  now follow the same phase-ownership predicates as their apply
+  counterparts, so they are carried only by the phase whose
+  credential can perform them (or by the main flow on targets
+  with no dedicated phase). `GHOSTLOCK_UID1000_PRESENCE_FPS`
+  stays in the main flow by design: its consumers are the
+  uid1000 runtime feature configuration and the retained-FPS
+  carriage, not the app-private write the cap keys drive.
 
 ### Fixed
 
