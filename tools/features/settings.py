@@ -245,6 +245,7 @@ class SettingsFeature:
         ],
         read_remote_wipe_backup: Callable[..., "dict[str, str] | None"],
         ensure_remote_wipe_backup: Callable[[], "dict[str, str]"],
+        alohausers_desired_disabled: Callable[[], bool] | None = None,
     ):
         self._adb_run = adb_run
         self._log_dir = log_dir
@@ -261,6 +262,9 @@ class SettingsFeature:
         self._read_component_backup = read_component_backup
         self._read_remote_wipe_backup = read_remote_wipe_backup
         self._ensure_remote_wipe_backup = ensure_remote_wipe_backup
+        self._alohausers_desired_disabled = (
+            alohausers_desired_disabled or (lambda: False)
+        )
         self.meta_accounts_absent = False
         self.meta_accounts_package_disabled = False
 
@@ -1147,7 +1151,25 @@ class SettingsFeature:
             package_state = self._adb_run(
                 ["shell", "pm", "list", "packages", "-d"], timeout=15, check=True
             ).stdout
-            if "package:com.facebook.alohaservices.alohausers" in package_state:
+            package_disabled = (
+                "package:com.facebook.alohaservices.alohausers" in package_state
+            )
+            if package_disabled and self._alohausers_desired_disabled():
+                # The recorded end state IS the disabled posture
+                # (C3-A): the run started with the package disabled
+                # and recorded that as the desired state, so the
+                # disabled package is the pass condition here, not
+                # a failure. The accounts and authenticator checks
+                # above are unaffected - the posture never licenses
+                # leftover accounts - and the retained-platform
+                # check still runs.
+                self.verify_retained_platform()
+                print(
+                    "META_ACCOUNTS_REMOVED_OK accounts=0 authenticators=disabled "
+                    "alohausers=disabled-posture"
+                )
+                return
+            if package_disabled:
                 raise ProvisionError("alohausers package was disabled instead of its authenticators")
             self.verify_retained_platform()
             print(

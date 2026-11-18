@@ -71,6 +71,9 @@ class PayloadConfig:
     restore_presence_fps: bool
     restore_presence_profile: bool
     presence_fps_cap: int | None
+    privacy_dns: str | None = None
+    dhcp_dns: bool = False
+    restore_privacy_dns: bool = False
 
 
 class PayloadFeature:
@@ -97,6 +100,8 @@ class PayloadFeature:
         stop_root_daemon: Callable[..., None],
         authorized_shizuku_key: Callable[[], str | None],
         read_saved_shizuku_key_marker: Callable[[], str | None],
+        read_private_dns_backup: Callable[..., "dict[str, str] | None"],
+        desired_state: Callable[[], "dict[str, str]"],
         autoroot_helper_local: Callable[[], pathlib.Path],
         autoroot_runner_local: Callable[[], pathlib.Path],
         adb_framework_boot_installed_remote: str,
@@ -119,6 +124,8 @@ class PayloadFeature:
         self._stop_root_daemon = stop_root_daemon
         self._authorized_shizuku_key = authorized_shizuku_key
         self._read_saved_shizuku_key_marker = read_saved_shizuku_key_marker
+        self._read_private_dns_backup = read_private_dns_backup
+        self._desired_state = desired_state
         self._autoroot_helper_local = autoroot_helper_local
         self._autoroot_runner_local = autoroot_runner_local
         self._adb_framework_boot_installed_remote = (
@@ -482,6 +489,72 @@ class PayloadFeature:
             line.strip() == "OTA_NODEMON=1" for line in existing.splitlines()
         )
 
+    def _existing_conf_lines(self) -> list[str]:
+        return self._adb_run(
+            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
+        ).stdout.splitlines()
+
+    def _dns_desired(self) -> tuple[str, str] | None:
+        """The Private DNS end state the staged autoroot config
+        records for the helper's per-boot drift pass (C3-A), as
+        (mode, specifier) with "null" for an absent specifier;
+        None when nothing should be recorded.
+
+        Same preserve/sync discipline as _ota_nodemon_desired: a
+        run that requests a DNS end state resolves it (dhcp ->
+        off, an explicit server -> hostname, a restore -> the
+        on-device backup's recorded values); a run that requests
+        none preserves the keys a previous staging left, so
+        re-staging autoroot for an unrelated feature cannot drop
+        the recorded state the pass enforces. A restore whose
+        backup is unreadable resolves to None: the pass then has
+        nothing new to enforce and the previous keys survive."""
+        config = self._config
+        if config.dhcp_dns:
+            return ("off", "null")
+        if config.privacy_dns:
+            return ("hostname", config.privacy_dns.strip().lower())
+        if config.restore_privacy_dns:
+            backup = self._read_private_dns_backup(required=False)
+            if backup is None:
+                return None
+            mode = backup.get("mode")
+            hostname = backup.get("hostname")
+            if not isinstance(mode, str) or not isinstance(hostname, str):
+                return None
+            return (
+                mode if mode not in ("", "null") else "null",
+                hostname if hostname not in ("", "null") else "null",
+            )
+        mode = None
+        specifier = None
+        for line in self._existing_conf_lines():
+            if line.startswith("DNS_MODE="):
+                mode = line.split("=", 1)[1].strip()
+            elif line.startswith("DNS_SPECIFIER="):
+                specifier = line.split("=", 1)[1].strip()
+        if mode is None:
+            return None
+        return (mode, specifier if specifier is not None else "null")
+
+    def _alohausers_disabled_desired(self) -> bool:
+        """Whether the staged autoroot config should carry
+        ALOHAUSERS_DISABLED=1 for the helper's per-boot drift pass
+        (C3-A). Aloha only. The provisioner's recorded desired
+        state decides; when it records nothing, a value a previous
+        staging left is preserved, so re-staging for an unrelated
+        feature cannot drop the posture record."""
+        target = self._target()
+        if target is None or target.device != "aloha":
+            return False
+        desired = self._desired_state()
+        if "alohausers_package" in desired:
+            return desired["alohausers_package"] == "disabled"
+        return any(
+            line.strip() == "ALOHAUSERS_DISABLED=1"
+            for line in self._existing_conf_lines()
+        )
+
     def _verify_keypair_to_stage_is_authorized(self) -> str | None:
         """Return the public key staging is about to copy into the
         autoroot helper, refusing a pair that was never authorized.
@@ -726,6 +799,11 @@ class PayloadFeature:
             )
             if self._ota_nodemon_desired():
                 conf += "OTA_NODEMON=1\n"
+            dns = self._dns_desired()
+            if dns is not None:
+                conf += f"DNS_MODE={dns[0]}\nDNS_SPECIFIER={dns[1]}\n"
+            if self._alohausers_disabled_desired():
+                conf += "ALOHAUSERS_DISABLED=1\n"
             local_conf = pathlib.Path(temp) / "autoroot.conf"
             local_conf.write_text(conf, encoding="utf-8")
             self._adb_run(
