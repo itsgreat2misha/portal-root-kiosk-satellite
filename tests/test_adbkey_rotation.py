@@ -9,12 +9,18 @@ convergence rules that keep the staged pair the authorized one:
 - install seeds the Shizuku helper from the autoroot helper's
   already-authorized pair before it may generate a fresh one, and
   generates only when neither helper holds a pair;
-- a channel apply that ended up with a freshly generated pair falls
-  back to the race run instead of staging it (the channel cannot
-  authorize a key);
+- a channel apply that ended up with a freshly generated pair, or
+  one that is not the recorded authorized key, falls back to the
+  race run instead of staging it (the channel cannot authorize a
+  key);
 - autoroot staging compares the pair it is about to copy against
-  the saved marker (the last authorized public key) and fails
-  loudly on a mismatch;
+  the key this run's install loop authorized, falling back to the
+  on-device saved marker (read through the root daemon, then the
+  shell) for runs that authorized nothing, and fails loudly on a
+  mismatch;
+- when a win proves the reused pair was already authorized, the
+  install phase refreshes the saved marker from that pair so the
+  helper, the staged file, and the marker converge;
 - the staged pair's SHA-256 lands in the run manifest.
 """
 
@@ -251,7 +257,25 @@ class ChannelKeygenGuardTest(unittest.TestCase):
 
 
 class StagingKeypairCheckTest(unittest.TestCase):
-    def run_staging(self, provisioner, *, helper_public: str, marker: str):
+    def run_staging(
+        self,
+        provisioner,
+        *,
+        helper_public: str,
+        marker: str,
+        record: str | None = None,
+        daemon_marker: str | None = None,
+    ):
+        provisioner.authorized_shizuku_key = record
+
+        def daemon_exec(command, timeout=40):
+            del timeout
+            # Only the saved-marker read is served; anything else
+            # behaves like a device with no payload daemon up.
+            if daemon_marker is not None and command.startswith("cat "):
+                return (0, daemon_marker)
+            raise OSError("no daemon in test")
+
         def adb_run(args, timeout=None, check=False):
             del timeout, check
             if args[:1] == ["exec-out"]:
@@ -271,6 +295,11 @@ class StagingKeypairCheckTest(unittest.TestCase):
         stdout = io.StringIO()
         with (
             mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+            mock.patch.object(
+                provisioner.payload_feature,
+                "daemon_exec",
+                side_effect=daemon_exec,
+            ),
             mock.patch.object(provisioner, "install_apk_preserving_verifier"),
             mock.patch.object(provisioner, "settle_package_state"),
             mock.patch.object(
@@ -340,6 +369,284 @@ class StagingKeypairCheckTest(unittest.TestCase):
                 provisioner, helper_public=PUBLIC_KEY, marker=""
             )
             self.assertIn("AUTOROOT_STAGED_OK", output)
+
+    def test_run_record_match_stages_despite_stale_marker(self) -> None:
+        # The Nov 18, 2026 Mini shape: this run's win authorized the
+        # helper's live pair, while the on-device marker still names
+        # a key from an aborted earlier rotation. The run record
+        # judges, so staging proceeds.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            output = self.run_staging(
+                provisioner,
+                helper_public=PUBLIC_KEY,
+                marker=OTHER_PUBLIC_KEY + "\n",
+                record=PUBLIC_KEY,
+            )
+            self.assertIn(
+                "AUTOROOT_KEY_AUTHORIZED source=run-record", output
+            )
+            self.assertIn("AUTOROOT_STAGED_OK", output)
+
+    def test_run_record_mismatch_fails_despite_matching_marker(
+        self,
+    ) -> None:
+        # The record is authoritative in both directions: a pair the
+        # marker blesses but this run did not authorize is refused.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            with self.assertRaisesRegex(
+                ProvisionError, "was never authorized"
+            ):
+                self.run_staging(
+                    provisioner,
+                    helper_public=PUBLIC_KEY,
+                    marker=PUBLIC_KEY + "\n",
+                    record=OTHER_PUBLIC_KEY,
+                )
+
+    def test_marker_fallback_reads_through_the_daemon(self) -> None:
+        # Omni's marker is root-owned 0600, so the shell cat returns
+        # nothing; the fallback judgment must come from the daemon
+        # read, in both directions.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            with self.assertRaisesRegex(
+                ProvisionError, "was never authorized"
+            ):
+                self.run_staging(
+                    provisioner,
+                    helper_public=PUBLIC_KEY,
+                    marker="",
+                    daemon_marker=OTHER_PUBLIC_KEY,
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            output = self.run_staging(
+                provisioner,
+                helper_public=PUBLIC_KEY,
+                marker="",
+                daemon_marker=PUBLIC_KEY,
+            )
+            self.assertIn(
+                "AUTOROOT_KEY_AUTHORIZED source=saved-marker", output
+            )
+            self.assertIn("AUTOROOT_STAGED_OK", output)
+
+
+class MarkerReadTest(unittest.TestCase):
+    def read_marker(self, temporary: str, *, daemon, shell: str):
+        provisioner = make_provisioner(temporary)
+
+        def daemon_exec(command, timeout=40):
+            del command, timeout
+            if isinstance(daemon, BaseException):
+                raise daemon
+            return (0, daemon)
+
+        def adb_run(args, timeout=None, check=False):
+            del timeout, check
+            return completed(args, shell)
+
+        with (
+            mock.patch.object(
+                provisioner.payload_feature,
+                "daemon_exec",
+                side_effect=daemon_exec,
+            ),
+            mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+        ):
+            return provisioner.read_saved_shizuku_key_marker()
+
+    def test_daemon_read_wins_over_empty_shell_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self.read_marker(temporary, daemon=PUBLIC_KEY, shell=""),
+                PUBLIC_KEY,
+            )
+
+    def test_shell_read_is_the_fallback_when_daemon_is_down(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self.read_marker(
+                    temporary,
+                    daemon=OSError("connection refused"),
+                    shell=OTHER_PUBLIC_KEY,
+                ),
+                OTHER_PUBLIC_KEY,
+            )
+
+    def test_unreadable_marker_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertIsNone(
+                self.read_marker(temporary, daemon="", shell="  \n")
+            )
+
+
+OMNI = next(
+    target
+    for target in TARGETS
+    if target.key == "portal-mini-omni-3051355900018050"
+)
+
+
+class MarkerRefreshTest(unittest.TestCase):
+    def run_refresh(
+        self,
+        temporary: str,
+        *,
+        source: str = "existing",
+        record: str | None = PUBLIC_KEY,
+        already: bool = True,
+        staged: str = PUBLIC_KEY,
+        target=OMNI,
+    ):
+        provisioner = make_provisioner(temporary, shizuku=True)
+        provisioner.target = target
+        calls: list = []
+
+        def adb_run(args, timeout=None, check=False):
+            del timeout, check
+            calls.append(list(args))
+            return completed(args)
+
+        host_copy = pathlib.Path(temporary) / "portal-shizuku-adbkey.pub"
+        host_copy.write_text(staged + "\n", encoding="utf-8")
+        provisioner.shizuku_feature.shizuku_public_key = host_copy
+        provisioner.shizuku_feature.shizuku_key_source = source
+        provisioner.authorized_shizuku_key = record
+        provisioner.authorized_shizuku_key_already = already
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(provisioner, "adb_run", side_effect=adb_run),
+            contextlib.redirect_stdout(stdout),
+        ):
+            provisioner.refresh_shizuku_key_marker()
+        pushes = [
+            call
+            for call in calls
+            if call[:1] == ["push"] and SHIZUKU_SAVED_KEY_REMOTE in call
+        ]
+        return pushes, stdout.getvalue()
+
+    def test_reuse_already_authorized_refreshes_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pushes, output = self.run_refresh(temporary)
+            self.assertEqual(len(pushes), 1)
+            self.assertIn("SHIZUKU_KEY_MARKER_REFRESHED", output)
+
+    def test_fresh_append_leaves_marker_to_the_native_save(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pushes, _ = self.run_refresh(temporary, already=False)
+            self.assertEqual(pushes, [])
+
+    def test_keygen_pair_never_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pushes, _ = self.run_refresh(temporary, source="keygen")
+            self.assertEqual(pushes, [])
+
+    def test_record_disagreeing_with_staged_copy_never_refreshes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pushes, _ = self.run_refresh(
+                temporary, record=OTHER_PUBLIC_KEY
+            )
+            self.assertEqual(pushes, [])
+
+    def test_buffered_target_never_refreshes(self) -> None:
+        # Buffered targets converge through finalize's host push.
+        with tempfile.TemporaryDirectory() as temporary:
+            pushes, _ = self.run_refresh(temporary, target=ALOHA)
+            self.assertEqual(pushes, [])
+
+
+class ChannelRecordedKeyGuardTest(unittest.TestCase):
+    def run_channel(self, temporary: str, *, marker: str):
+        provisioner = make_provisioner(
+            temporary, shizuku=True, autoroot=True
+        )
+        calls: list = []
+        patched = (
+            provision_portal_module.android_build_environment,
+            provision_portal_module.build,
+        )
+        provision_portal_module.android_build_environment = (
+            lambda target, **_kwargs: None
+        )
+        provision_portal_module.build = lambda **kwargs: calls.append(
+            "build"
+        )
+
+        host_copy = pathlib.Path(temporary) / "portal-shizuku-adbkey.pub"
+        host_copy.write_text(PUBLIC_KEY + "\n", encoding="utf-8")
+
+        def install() -> None:
+            calls.append("install_shizuku_payload")
+            provisioner.shizuku_public_key = host_copy
+            provisioner.shizuku_key_source = "existing"
+
+        def adb_run(args, timeout=None, check=False):
+            del timeout, check
+            if args == ["shell", "cat", SHIZUKU_SAVED_KEY_REMOTE]:
+                return completed(args, marker)
+            return completed(args)
+
+        provisioner.resolve_shizuku_apk = lambda: pathlib.Path("s.apk")
+        provisioner.install_shizuku_payload = install
+        provisioner.stage_autoroot_payload = lambda: calls.append(
+            "stage_autoroot_payload"
+        )
+        provisioner.prepare_exploit_sentinel = lambda: calls.append(
+            "prepare_exploit_sentinel"
+        )
+        provisioner.verify_requested_state = lambda **k: calls.append(
+            "verify_requested_state"
+        )
+        provisioner._apply_shell_level_state = (
+            lambda *a, **k: calls.append("apply_shell_level_state")
+        )
+        provisioner._shizuku_root_ok = lambda: True
+        states: list = []
+        provisioner.write_state = lambda status, **k: states.append(status)
+        stdout = io.StringIO()
+        try:
+            with (
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=adb_run
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                handled = provisioner._apply_via_channel("dns-drift")
+        finally:
+            (
+                provision_portal_module.android_build_environment,
+                provision_portal_module.build,
+            ) = patched
+        return handled, calls, stdout.getvalue()
+
+    def test_unrecorded_pair_falls_back_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            handled, calls, output = self.run_channel(
+                temporary, marker=OTHER_PUBLIC_KEY
+            )
+            self.assertFalse(handled)
+            self.assertIn("not the recorded authorized key", output)
+            self.assertIn("PROVISION_CHANNEL_FALLBACK", output)
+            self.assertNotIn("stage_autoroot_payload", calls)
+
+    def test_recorded_pair_stages_on_the_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            handled, calls, output = self.run_channel(
+                temporary, marker=PUBLIC_KEY
+            )
+            self.assertTrue(handled)
+            self.assertIn("PROVISION_CHANNEL_OK", output)
+            self.assertIn("stage_autoroot_payload", calls)
 
 
 class ManifestKeyHashTest(unittest.TestCase):

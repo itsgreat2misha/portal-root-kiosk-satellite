@@ -145,6 +145,24 @@ the fork diverged from upstream:
   and the staged pair's SHA-256 is recorded in the run manifest
   (`autoroot_key_sha256`) and shown by `--status`, so a future
   authorization failure names the key generation that was live.
+- The saved marker that comparison judges against could itself
+  lag the authorized key: on non-buffered targets the marker is
+  written by the native authorize from the staged scratch file,
+  so in the reuse path a run that rotated the helper's pair and
+  aborted could leave the marker naming a key that matches no
+  surviving record, and the comparison then aborted a later run
+  whose pair was in fact authorized. The install loop now records
+  the key its win actually authorized, and staging judges the
+  pair it copies against that record; the marker remains only as
+  the fallback for runs that authorized nothing (channel and
+  payload-only runs), is read through the root daemon first (on
+  those targets it is root-owned, so a shell read silently
+  returned nothing unless adbd was in root mode), and the channel
+  guard now also refuses a pair that is not the recorded
+  authorized key, not just a freshly generated one. When a win
+  proves the reused pair was already in adb_keys, the install
+  phase rewrites the marker from that pair, so the helper, the
+  staged file, and the marker end the phase on one generation.
 - A winning autoroot attempt whose process tree wedged (spinning
   or ptrace-stopped) held the Shizuku handoff for ~13 minutes
   until the processes happened to exit: the service now sweeps
