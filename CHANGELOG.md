@@ -87,6 +87,20 @@ the fork diverged from upstream:
   wall-clock deadline with a re-sweep and one retry before the
   handoff is left for the next service start. Autoroot helper
   1.9 (versionCode 10) in this release.
+- The post-attempt sweep above could not shorten a winning
+  attempt's stall: it runs only after the attempt's foreground
+  shell call returns, and that call returns only at its own
+  600 s socket timeout, which is itself what tears the wedged
+  session down (live validation showed win-to-handoff still
+  ~9 minutes, resolved by the timeout, with the sweep never
+  finding a live target). The attempt watchdog now also sweeps
+  from its own poll loop, the one thread alive during the
+  stall: once a win verdict is 120 s old and the call is still
+  outstanding, and once more 120 s later, it sweeps the
+  attempt's leftover tree and logs the outcome whether or not
+  anything was killed. A win verdict is still never cut, the
+  600 s timeout remains the backstop, and verdict accounting
+  is unchanged. Autoroot helper 1.10 (versionCode 11).
 - The autoroot guard's restore could print
   `AUTOROOT_GUARD_RESTORED` over a disable flag that was still
   on disk: issued into an adbd disruption (Run 34), its rm never

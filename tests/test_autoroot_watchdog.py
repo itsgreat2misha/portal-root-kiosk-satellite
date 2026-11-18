@@ -18,6 +18,15 @@ A fail-verdict attempt may be cut once the grace period since
 the verdict has elapsed AND the root daemon is known-absent; a
 fail verdict with the daemon present is never cut.
 
+Win-stall sweep (C1b, 2026-11-17): live validation showed the
+post-attempt orphan sweep cannot shorten a winning attempt's
+stall - it runs only after the foreground shell call returns,
+and the call returns only at its own 600 s socket timeout. The
+watchdog therefore also sweeps from its own poll loop once a
+WIN verdict is 120 s old and the call is still outstanding,
+and once more 120 s later; a win is still never cut, and the
+sweep outcome is logged whether or not anything was killed.
+
 The policy itself is pure Java (AttemptWatchdog). When a JDK is
 available these tests compile and execute the real decision
 table; the source-shape tests always run and pin the wiring:
@@ -96,6 +105,35 @@ public final class WatchdogHarness {
         check(!AttemptWatchdog.shouldCutFailVerdict(900_000L, false),
                 "fail cut late with daemon present");
         check(AttemptWatchdog.FAIL_GRACE_MS == 30_000L, "grace is not 30 s");
+        // Win-stall sweep: due 120 s after a win verdict while
+        // the attempt call is still outstanding, once more at
+        // 240 s, never a third time; never without a win verdict
+        // and never once the call has returned.
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 0L, 0, false),
+                "win sweep at the verdict instant");
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 119_999L, 0, false),
+                "win sweep inside the first grace");
+        check(AttemptWatchdog.shouldSweepWinStall(1, 120_000L, 0, false),
+                "no first win sweep at grace end");
+        check(AttemptWatchdog.shouldSweepWinStall(1, 200_000L, 0, false),
+                "no first win sweep when polled late");
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 120_000L, 1, false),
+                "second win sweep at the first grace");
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 239_999L, 1, false),
+                "second win sweep inside the second grace");
+        check(AttemptWatchdog.shouldSweepWinStall(1, 240_000L, 1, false),
+                "no second win sweep at the second grace end");
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 600_000L, 2, false),
+                "third win sweep at the timeout edge");
+        check(!AttemptWatchdog.shouldSweepWinStall(0, 600_000L, 0, false),
+                "win sweep on a fail verdict");
+        check(!AttemptWatchdog.shouldSweepWinStall(-1, 600_000L, 0, false),
+                "win sweep with no verdict");
+        check(!AttemptWatchdog.shouldSweepWinStall(1, 600_000L, 0, true),
+                "win sweep after the call returned");
+        check(AttemptWatchdog.WIN_SWEEP_GRACE_MS == 120_000L,
+                "win sweep grace is not 120 s");
+        check(AttemptWatchdog.WIN_SWEEP_MAX == 2, "win sweep max is not 2");
         System.out.println("WATCHDOG_HARNESS_OK");
     }
 }
@@ -175,6 +213,30 @@ class WatchdogWiringTest(unittest.TestCase):
         # The cut uses the existing tracked-client teardown (the
         # stop path's kill mechanism), not a new kill channel.
         self.assertIn("client.close()", self.service)
+
+    def test_win_stall_sweep_policy_shape(self) -> None:
+        # The win-stall sweep: two sweeps, one 120 s grace apart,
+        # gated on a WIN verdict and an outstanding call. The
+        # service consults the policy from the watchdog loop,
+        # sweeps through the existing sweepAttemptOrphans seam,
+        # and logs the outcome unconditionally (a stall with an
+        # empty kill set must still explain itself).
+        self.assertIn("WIN_SWEEP_GRACE_MS = 120_000L", self.watchdog)
+        self.assertIn("WIN_SWEEP_MAX = 2", self.watchdog)
+        self.assertIn("verdict != VERDICT_WIN || callReturned", self.watchdog)
+        self.assertIn("AttemptWatchdog.shouldSweepWinStall", self.service)
+        self.assertIn("AttemptWatchdog.VERDICT_WIN", self.service)
+        self.assertIn('"win-stall-" + winSweepsDone', self.service)
+        self.assertIn("win-stall sweep attempt=", self.service)
+        self.assertIn("win-stall outcome attempt=", self.service)
+        # The win-stall branch never closes the tracked client:
+        # inside runAttemptWithWatchdog the only client.close()
+        # is still the cut path's.
+        method = self.service[
+            self.service.index("private void runAttemptWithWatchdog") :
+            self.service.index("// ---- failure budget")
+        ]
+        self.assertEqual(method.count("client.close()"), 1)
 
     def test_attempt_timeout_and_provision_path_unchanged(self) -> None:
         # The 600 s runner timeout stays; the watchdog only stops
