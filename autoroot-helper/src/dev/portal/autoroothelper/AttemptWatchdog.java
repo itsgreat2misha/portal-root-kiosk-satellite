@@ -36,12 +36,30 @@ package dev.portal.autoroothelper;
  * fail verdict with the daemon present is never cut - that
  * attempt's handoff belongs to the normal post-attempt path.
  *
+ * Win-stall sweep (2026-11-17, C1b): a WIN verdict is never cut,
+ * but live validation of the post-attempt orphan sweep showed it
+ * cannot shorten a winning attempt's stall: the sweep runs only
+ * after the foreground shell call returns, and the call returns
+ * only at its own 600 s socket timeout, which is itself what
+ * tears the wedged session down - by then the tree is already
+ * gone and the sweep finds nothing. The watchdog poll loop is
+ * the one thread alive during the stall, so the sweep also runs
+ * from there: once a win verdict is WIN_SWEEP_GRACE_MS old and
+ * the call is still outstanding, the attempt's leftover tree is
+ * debris by the same argument as the post-attempt sweep (the
+ * verdict is written only after the attempt's real work
+ * completes) and is swept early - at most WIN_SWEEP_MAX times,
+ * one grace period apart - instead of holding the handoff until
+ * the timeout edge. The 600 s timeout remains the backstop.
+ *
  * Pure logic, no Android dependencies, so the policy is unit
  * testable off-device.
  */
 final class AttemptWatchdog {
     static final long CUTOFF_MS = 300_000L;
     static final long FAIL_GRACE_MS = 30_000L;
+    static final long WIN_SWEEP_GRACE_MS = 120_000L;
+    static final int WIN_SWEEP_MAX = 2;
     static final String VERDICT_MARKER = "WATCH_CFI_OK=";
 
     static final int VERDICT_NONE = -1;
@@ -66,6 +84,30 @@ final class AttemptWatchdog {
     static boolean shouldCutFailVerdict(long sinceFailVerdictMs,
             boolean daemonAbsent) {
         return daemonAbsent && sinceFailVerdictMs >= FAIL_GRACE_MS;
+    }
+
+    /**
+     * True when a win-verdict attempt whose foreground shell call
+     * is still outstanding should have its leftover process tree
+     * swept from the watchdog thread: the grace period for the
+     * next sweep has elapsed since the win verdict. Sweeps are
+     * due at WIN_SWEEP_GRACE_MS intervals after the verdict, at
+     * most WIN_SWEEP_MAX of them; after that the attempt's own
+     * 600 s shell timeout remains the backstop. Never true
+     * without a win verdict and never true once the call has
+     * returned. This is not a cut: the verdict and its
+     * accounting are untouched, only the orphaned tree is
+     * collected early.
+     */
+    static boolean shouldSweepWinStall(int verdict, long sinceWinVerdictMs,
+            int sweepsDone, boolean callReturned) {
+        if (verdict != VERDICT_WIN || callReturned) {
+            return false;
+        }
+        if (sweepsDone < 0 || sweepsDone >= WIN_SWEEP_MAX) {
+            return false;
+        }
+        return sinceWinVerdictMs >= WIN_SWEEP_GRACE_MS * (sweepsDone + 1);
     }
 
     /** True when the given attempt.log tail contains a race verdict. */

@@ -355,8 +355,13 @@ public final class AutorootService extends Service {
         // AttemptWatchdog.CUTOFF_MS is cut by closing the tracked
         // client - the same teardown the stop path uses - instead
         // of riding to the 600 s timeout. A WIN verdict is never
-        // cut: wins write their verdict early and conclude at the
-        // timeout edge by design. Post-verdict extension
+        // cut, but its leftover tree is swept from the watchdog
+        // thread once the verdict is 120 s old and the call is
+        // still outstanding (C1b, 2026-11-17): the post-attempt
+        // sweep cannot reach a wedged winning tree before the
+        // call returns at the 600 s timeout, so without the
+        // in-loop sweep a wedged win holds the handoff to the
+        // timeout edge. Post-verdict extension
         // (2026-11-15): a FAIL verdict followed by a runner hang
         // is cut too, but only after the watchdog's grace period
         // and only while the root daemon is known-absent (see
@@ -414,9 +419,15 @@ public final class AutorootService extends Service {
      * launch thread, polling attempt.log for the verdict marker in
      * the meantime. Cuts the attempt at the watchdog cutoff when no
      * verdict has appeared, and cuts a fail-verdict attempt after
-     * the grace period while the root daemon is known-absent;
-     * otherwise lets the launch ride to its own completion or the
-     * 600 s shell timeout, exactly as the pre-watchdog code did.
+     * the grace period while the root daemon is known-absent. A win
+     * verdict is never cut, but once it is 120 s old and the call
+     * is still outstanding this loop sweeps the attempt's leftover
+     * process tree itself (at most twice, 120 s apart): the
+     * post-attempt sweep cannot reach a wedged winning tree until
+     * the call returns at its 600 s socket timeout, so without
+     * this the stall always lasts to the timeout edge. Otherwise
+     * the launch rides to its own completion or the 600 s shell
+     * timeout, exactly as the pre-watchdog code did.
      */
     private void runAttemptWithWatchdog(String kaslr, String memstart,
             int attempts, long attemptLogOffset) {
@@ -433,6 +444,8 @@ public final class AutorootService extends Service {
         launch.start();
         int verdict = AttemptWatchdog.VERDICT_NONE;
         long failVerdictAtMs = 0;
+        long winVerdictAtMs = 0;
+        int winSweepsDone = 0;
         boolean daemonPresent = false;
         while (launch.isAlive()) {
             if (stopRequested) {
@@ -442,9 +455,35 @@ public final class AutorootService extends Service {
                 verdict = attemptVerdict(attemptLogOffset);
                 if (verdict == AttemptWatchdog.VERDICT_FAIL) {
                     failVerdictAtMs = System.currentTimeMillis();
+                } else if (verdict == AttemptWatchdog.VERDICT_WIN) {
+                    winVerdictAtMs = System.currentTimeMillis();
                 }
             }
             long nowMs = System.currentTimeMillis();
+            if (verdict == AttemptWatchdog.VERDICT_WIN
+                    && AttemptWatchdog.shouldSweepWinStall(verdict,
+                            nowMs - winVerdictAtMs, winSweepsDone,
+                            !launch.isAlive())) {
+                // Win-stall sweep: the verdict is in, so the
+                // attempt's real work is done and any of its tree
+                // still alive is debris - but the post-attempt
+                // sweep only runs once this foreground call
+                // returns, and the call returns only at its
+                // 600 s socket timeout. Sweep from here, the one
+                // thread alive during the stall. The call itself
+                // is never cut and the verdict accounting is
+                // untouched; the outcome is logged whether or
+                // not anything was killed, so a future stall is
+                // self-explaining.
+                winSweepsDone++;
+                List<Integer> killed = sweepAttemptOrphans(
+                        "win-stall-" + winSweepsDone);
+                Log.w(TAG, "win-stall sweep attempt=" + attempts
+                        + " sweep=" + winSweepsDone + " killed=" + killed);
+                logFile("win-stall sweep attempt=" + attempts
+                        + " sweep=" + winSweepsDone
+                        + " killed=" + (killed == null ? "error" : killed));
+            }
             boolean cut = false;
             String cutLog = null;
             if (verdict == AttemptWatchdog.VERDICT_FAIL && !daemonPresent) {
@@ -495,6 +534,11 @@ public final class AutorootService extends Service {
             } catch (InterruptedException error) {
                 break;
             }
+        }
+        if (winSweepsDone > 0) {
+            logFile("win-stall outcome attempt=" + attempts
+                    + " sweeps=" + winSweepsDone
+                    + " callReturned=" + !launch.isAlive());
         }
         try {
             launch.join(30000);
@@ -988,14 +1032,20 @@ public final class AutorootService extends Service {
      * cannot (its shell SELinux domain gets EPERM, observed live
      * 2026-11-17). Best effort: a failed sweep is logged, never
      * fatal - the bounded handoff and its retry are the backstop.
+     *
+     * Returns the kill set (empty when nothing was selected), or
+     * null when the sweep itself failed; the failure is logged
+     * either way. Callers that must explain a stall (the
+     * watchdog's win-stall sweep) log the returned set
+     * unconditionally, including the empty case.
      */
-    private void sweepAttemptOrphans(String when) {
+    private List<Integer> sweepAttemptOrphans(String when) {
         try {
             String ps = shell("ps -A -o pid,ppid,comm");
             List<Integer> kill = OrphanSweep.selectKillPids(
                     ps, android.os.Process.myPid());
             if (kill.isEmpty()) {
-                return;
+                return kill;
             }
             StringBuilder command = new StringBuilder("kill -9");
             for (int pid : kill) {
@@ -1004,9 +1054,11 @@ public final class AutorootService extends Service {
             shell(command.toString());
             Log.w(TAG, "orphan sweep (" + when + ") killed " + kill);
             logFile("orphan sweep when=" + when + " killed=" + kill);
+            return kill;
         } catch (Exception error) {
             Log.w(TAG, "orphan sweep failed (" + when + ")", error);
             logFile("orphan sweep failed when=" + when + " " + error);
+            return null;
         }
     }
 
