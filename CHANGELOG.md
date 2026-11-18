@@ -105,6 +105,25 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A bootstrap phase's failure was judged where it happened in the
+  run's ordering instead of against the device's end state: in the
+  combined flow the OTA bootstrap's verification failure aborted
+  the run before the custom payload phase even when later phases
+  put the device in exactly the state the check wants (Run 37C),
+  and the payload-only path never reported deferred failures at
+  all. Deferred failures are now re-judged at the run's final
+  report — `ota_preflight()` against the end state — with the
+  raise deferred past a pending payload phase and the final report
+  made after the payload apply on both payload paths. When the run
+  ends in the alohausers-disabled posture, where the MobileConfig
+  service is absent by design and override provenance can never
+  verify, the OTA item is judged by the posture's own criteria
+  instead (nodemon config staged, `otad.nodemon` set, alohausers
+  disabled, override file present), logged as `OTA_POSTURE_JUDGED`
+  with the per-criterion results; all four true records the action
+  done, any one false leaves it `unverified`, and a completed
+  manifest that claimed it done is corrected in place
+  (`OTA_MANIFEST_CORRECTED`), preserving the verification boots.
 - The Shizuku/autoroot ADB keypair could rotate away from the
   authorized key and strand recovery: the two helpers share one
   keypair, autoroot staging removes the Shizuku helper, and the

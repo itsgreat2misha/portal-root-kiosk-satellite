@@ -195,6 +195,13 @@ OTA_BACKEND_BACKUP_REMOTE = "/data/local/tmp/portal-ota-backend-before-v1.json"
 # Both must match the native override in exploit/src/fops.c.
 OTA_POLL_INTERVAL_MINUTES = 1_000_000
 OTA_JSON_URL = "https://127.0.0.1:9/"
+# The MobileConfig override the native OTA action installs; the path
+# must match exploit/src/fops.c. It lives in alohausers' app-private
+# directory, so the shell cannot stat it — see _ota_override_present.
+OTA_OVERRIDE_REMOTE = (
+    "/data/user/0/com.facebook.alohaservices.alohausers/files/"
+    "mobileconfig/mc_overrides.json"
+)
 
 
 def parse_ota_config(dump: str) -> dict[str, str] | None:
@@ -364,6 +371,24 @@ class PortalProvisioner:
         self.ota_already_configured = False
         self.ota_backend_value = ota_backend_value
         self.ota_unverified = False
+        # Set when any win in this run (a nested bootstrap run's win
+        # included, propagated by the phase that ran it) set
+        # otad.nodemon and read it back true. The posture judgment
+        # uses it because the property itself is per-boot and no
+        # mechanism sets it on the payload boot a combined run ends
+        # on (PR #45 validation, 2026-11-17).
+        self.ota_nodemon_set_this_run = False
+        # Set when this run's dedicated OTA bootstrap returned
+        # normally, which means its install action completed — and
+        # that action verifies the override file's exact contents
+        # as its last step. The posture judgment's override-presence
+        # evidence when no root channel can stat the file.
+        self._ota_install_verified_this_run = False
+        # While true, report_deferred_failures() re-judges but does
+        # not raise: a custom payload phase is still to run in this
+        # invocation, and the judgment that ends the run happens in
+        # the final report after it.
+        self._payload_phase_pending = False
         # Process whose credential the most recently built exploit
         # environment's action child clones, if any; reported by
         # exploit() alongside the environment's action keys.
@@ -1796,11 +1821,189 @@ class PortalProvisioner:
             )
 
     def report_deferred_failures(self) -> None:
+        self._rejudge_deferred_failures(
+            final=not self._payload_phase_pending
+        )
+        if self._payload_phase_pending:
+            # A custom payload phase is still to run in this
+            # invocation. The re-judgment above may already have
+            # cleared a failure against the current state, but the
+            # judgment that ends the run (and may raise) happens in
+            # the final report after that phase.
+            return
         if self.deferred_phase_failures:
             raise ProvisionError(
                 "bootstrap phases failed: "
                 + "; ".join(self.deferred_phase_failures)
             )
+
+    def _rejudge_deferred_failures(self, *, final: bool) -> None:
+        """Re-judge a deferred OTA bootstrap verification failure
+        against the device's current state.
+
+        The dedicated OTA bootstrap verifies while the run is still
+        in its bootstrap ordering: on a device in the
+        alohausers-disabled posture its in-phase verification
+        cannot observe the override being served, because the
+        accounts phase that re-enables the package has not run yet
+        (Run 37C). The failure is therefore re-judged at report
+        time — ota_preflight() against the current state, or, when
+        the end state is the disabled posture itself, the posture
+        criteria (_judge_ota_posture). A judgment that confirms the
+        failure marks the action unverified and corrects a manifest
+        that already claimed it done; a provisional judgment (a
+        payload phase still pending) may clear a failure but never
+        confirms one. Only the bootstrap's verification failure is
+        re-judgeable: an entry recording a different failure (the
+        nested run died, the transport dropped) stays as recorded.
+        """
+        entries = [
+            entry
+            for entry in self.deferred_phase_failures
+            if entry.startswith("disable_updates:")
+            and "did not verify" in entry
+        ]
+        if not entries:
+            return
+        if self._ota_end_state_verified():
+            for entry in entries:
+                self.deferred_phase_failures.remove(entry)
+            print(
+                "OTA_DEFERRED_FAILURE_CLEARED "
+                "reason=end-state-verified",
+                flush=True,
+            )
+            return
+        if not final:
+            return
+        self.ota_unverified = True
+        self._correct_manifest_for_unverified_ota()
+
+    def _ota_end_state_verified(self) -> bool:
+        if self.ota_preflight():
+            return True
+        return self._judge_ota_posture()
+
+    def _judge_ota_posture(self) -> bool:
+        """Judge the OTA action by the disabled posture's own pass
+        conditions (owner decision, Nov 18, 2026).
+
+        Applies only when the run ends in the alohausers-disabled
+        posture: the MobileConfig service is then absent by design,
+        so the provenance verification ota_preflight() performs can
+        never pass, and the block rests on the posture's own
+        mechanism instead — otad.nodemon re-asserted after every
+        boot by the staged autoroot payload, the config provider
+        package disabled, and the override file present as the
+        inert backstop (the posture itself was proven over a full
+        241-minute cycle with zero check-ins, Nov 17, 2026). Every
+        criterion is read back live; any one false leaves the
+        action unverified. When alohausers is enabled at the end
+        this judgment does not apply at all, and a failed
+        provenance verification stands exactly as before.
+        """
+        if not self.target or self.target.device != "aloha":
+            return False
+        if not self.alohausers_package_disabled():
+            return False
+        conf_staged = self._ota_nodemon_conf_staged()
+        nodemon_now = (
+            self.adb_run(
+                ["shell", "getprop", OTA_NODEMON_PROPERTY], timeout=5
+            ).stdout.strip()
+            == "true"
+        )
+        nodemon = nodemon_now or self.ota_nodemon_set_this_run
+        override_present = self._ota_override_present()
+        judged_done = bool(conf_staged and nodemon and override_present)
+        print(
+            "OTA_POSTURE_JUDGED "
+            f"result={'done' if judged_done else 'unverified'} "
+            f"conf_staged={int(conf_staged)} "
+            f"nodemon={int(nodemon)} "
+            "nodemon_source="
+            + (
+                "current-boot"
+                if nodemon_now
+                else "set-this-run"
+                if self.ota_nodemon_set_this_run
+                else "none"
+            )
+            + " alohausers_disabled=1 "
+            f"override_present={int(override_present)}",
+            flush=True,
+        )
+        return judged_done
+
+    def alohausers_package_disabled(self) -> bool:
+        return self.settings_feature.alohausers_package_disabled()
+
+    def _ota_nodemon_conf_staged(self) -> bool:
+        result = self.adb_run(
+            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
+        )
+        if result.returncode != 0:
+            return False
+        return any(
+            line.strip() == "OTA_NODEMON=1"
+            for line in result.stdout.splitlines()
+        )
+
+    def _ota_override_present(self) -> bool:
+        """Whether the MobileConfig override file is in place.
+
+        The file lives in alohausers' app-private directory, which
+        the shell cannot stat. When the custom payload's root
+        daemon is serving it answers directly (a nonzero answer is
+        not authoritative — the daemon's shell domain may be
+        refused the stat — so it only ever proves presence).
+        Otherwise the evidence is this run's own install action:
+        the deferred verification failure being judged exists only
+        because that action completed, and it verifies the file's
+        exact contents as its last step (a failed install discards
+        the attempt instead of reaching verification).
+        """
+        try:
+            code, _output = self.daemon_exec(
+                f"test -f {OTA_OVERRIDE_REMOTE}"
+            )
+            if code == 0:
+                return True
+        except Exception:
+            pass
+        return self._ota_install_verified_this_run
+
+    def _correct_manifest_for_unverified_ota(self) -> None:
+        """Re-write a completed manifest that claimed the OTA
+        action done now that the final judgment marks it
+        unverified, preserving the recorded verification boots, so
+        the on-disk record never claims an unverified action as
+        done (write_state maps the action to "unverified" while
+        ota_unverified is set)."""
+        try:
+            state = self.read_state()
+        except ProvisionError:
+            state = None
+        if not state or state.get("status") != "complete":
+            return
+        actions = state.get("actions")
+        if not isinstance(actions, dict):
+            return
+        if actions.get("disable_updates") is not True:
+            return
+        first_boot = second_boot = None
+        verification = state.get("verification")
+        if isinstance(verification, dict):
+            if isinstance(verification.get("first_boot"), str):
+                first_boot = verification["first_boot"]
+            if isinstance(verification.get("second_boot"), str):
+                second_boot = verification["second_boot"]
+        self.write_state("complete", first_boot, second_boot)
+        print(
+            "OTA_MANIFEST_CORRECTED action=disable_updates "
+            "recorded=unverified",
+            flush=True,
+        )
 
 
     def requested_actions(self) -> dict[str, object]:
@@ -5011,6 +5214,17 @@ class PortalProvisioner:
                         output.write(annotation)
                         output.flush()
                     if (
+                        "OTA_NODEMON_SET property=" in line
+                        and "value=true" in line
+                    ):
+                        # The win's dedicated child set the per-boot
+                        # property and read it back true (the native
+                        # line is emitted from that read-back). The
+                        # posture judgment uses this record because
+                        # the property does not survive the reboots
+                        # between this phase and the run's end.
+                        self.ota_nodemon_set_this_run = True
+                    if (
                         self.target.post_scheduler_timeout_seconds > 0
                         and "post-scheduler checkpoint complete" in line
                     ):
@@ -6012,6 +6226,10 @@ class PortalProvisioner:
         self._release_autoroot_guard(succeeded=True)
 
     def _provision_stages(self) -> None:
+        # While a custom payload phase is part of this invocation,
+        # deferred-failure reports re-judge but do not raise; the
+        # payload branch clears this and makes the final report.
+        self._payload_phase_pending = self.custom_payload is not None
         self._capture_start_state()
         resumed_pending = False
         if self.recover:
@@ -6281,17 +6499,28 @@ class PortalProvisioner:
                     "reason=installer-credential",
                     flush=True,
                 )
-                PortalProvisioner(
+                bootstrap = PortalProvisioner(
                     self.serial,
                     self.attempts,
                     phase_logs,
                     disable_updates=True,
                     skip_build=self.skip_build,
-                ).provision()
+                )
+                bootstrap.provision()
+                if bootstrap.ota_nodemon_set_this_run:
+                    self.ota_nodemon_set_this_run = True
                 self.connect(wait_seconds=30)
                 self.verify_target()
                 self.ota_already_configured = self.ota_preflight()
                 if not self.ota_already_configured:
+                    # The nested run returned normally, so its
+                    # install action completed — and that action
+                    # verifies the override file's exact contents
+                    # as its last step. The posture judgment uses
+                    # this as its override-presence evidence when
+                    # no root channel can stat the app-private
+                    # file (see _ota_override_present).
+                    self._ota_install_verified_this_run = True
                     raise ProvisionError(
                         "the dedicated Aloha OTA bootstrap did not verify"
                     )
@@ -6734,6 +6963,13 @@ class PortalProvisioner:
                         "EXPLOIT_SENTINEL_RETAINED reason=autoroot",
                         flush=True,
                     )
+            # The payload-only path used to return here without
+            # ever reporting deferred bootstrap failures, silently
+            # dropping them; the combined path's mid-run report
+            # could only defer its raise to this point. Either way
+            # this is the judgment that ends the run.
+            self._payload_phase_pending = False
+            self.report_deferred_failures()
             return
         self.run_standard_install(use_exploit_sentinel)
 
