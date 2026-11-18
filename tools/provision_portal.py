@@ -405,6 +405,14 @@ class PortalProvisioner:
         self.system_theme_control_log_count_before = 0
         self._autoroot_guard_prior: str | None = None
         self._autoroot_guard_nested = False
+        # Phase C2 Private DNS state: the manifest this run started
+        # from (captured before any write of ours replaces it), the
+        # stages path's deferred DNS apply, and a recorded-state
+        # repair routed through the channel path.
+        self._start_state: dict[str, object] | None = None
+        self._start_state_captured = False
+        self._dns_apply_deferred = False
+        self._dns_repair_expectation: tuple[str, str] | None = None
         self.shizuku_apk = shizuku_apk
         self.custom_payload = custom_payload
         self.skip_shizuku_root = skip_shizuku_root
@@ -1414,6 +1422,70 @@ class PortalProvisioner:
         # staging pushes it on demand.
         return None
 
+    def _apply_shell_level_state(
+        self,
+        *,
+        debloat_configured: bool,
+        remote_wipe_configured: bool,
+        defer_dns: bool,
+    ) -> None:
+        """The one host shell-level apply sequence, shared by the
+        race (stages) path and the root-channel path so the two can
+        never drift apart: every shell-applicable action applies
+        here, in this order, on both paths.
+
+        The two callers differ only in where the debloat /
+        remote-wipe skip answers come from, and both are honest:
+        the stages path passes the run's cached preflight results
+        (a dedicated bootstrap phase may have just changed them,
+        and the cache is what the rest of the run consults), the
+        channel path passes fresh live preflights (no bootstrap ran
+        on that path). The stages path also defers the Private DNS
+        applies to final verification (defer_dns): the write used
+        to sit pre-race, where the race's crash-reboots could
+        discard the SettingsProvider async flush before it
+        persisted (Nov 15 robustness decision). The channel path
+        has no races, so it applies DNS inline like everything
+        else."""
+        if self.debloat and not debloat_configured:
+            self.apply_debloat()
+        if self.restore_bloat:
+            self.restore_debloat()
+        if self.block_remote_wipe and not remote_wipe_configured:
+            self.ensure_remote_wipe_backup()
+        if self.restore_remote_wipe:
+            self.read_remote_wipe_backup(required=True)
+        if self.needs_uid1000_payload():
+            if self.skip_build:
+                self.validate_uid1000_payload()
+            self.prepare_camera_light_install()
+        if self.disable_updates:
+            self.disable_ota_packages()
+        if self.disable_adb_auth_timeout:
+            self.disable_adb_authorization_timeout()
+        if self.restore_adb_auth_timeout:
+            self.restore_adb_authorization_timeout()
+        if defer_dns:
+            if (
+                self.privacy_dns
+                or self.dhcp_dns
+                or self.restore_privacy_dns
+            ):
+                self._dns_apply_deferred = True
+        else:
+            if self.privacy_dns:
+                self.apply_privacy_dns()
+            if self.dhcp_dns:
+                self.apply_dhcp_dns()
+            if self.restore_privacy_dns:
+                self.restore_private_dns()
+        if self.allow_app_updates:
+            self.allow_third_party_app_updates()
+        if self.restore_app_verifier:
+            self.restore_app_verifier_setting()
+        if self.needs_component_ctl():
+            self.prepare_component_actions()
+
     def _apply_via_channel(self, reason: str) -> bool:
         """Apply the drifted delta through the device's existing root
         setup: the same shell-level applies, package installs, and
@@ -1433,36 +1505,17 @@ class PortalProvisioner:
             if self.shizuku:
                 self.resolve_shizuku_apk()
             self.write_state("pending")
-            if self.debloat and not self.debloat_preflight():
-                self.apply_debloat()
-            if self.restore_bloat:
-                self.restore_debloat()
-            if self.block_remote_wipe and not self.remote_wipe_preflight():
-                self.ensure_remote_wipe_backup()
-            if self.restore_remote_wipe:
-                self.read_remote_wipe_backup(required=True)
-            if self.needs_uid1000_payload():
-                if self.skip_build:
-                    self.validate_uid1000_payload()
-                self.prepare_camera_light_install()
-            if self.disable_updates:
-                self.disable_ota_packages()
-            if self.disable_adb_auth_timeout:
-                self.disable_adb_authorization_timeout()
-            if self.restore_adb_auth_timeout:
-                self.restore_adb_authorization_timeout()
-            if self.privacy_dns:
-                self.apply_privacy_dns()
-            if self.dhcp_dns:
-                self.apply_dhcp_dns()
-            if self.restore_privacy_dns:
-                self.restore_private_dns()
-            if self.allow_app_updates:
-                self.allow_third_party_app_updates()
-            if self.restore_app_verifier:
-                self.restore_app_verifier_setting()
-            if self.needs_component_ctl():
-                self.prepare_component_actions()
+            self._apply_shell_level_state(
+                debloat_configured=(
+                    self.debloat_preflight() if self.debloat else False
+                ),
+                remote_wipe_configured=(
+                    self.remote_wipe_preflight()
+                    if self.block_remote_wipe
+                    else False
+                ),
+                defer_dns=False,
+            )
             if not self.skip_build:
                 build(
                     target=self.target,
@@ -1529,14 +1582,29 @@ class PortalProvisioner:
         if blocker is None:
             root_blocker = self._root_setup_blocker()
             if root_blocker is None:
+                # The no-op decision may not pass over Private DNS
+                # drift: the manifest records the desired end
+                # state, so live drift routes to the channel path,
+                # whose final verification performs the repair.
+                drift = self._dns_drift(state)
+                if drift is None:
+                    print(
+                        "PROVISION_NOOP reason=already-provisioned "
+                        f"tool_revision={state.get('tool_revision')} "
+                        f"logs={self.log_dir}",
+                        flush=True,
+                    )
+                    return True
                 print(
-                    "PROVISION_NOOP reason=already-provisioned "
-                    f"tool_revision={state.get('tool_revision')} "
-                    f"logs={self.log_dir}",
+                    "PRIVACY_DNS_DRIFT "
+                    f"recorded_mode={drift[0]} "
+                    f"recorded_hostname={drift[1]}",
                     flush=True,
                 )
-                return True
-            blocker = root_blocker
+                self._dns_repair_expectation = drift
+                blocker = "dns-drift"
+            else:
+                blocker = root_blocker
         print(f"PROVISION_NOOP_SKIP reason={blocker}", flush=True)
         channel_blocker = self._channel_blocker(state)
         if channel_blocker is not None:
@@ -1546,6 +1614,142 @@ class PortalProvisioner:
             )
             return False
         return self._apply_via_channel(blocker)
+
+    # ---- Private DNS end-state invariant (Phase C2) ---------------
+    #
+    # A run's own DNS request is verified against the request, but
+    # nothing used to compare the live state to the state the
+    # previous completed run recorded: the no-op path never read
+    # live DNS at all, and a run that requested no DNS change never
+    # looked at it either, so user-side drift and flush-loss drift
+    # were both invisible. The invariant closes that: the recorded
+    # state is the desired end state on every later run.
+
+    def _capture_start_state(self) -> None:
+        """Snapshot the manifest this run started from, before any
+        write of ours replaces it. The invariant judges the
+        finished device against the previously recorded state, not
+        against this run's request, so the snapshot has to predate
+        this run's first write_state."""
+        if self._start_state_captured:
+            return
+        self._start_state_captured = True
+        try:
+            self._start_state = self.read_state()
+        except ProvisionError:
+            self._start_state = None
+
+    def _recorded_dns_expectation(
+        self, state: dict[str, object] | None
+    ) -> tuple[str, str] | None:
+        """The Private DNS end state a manifest records, as
+        (mode, specifier) with "null" for an absent specifier;
+        None when the manifest records no DNS action (nothing to
+        enforce) or the recorded state cannot be determined (a
+        recorded restore whose on-device backup is unreadable)."""
+        if not state:
+            return None
+        actions = state.get("actions")
+        if not isinstance(actions, dict):
+            return None
+        if actions.get("dhcp_dns"):
+            return ("off", "null")
+        privacy_dns = actions.get("privacy_dns")
+        if isinstance(privacy_dns, str) and privacy_dns.strip():
+            return ("hostname", privacy_dns.strip().lower())
+        if actions.get("restore_privacy_dns"):
+            backup = self.read_private_dns_backup()
+            if backup is None:
+                return None
+            mode = backup.get("mode")
+            hostname = backup.get("hostname")
+            if not isinstance(mode, str) or not isinstance(hostname, str):
+                return None
+            return (
+                mode if mode not in ("", "null") else "null",
+                hostname if hostname not in ("", "null") else "null",
+            )
+        return None
+
+    def _dns_drift(
+        self, state: dict[str, object] | None
+    ) -> tuple[str, str] | None:
+        """The recorded DNS expectation when the live state has
+        drifted from it; None when it matches or nothing is
+        recorded. An unreadable live state counts as drift: the
+        no-op decision must never pass over state it could not
+        check, and the repair path surfaces a real I/O failure if
+        there is one."""
+        expectation = self._recorded_dns_expectation(state)
+        if expectation is None:
+            return None
+        try:
+            live = self.read_private_dns_state()
+        except ProvisionError:
+            return expectation
+        if live == expectation:
+            return None
+        return expectation
+
+    def _enforce_recorded_dns(
+        self, state: dict[str, object] | None
+    ) -> None:
+        """Enforce the invariant against a starting manifest: on
+        drift, re-write the recorded state, log the repair, and
+        re-read before the run may call itself complete."""
+        expectation = self._recorded_dns_expectation(state)
+        if expectation is None:
+            return
+        live = self.read_private_dns_state()
+        if live == expectation:
+            print(
+                "PRIVACY_DNS_RECORDED_OK "
+                f"mode={live[0]} hostname={live[1]}",
+                flush=True,
+            )
+            return
+        print(
+            "PRIVACY_DNS_DRIFT "
+            f"recorded_mode={expectation[0]} "
+            f"recorded_hostname={expectation[1]} "
+            f"live_mode={live[0]} live_hostname={live[1]}",
+            flush=True,
+        )
+        self.write_private_dns_state(*expectation)
+        live = self.read_private_dns_state()
+        if live != expectation:
+            raise ProvisionError(
+                "Private DNS drift repair did not persist: "
+                f"mode={live[0]!r}/{expectation[0]!r} "
+                f"hostname={live[1]!r}/{expectation[1]!r}"
+            )
+        print(
+            "PRIVACY_DNS_REPAIRED "
+            f"mode={expectation[0]} hostname={expectation[1]}",
+            flush=True,
+        )
+
+    def _finalize_dns_state(self) -> None:
+        """End-of-run Private DNS position for the outermost run:
+        first apply any stages-path DNS write deferred to this
+        point (post-race, so a crash-reboot can no longer discard
+        its SettingsProvider flush), then — when this run
+        requested no DNS change of its own — enforce the
+        manifest-recorded end state."""
+        if self._autoroot_guard_nested:
+            return
+        if self._dns_apply_deferred:
+            self._dns_apply_deferred = False
+            if self.privacy_dns:
+                self.apply_privacy_dns()
+            if self.dhcp_dns:
+                self.apply_dhcp_dns()
+            if self.restore_privacy_dns:
+                self.restore_private_dns()
+            return
+        if self.privacy_dns or self.dhcp_dns or self.restore_privacy_dns:
+            return
+        self._enforce_recorded_dns(self._start_state)
 
     @contextlib.contextmanager
     def bootstrap_guard(self, label: str):
@@ -3022,6 +3226,15 @@ class PortalProvisioner:
     def verify_privacy_dns(self) -> None:
         return self.settings_feature.verify_privacy_dns()
 
+    def read_private_dns_state(self) -> tuple[str, str]:
+        return self.settings_feature.read_private_dns_state()
+
+    def write_private_dns_state(self, mode: str, hostname: str) -> None:
+        return self.settings_feature.write_private_dns_state(mode, hostname)
+
+    def read_private_dns_backup(self) -> dict[str, object] | None:
+        return self.settings_feature.read_private_dns_backup()
+
     def app_verifier_package_disabled(self) -> bool:
         disabled = self.adb_run(
             ["shell", "pm", "list", "packages", "-d", "-u"],
@@ -4218,7 +4431,16 @@ class PortalProvisioner:
                 environment["GHOSTLOCK_OTA_BLOCK"] = "1"
                 if self.target.device == "aloha":
                     environment["GHOSTLOCK_OTA_PLATFORM_BACKEND"] = "1"
-        if self.enable_updates and self.ota_backend_value is None:
+        if (
+            self.enable_updates
+            and self.ota_backend_value is None
+            and ota_phase_owns_block
+        ):
+            # Same phase rule as the block install above: the
+            # restore removes the override inside the same
+            # alohausers app-private directory (step 17), so on
+            # targets with a dedicated OTA credential only the
+            # dedicated OTA phase's environment carries it.
             environment["GHOSTLOCK_RESTORE_OTA_BLOCK"] = "1"
         # The nodemon action belongs to the standard-install
         # attempts: their action child clones init's credential (no
@@ -4242,6 +4464,9 @@ class PortalProvisioner:
             and not self._in_custom_payload_phase
         ):
             environment["GHOSTLOCK_OTA_NODEMON"] = "1"
+        presence_phase_owns_profile = private_presence_action or not (
+            self.target.presence_installer_credentials
+        )
         if self.optimize_presence and not self.presence_already_configured:
             # Same phase rule as the OTA block: on targets with a
             # dedicated presence installer credential the profile
@@ -4249,23 +4474,53 @@ class PortalProvisioner:
             # into the main flow's attempts it writes inside the
             # aiservice app-private directory under init's credential,
             # fails with EACCES (step 19), and discards won races.
-            if private_presence_action or not (
-                self.target.presence_installer_credentials
-            ):
+            if presence_phase_owns_profile:
                 environment["GHOSTLOCK_PRESENCE_PROFILE"] = "1"
-        if self.restore_presence_profile:
+        if self.restore_presence_profile and presence_phase_owns_profile:
+            # The restore writes the same app-private directory as
+            # the install (step 19), so it follows the install's
+            # phase rule exactly.
             environment["GHOSTLOCK_RESTORE_PRESENCE_PROFILE"] = "1"
-        if self.presence_fps_action_requested():
-            environment["GHOSTLOCK_PRESENCE_FPS_CAP"] = str(
-                self.presence_fps_cap
+        # Presence FPS phase ruling (Phase C2, from the code):
+        # the FPS cap install/restore write inside the aiservice
+        # app-private directory (install_presence_fps_cap /
+        # restore_presence_fps_cap, step 21) — the same wall as
+        # the profile — so on targets with a dedicated FPS phase
+        # (uid1000 installer credential) the cap keys belong to
+        # that phase, exactly like the profile. The restore keys
+        # are additionally owned by the presence phase, because a
+        # profile restore is what sets them when no FPS action is
+        # requested. Targets with neither credential have no
+        # dedicated phase: the main flow is the only carrier and
+        # keeps the keys. GHOSTLOCK_UID1000_PRESENCE_FPS is
+        # deliberately NOT gated: its consumers are the uid1000
+        # runtime feature configuration, not the app-private
+        # write, and the retained-FPS block below re-sets it from
+        # the on-device backup in the main flow by design.
+        fps_phase_owns_cap = private_uid1000_action or not (
+            self.target.uid1000_installer_credentials
+        )
+        fps_phase_owns_restore = (
+            private_uid1000_action
+            or private_presence_action
+            or not (
+                self.target.uid1000_installer_credentials
+                or self.target.presence_installer_credentials
             )
+        )
+        if self.presence_fps_action_requested():
+            if fps_phase_owns_cap:
+                environment["GHOSTLOCK_PRESENCE_FPS_CAP"] = str(
+                    self.presence_fps_cap
+                )
+                environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"] = "1"
             environment["GHOSTLOCK_UID1000_PRESENCE_FPS"] = str(
                 self.presence_fps_cap
             )
-            environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"] = "1"
         if self.restore_presence_fps or self.restore_presence_profile:
-            environment["GHOSTLOCK_RESTORE_PRESENCE_FPS"] = "1"
-            environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"] = "1"
+            if fps_phase_owns_restore:
+                environment["GHOSTLOCK_RESTORE_PRESENCE_FPS"] = "1"
+                environment["GHOSTLOCK_PRESENCE_REMOVE_KEY"] = "1"
         native_presence_prefs = self.uses_native_presence_prefs()
         if native_presence_prefs:
             environment["GHOSTLOCK_PRESENCE_NATIVE_PREFS"] = "1"
@@ -4278,13 +4533,18 @@ class PortalProvisioner:
                     ),
                 }
             )
-        if self.presence_fps_action_requested() and not native_presence_prefs:
+        if (
+            self.presence_fps_action_requested()
+            and not native_presence_prefs
+            and fps_phase_owns_cap
+        ):
             environment["GHOSTLOCK_PRESENCE_PREF_ACTION"] = (
                 f"set:{self.presence_fps_cap}"
             )
         if (
             (self.restore_presence_fps or self.restore_presence_profile)
             and not native_presence_prefs
+            and fps_phase_owns_restore
         ):
             environment["GHOSTLOCK_PRESENCE_PREF_ACTION"] = "restore"
         if self.remove_meta_accounts and not self.meta_accounts_already_clean:
@@ -4553,7 +4813,7 @@ class PortalProvisioner:
             expected_markers["ota_backend"] = ("OTA backend property", True)
         elif "GHOSTLOCK_OTA_BLOCK" in environment:
             expected_markers["ota_block"] = ("OTA block file install", True)
-        if self.enable_updates and self.ota_backend_value is None:
+        if "GHOSTLOCK_RESTORE_OTA_BLOCK" in environment:
             expected_markers["ota_restore"] = ("OTA block restore", True)
         if (
             self.optimize_presence
@@ -4564,22 +4824,34 @@ class PortalProvisioner:
                 "presence profile install",
                 True,
             )
-        if self.restore_presence_profile:
+        if (
+            self.restore_presence_profile
+            and "GHOSTLOCK_RESTORE_PRESENCE_PROFILE" in environment
+        ):
             expected_markers["presence_restore"] = (
                 "presence profile restore",
                 True,
             )
         if self.presence_fps_action_requested():
-            presence_marker = (
-                "PORTAL_PRESENCE_FPS_NATIVE action=set "
-                f"fps={self.presence_fps_cap}"
-                if self.uses_native_presence_prefs()
-                else f"PORTAL_PRESENCE_FPS action=set fps={self.presence_fps_cap}"
-            )
-            expected_markers["presence_fps"] = (
-                presence_marker,
-                True,
-            )
+            # The FPS cap marker is required only in the phase
+            # whose environment carries the cap action (Phase C2
+            # gating); the uid1000 markers stay config-based
+            # because GHOSTLOCK_UID1000_PRESENCE_FPS is carried in
+            # every phase by design.
+            if (
+                "GHOSTLOCK_PRESENCE_FPS_CAP" in environment
+                or "GHOSTLOCK_PRESENCE_PREF_ACTION" in environment
+            ):
+                presence_marker = (
+                    "PORTAL_PRESENCE_FPS_NATIVE action=set "
+                    f"fps={self.presence_fps_cap}"
+                    if self.uses_native_presence_prefs()
+                    else f"PORTAL_PRESENCE_FPS action=set fps={self.presence_fps_cap}"
+                )
+                expected_markers["presence_fps"] = (
+                    presence_marker,
+                    True,
+                )
             expected_markers["presence_uid1000_config"] = (
                 "UID1000 presence activation config",
                 True,
@@ -4592,7 +4864,12 @@ class PortalProvisioner:
                 "Battery ART boot hook",
                 True,
             )
-        if self.restore_presence_fps:
+        if (
+            self.restore_presence_fps or self.restore_presence_profile
+        ) and (
+            "GHOSTLOCK_RESTORE_PRESENCE_FPS" in environment
+            or "GHOSTLOCK_PRESENCE_PREF_ACTION" in environment
+        ):
             expected_markers["presence_fps_restore"] = (
                 (
                     "PORTAL_PRESENCE_FPS_NATIVE action=restore"
@@ -4601,16 +4878,6 @@ class PortalProvisioner:
                 ),
                 True,
             )
-        if self.restore_presence_profile:
-            expected_markers["presence_fps_restore"] = (
-                (
-                    "PORTAL_PRESENCE_FPS_NATIVE action=restore"
-                    if self.uses_native_presence_prefs()
-                    else "PORTAL_PRESENCE_FPS action=restore"
-                ),
-                True,
-            )
-        if self.restore_presence_fps or self.restore_presence_profile:
             expected_markers["presence_helper_key_remove"] = (
                 "Presence ADB key remove",
                 True,
@@ -5471,6 +5738,7 @@ class PortalProvisioner:
                 timeout=5,
             ).returncode == 0:
                 raise ProvisionError("UID-1000 presence activation config remains")
+        self._finalize_dns_state()
         if self.privacy_dns or self.dhcp_dns or self.restore_privacy_dns:
             self.verify_privacy_dns()
         if self.allow_app_updates or self.restore_app_verifier:
@@ -5716,6 +5984,7 @@ class PortalProvisioner:
         self._release_autoroot_guard(succeeded=True)
 
     def _provision_stages(self) -> None:
+        self._capture_start_state()
         resumed_pending = False
         if self.recover:
             self.verify_target(require_supported=False)
@@ -6327,36 +6596,11 @@ class PortalProvisioner:
                         "the dedicated Aloha presence FPS bootstrap did not verify"
                     )
                 self.write_state("pending")
-        if self.debloat and not self.debloat_already_configured:
-            self.apply_debloat()
-        if self.restore_bloat:
-            self.restore_debloat()
-        if self.block_remote_wipe and not self.remote_wipe_already_configured:
-            self.ensure_remote_wipe_backup()
-        if self.restore_remote_wipe:
-            self.read_remote_wipe_backup(required=True)
-        if self.needs_uid1000_payload():
-            if self.skip_build:
-                self.validate_uid1000_payload()
-            self.prepare_camera_light_install()
-        if self.disable_updates:
-            self.disable_ota_packages()
-        if self.disable_adb_auth_timeout:
-            self.disable_adb_authorization_timeout()
-        if self.restore_adb_auth_timeout:
-            self.restore_adb_authorization_timeout()
-        if self.privacy_dns:
-            self.apply_privacy_dns()
-        if self.dhcp_dns:
-            self.apply_dhcp_dns()
-        if self.restore_privacy_dns:
-            self.restore_private_dns()
-        if self.allow_app_updates:
-            self.allow_third_party_app_updates()
-        if self.restore_app_verifier:
-            self.restore_app_verifier_setting()
-        if self.needs_component_ctl():
-            self.prepare_component_actions()
+        self._apply_shell_level_state(
+            debloat_configured=self.debloat_already_configured,
+            remote_wipe_configured=self.remote_wipe_already_configured,
+            defer_dns=True,
+        )
 
         privileged_action = (
             self.persist_wireless_adb
@@ -6448,6 +6692,11 @@ class PortalProvisioner:
         if self.custom_payload is not None:
             try:
                 self.apply_custom_payload()
+                # The payload path ends without verify_requested_
+                # state(), so the deferred DNS apply and the
+                # recorded-state invariant take their post-race
+                # position here instead.
+                self._finalize_dns_state()
             finally:
                 if use_exploit_sentinel and not self.autoroot_staged():
                     self.uninstall_exploit_sentinel(best_effort=True)

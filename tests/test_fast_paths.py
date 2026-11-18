@@ -87,6 +87,10 @@ class FakeDevice:
         self.audio_marker = True
         self.audio_artifact = True
         self.aiservice = True
+        # The documented set records dhcp_dns, whose end state is
+        # Private DNS off with no specifier.
+        self.dns_mode = "off"
+        self.dns_specifier = "null"
 
     def adb_run(self, arguments, timeout=None, check=False):
         del timeout, check
@@ -130,6 +134,10 @@ class FakeDevice:
             return completed(arguments, "", 1)
         if "getprop persist.adb.tcp.port" in command:
             return completed(arguments, self.port + "\n")
+        if "settings get global private_dns_mode" in command:
+            return completed(arguments, self.dns_mode + "\n")
+        if "settings get global private_dns_specifier" in command:
+            return completed(arguments, self.dns_specifier + "\n")
         return completed(arguments, "", 1)
 
 
@@ -591,6 +599,267 @@ class RunFastPathTest(unittest.TestCase):
                 "PROVISION_NOOP_SKIP reason=actions-dhcp_dns",
                 stdout.getvalue(),
             )
+
+
+class DnsDevice:
+    """adb fake modelling the Private DNS settings store and the
+    on-device first-value backup file."""
+
+    def __init__(self, mode="off", specifier="null", backup=True):
+        self.mode = mode
+        self.specifier = specifier
+        self.backup = backup
+        self.writes: list = []
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        if "settings get global private_dns_mode" in command:
+            return completed(arguments, self.mode + "\n")
+        if "settings get global private_dns_specifier" in command:
+            return completed(arguments, self.specifier + "\n")
+        if "settings put global private_dns_mode" in command:
+            self.mode = arguments[-1]
+            self.writes.append(("mode", self.mode))
+            return completed(arguments)
+        if "settings put global private_dns_specifier" in command:
+            self.specifier = arguments[-1]
+            self.writes.append(("specifier", self.specifier))
+            return completed(arguments)
+        if "settings delete global private_dns_mode" in command:
+            self.mode = "null"
+            self.writes.append(("mode", "null"))
+            return completed(arguments)
+        if "settings delete global private_dns_specifier" in command:
+            self.specifier = "null"
+            self.writes.append(("specifier", "null"))
+            return completed(arguments)
+        if "portal-private-dns-before-v1.json" in command and "cat" in command:
+            if not self.backup:
+                return completed(arguments, "", 1)
+            return completed(
+                arguments,
+                json.dumps(
+                    {"schema": 1, "mode": "off", "hostname": "null"}
+                ),
+            )
+        return completed(arguments, "", 0)
+
+
+class RecordedDnsInvariantTest(unittest.TestCase):
+    """Phase C2: the Private DNS end-state invariant. The manifest
+    records the desired end state; every later run compares the
+    live state to the record, and drift is repaired, never passed
+    over — including by the no-op exit."""
+
+    def _provisioner(self, temporary: str, device: DnsDevice, **kwargs):
+        provisioner = make_provisioner(temporary, **kwargs)
+        provisioner.adb_run = device.adb_run
+        return provisioner
+
+    def test_expectation_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._provisioner(temporary, DnsDevice())
+            expect = provisioner._recorded_dns_expectation
+            self.assertEqual(
+                expect({"actions": {"dhcp_dns": True}}), ("off", "null")
+            )
+            self.assertEqual(
+                expect({"actions": {"privacy_dns": "Family.Example.com"}}),
+                ("hostname", "family.example.com"),
+            )
+            self.assertIsNone(expect({"actions": {"audio": True}}))
+            self.assertIsNone(expect({"actions": {}}))
+            self.assertIsNone(expect(None))
+            self.assertIsNone(expect({}))
+            provisioner.read_private_dns_backup = lambda: {
+                "schema": 1,
+                "mode": "hostname",
+                "hostname": "dns.example.org",
+            }
+            self.assertEqual(
+                expect({"actions": {"restore_privacy_dns": True}}),
+                ("hostname", "dns.example.org"),
+            )
+            provisioner.read_private_dns_backup = lambda: None
+            self.assertIsNone(
+                expect({"actions": {"restore_privacy_dns": True}})
+            )
+
+    def test_verify_repairs_recorded_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = DnsDevice(mode="hostname", specifier="one.one.one.one")
+            provisioner = self._provisioner(temporary, device)
+            provisioner._start_state = {"actions": {"dhcp_dns": True}}
+            provisioner._start_state_captured = True
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.verify_requested_state()
+            self.assertEqual(device.mode, "off")
+            self.assertEqual(device.specifier, "null")
+            output = stdout.getvalue()
+            self.assertIn("PRIVACY_DNS_DRIFT", output)
+            self.assertIn("PRIVACY_DNS_REPAIRED", output)
+
+    def test_verify_channel_repairs_recorded_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = DnsDevice(mode="hostname", specifier="one.one.one.one")
+            provisioner = self._provisioner(temporary, device)
+            provisioner._start_state = {"actions": {"dhcp_dns": True}}
+            provisioner._start_state_captured = True
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state(via_channel=True)
+            self.assertEqual(device.mode, "off")
+            self.assertEqual(device.specifier, "null")
+
+    def test_verify_passes_when_recorded_state_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = DnsDevice()
+            provisioner = self._provisioner(temporary, device)
+            provisioner._start_state = {"actions": {"dhcp_dns": True}}
+            provisioner._start_state_captured = True
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.verify_requested_state()
+            self.assertEqual(device.writes, [])
+            self.assertIn("PRIVACY_DNS_RECORDED_OK", stdout.getvalue())
+
+    def test_verify_skips_when_nothing_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = DnsDevice(mode="hostname", specifier="one.one.one.one")
+            provisioner = self._provisioner(temporary, device)
+            provisioner._start_state = {"actions": {"audio": True}}
+            provisioner._start_state_captured = True
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.verify_requested_state()
+            self.assertEqual(device.writes, [])
+            self.assertNotIn("PRIVACY_DNS", stdout.getvalue())
+
+    def test_deferred_apply_flushes_instead_of_invariant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = DnsDevice(mode="hostname", specifier="one.one.one.one")
+            provisioner = self._provisioner(temporary, device, dhcp_dns=True)
+            provisioner._start_state = {"actions": {"dhcp_dns": True}}
+            provisioner._start_state_captured = True
+            provisioner._dns_apply_deferred = True
+            applied: list = []
+            provisioner.apply_dhcp_dns = lambda: applied.append("dhcp")
+            provisioner.verify_privacy_dns = lambda: applied.append("verify")
+            with redirect_stdout(io.StringIO()):
+                provisioner.verify_requested_state()
+            self.assertEqual(applied, ["dhcp", "verify"])
+            self.assertFalse(provisioner._dns_apply_deferred)
+            self.assertEqual(device.writes, [])
+
+    def test_noop_blocked_by_dns_drift_takes_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(temporary)
+            device.dns_mode = "hostname"
+            device.dns_specifier = "one.one.one.one"
+            provisioner.read_state = lambda: good_state(provisioner)
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, ["dns-drift"])
+            self.assertEqual(
+                provisioner._dns_repair_expectation, ("off", "null")
+            )
+            output = stdout.getvalue()
+            self.assertIn("PRIVACY_DNS_DRIFT", output)
+            self.assertIn("PROVISION_NOOP_SKIP reason=dns-drift", output)
+            self.assertNotIn("PROVISION_NOOP reason=", output)
+
+
+class SharedApplySequenceTest(unittest.TestCase):
+    """Phase C2 item 1: the stages path and the channel path run
+    one shared shell-level apply sequence. These tests pin the
+    order, the two skip sources, and the stages path's DNS defer."""
+
+    SEQUENCE_KWARGS = dict(
+        debloat=True,
+        restore_bloat=True,
+        block_remote_wipe=True,
+        restore_remote_wipe=True,
+        disable_updates=True,
+        disable_adb_auth_timeout=True,
+        restore_adb_auth_timeout=True,
+        privacy_dns="family.example.com",
+        dhcp_dns=True,
+        restore_privacy_dns=True,
+        allow_app_updates=True,
+        restore_app_verifier=True,
+    )
+    APPLIES = (
+        "apply_debloat",
+        "restore_debloat",
+        "ensure_remote_wipe_backup",
+        "read_remote_wipe_backup",
+        "disable_ota_packages",
+        "disable_adb_authorization_timeout",
+        "restore_adb_authorization_timeout",
+        "apply_privacy_dns",
+        "apply_dhcp_dns",
+        "restore_private_dns",
+        "allow_third_party_app_updates",
+        "restore_app_verifier_setting",
+        "prepare_component_actions",
+    )
+
+    def _instrumented(self, temporary: str):
+        provisioner = make_provisioner(temporary, **self.SEQUENCE_KWARGS)
+        calls: list = []
+        for name in self.APPLIES:
+            setattr(
+                provisioner,
+                name,
+                (lambda recorded: lambda *a, **k: calls.append(recorded))(
+                    name
+                ),
+            )
+        provisioner.needs_uid1000_payload = lambda: False
+        provisioner.needs_component_ctl = lambda: True
+        return provisioner, calls
+
+    def test_full_sequence_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, calls = self._instrumented(temporary)
+            provisioner._apply_shell_level_state(
+                debloat_configured=False,
+                remote_wipe_configured=False,
+                defer_dns=False,
+            )
+            self.assertEqual(calls, list(self.APPLIES))
+            self.assertFalse(provisioner._dns_apply_deferred)
+
+    def test_configured_skips_and_dns_defer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, calls = self._instrumented(temporary)
+            provisioner._apply_shell_level_state(
+                debloat_configured=True,
+                remote_wipe_configured=True,
+                defer_dns=True,
+            )
+            self.assertEqual(
+                calls,
+                [
+                    name
+                    for name in self.APPLIES
+                    if name
+                    not in (
+                        "apply_debloat",
+                        "ensure_remote_wipe_backup",
+                        "apply_privacy_dns",
+                        "apply_dhcp_dns",
+                        "restore_private_dns",
+                    )
+                ],
+            )
+            self.assertTrue(provisioner._dns_apply_deferred)
 
 
 class ForceTest(unittest.TestCase):
