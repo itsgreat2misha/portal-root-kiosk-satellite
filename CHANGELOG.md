@@ -101,6 +101,17 @@ the fork diverged from upstream:
   anything was killed. A win verdict is still never cut, the
   600 s timeout remains the backstop, and verdict accounting
   is unchanged. Autoroot helper 1.10 (versionCode 11).
+- The orphan sweep's ps snapshot read the COMM column, which
+  on this device's toybox ps carries the executable name, not
+  the task name: the /system/bin/true host reported as
+  "toybox" (its exe resolves to the toybox binary), so the
+  sweep's kill set was always empty against a real wedged
+  tree. Invisible while the sweep only ran after a stall had
+  already ended; the win-stall sweep above exposed it on its
+  first live run against a live tree, logging empty kill sets
+  while the tree stood in ps under NAME as "true". The
+  snapshot now reads the NAME column. Autoroot helper 1.11
+  (versionCode 12).
 - The autoroot guard's restore could print
   `AUTOROOT_GUARD_RESTORED` over a disable flag that was still
   on disk: issued into an adbd disruption (Run 34), its rm never
