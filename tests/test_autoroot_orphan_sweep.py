@@ -14,6 +14,13 @@ hand. The service now sweeps the attempt's leftover tree after
 every attempt's verdict, and the handoff wait is bounded by a
 wall-clock deadline with a re-sweep and exactly one retry.
 
+Snapshot column (2026-11-18, found by the C1b win-stall sweep's
+first live run against a live tree): the sweep's ps snapshot
+must use the NAME column. This device's toybox ps prints the
+executable name in COMM - the /system/bin/true host reports as
+"toybox" - so a COMM snapshot never matches the policy's task
+names and the kill set was always empty against a real wedge.
+
 The kill-set policy is pure Java (OrphanSweep). When a JDK is
 available these tests compile and execute the real decision
 table; the source-shape tests always run and pin the wiring:
@@ -67,7 +74,7 @@ public final class SweepHarness {
         // children, the root daemon hanging off the same tree
         // (excluded, and its own child not traversed), an
         // unrelated shell and the service itself.
-        String wedged = "PID PPID COMM\\n"
+        String wedged = "PID PPID NAME\\n"
                 + "1 0 init\\n"
                 + "900 1 sh\\n"
                 + "1000 900 true\\n"
@@ -81,7 +88,7 @@ public final class SweepHarness {
         checkSet(wedged, 2000, "wedged tree", 1000, 1001, 1002, 1003);
 
         // Clean attempt: no true processes at all, nothing to do.
-        String clean = "PID PPID COMM\\n"
+        String clean = "PID PPID NAME\\n"
                 + "1 0 init\\n"
                 + "1200 1 shizuku_server\\n"
                 + "1300 1 portal-root-dae\\n";
@@ -167,7 +174,13 @@ class SweepWiringTest(unittest.TestCase):
         self.assertLess(attempt_at, sweep_at)
         self.assertLess(sweep_at, daemon_wait_at)
         self.assertIn("kill -9", self.service)
-        self.assertIn('shell("ps -A -o pid,ppid,comm")', self.service)
+        # The snapshot column is NAME, never COMM: this device's
+        # toybox ps prints the executable name in COMM ("toybox"
+        # for the /system/bin/true host), so a COMM snapshot can
+        # never match the policy's task names (found live by the
+        # C1b win-stall sweep, 2026-11-18).
+        self.assertIn('shell("ps -A -o pid,ppid,name")', self.service)
+        self.assertNotIn('shell("ps -A -o pid,ppid,comm")', self.service)
 
     def test_handoff_is_bounded_with_one_retry(self) -> None:
         self.assertIn("HANDOFF_WAIT_MS = 120_000L", self.service)
@@ -187,8 +200,8 @@ class SweepWiringTest(unittest.TestCase):
 
     def test_helper_version_bumped(self) -> None:
         manifest = MANIFEST_XML.read_text(encoding="utf-8")
-        self.assertIn('android:versionCode="11"', manifest)
-        self.assertIn('android:versionName="1.10"', manifest)
+        self.assertIn('android:versionCode="12"', manifest)
+        self.assertIn('android:versionName="1.11"', manifest)
 
 
 if __name__ == "__main__":

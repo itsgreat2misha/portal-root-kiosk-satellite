@@ -54,8 +54,11 @@ final class OrphanSweep {
     }
 
     /**
-     * Selects the pids to kill from `ps -A -o pid,ppid,comm`
-     * output. Malformed lines (including the header) are ignored.
+     * Selects the pids to kill from `ps -A -o pid,ppid,name`
+     * output (the caller must ask ps for the NAME column: the
+     * COMM column on this device's toybox ps carries the
+     * executable name, "toybox" for the true host, not the task
+     * name). Malformed lines (including the header) are ignored.
      * Returns the kill set sorted ascending, possibly empty.
      */
     static List<Integer> selectKillPids(String psOutput, int selfPid) {

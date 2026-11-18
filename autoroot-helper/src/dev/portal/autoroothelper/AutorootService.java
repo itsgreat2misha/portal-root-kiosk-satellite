@@ -1041,7 +1041,16 @@ public final class AutorootService extends Service {
      */
     private List<Integer> sweepAttemptOrphans(String when) {
         try {
-            String ps = shell("ps -A -o pid,ppid,comm");
+            // The snapshot must read the NAME column, not COMM:
+            // this device's toybox ps prints the executable name
+            // in COMM (the /system/bin/true host reports as
+            // "toybox", since its exe resolves to the toybox
+            // binary), while NAME is the kernel task name the
+            // OrphanSweep policy matches on ("true"). With COMM
+            // the kill set was always empty against a real wedged
+            // tree - invisible until the C1b win-stall sweep first
+            // ran while the tree was alive (2026-11-18).
+            String ps = shell("ps -A -o pid,ppid,name");
             List<Integer> kill = OrphanSweep.selectKillPids(
                     ps, android.os.Process.myPid());
             if (kill.isEmpty()) {
