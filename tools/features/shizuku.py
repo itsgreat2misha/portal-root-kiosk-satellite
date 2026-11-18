@@ -37,6 +37,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
 SHIZUKU_HELPER_PACKAGE = "dev.portal.shizukuhelper"
+# The autoroot helper holds its own copy of this same keypair (staged
+# from the Shizuku helper's pair, which the install loop authorized).
+# When the Shizuku helper has no pair, install seeds it from the
+# autoroot helper's copy before generating a fresh one, so the pair
+# converges on the already-authorized key instead of rotating to a
+# key no race has authorized. The package name is pinned to
+# features.payload's AUTOROOT_HELPER_PACKAGE by a test, like the
+# other names in SIGNATURE_MISMATCH_RETRY_PACKAGES below.
+AUTOROOT_HELPER_PACKAGE = "dev.portal.autoroothelper"
 # Packages this project builds and signs itself whose installed copy can
 # predate the current build host's keystore (a device provisioned by an
 # older build). Android refuses signature-changing updates, so for these
@@ -50,7 +59,7 @@ SIGNATURE_MISMATCH_RETRY_PACKAGES = frozenset(
     {
         SHIZUKU_HELPER_PACKAGE,
         "dev.portal.exploitsentinel",
-        "dev.portal.autoroothelper",
+        AUTOROOT_HELPER_PACKAGE,
         "dev.portal.presencehelper",
     }
 )
@@ -102,6 +111,14 @@ class ShizukuFeature:
         self._verify_package_verifier_state = verify_package_verifier_state
         self.shizuku_apk = shizuku_apk
         self.shizuku_public_key: pathlib.Path | None = None
+        # Where the pair install_shizuku_payload ended up with came
+        # from: "existing" (the helper already held it), "autoroot-seed"
+        # (copied from the autoroot helper's already-authorized pair),
+        # or "keygen" (freshly generated; no race has authorized it
+        # yet). The channel apply path refuses to stage a "keygen"
+        # pair: it cannot authorize one, and staging it would strand
+        # autoroot recovery on a key adb_keys does not hold.
+        self.shizuku_key_source: str | None = None
         self.package_verifier_before_install_disabled: bool | None = None
 
 
@@ -154,6 +171,58 @@ class ShizukuFeature:
             raise ProvisionError(f"invalid Shizuku APK: {path}") from exc
         return path
 
+    def _read_helper_keypair(
+        self, package: str
+    ) -> tuple[str, str] | None:
+        """The ADB keypair a helper app holds, or None when it holds
+        no complete, well-formed pair."""
+        private_key = self._adb_run(
+            ["exec-out", "run-as", package, "cat", "files/adbkey"],
+            timeout=10,
+        ).stdout
+        public_key = self._adb_run(
+            ["exec-out", "run-as", package, "cat", "files/adbkey.pub"],
+            timeout=10,
+        ).stdout.strip()
+        if (
+            "-----BEGIN PRIVATE KEY-----" in private_key
+            and "-----END PRIVATE KEY-----" in private_key
+            and re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", public_key)
+            is not None
+        ):
+            return private_key, public_key
+        return None
+
+    def _push_keypair_into_shizuku_helper(
+        self, private_path: pathlib.Path, public_path: pathlib.Path
+    ) -> None:
+        for source, remote, destination in (
+            (private_path, "/data/local/tmp/portal-shizuku-key.tmp", "files/adbkey"),
+            (
+                public_path,
+                "/data/local/tmp/portal-shizuku-key.pub.tmp",
+                "files/adbkey.pub",
+            ),
+        ):
+            self._adb_run(["push", str(source), remote], timeout=15, check=True)
+            self._adb_run(["shell", "chmod", "0644", remote], timeout=5, check=True)
+            self._adb_run(
+                ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "mkdir", "-p", "files"],
+                timeout=10,
+                check=True,
+            )
+            self._adb_run(
+                ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "cp", remote, destination],
+                timeout=10,
+                check=True,
+            )
+            self._adb_run(
+                ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "chmod", "0600", destination],
+                timeout=10,
+                check=True,
+            )
+            self._adb_run(["shell", "rm", "-f", remote], timeout=5)
+
     def install_shizuku_payload(self) -> None:
         apk = self._resolve_shizuku_apk()
         self._install_apk_preserving_verifier(apk, "shizuku", SHIZUKU_PACKAGE)
@@ -174,62 +243,40 @@ class ShizukuFeature:
                 f"installed Shizuku version is not {SHIZUKU_VERSION}"
             )
 
-        private_key = self._adb_run(
-            [
-                "exec-out",
-                "run-as",
-                SHIZUKU_HELPER_PACKAGE,
-                "cat",
-                "files/adbkey",
-            ],
-            timeout=10,
-        ).stdout
-        existing_public = self._adb_run(
-            [
-                "exec-out",
-                "run-as",
-                SHIZUKU_HELPER_PACKAGE,
-                "cat",
-                "files/adbkey.pub",
-            ],
-            timeout=10,
-        ).stdout.strip()
         key_exists = (
-            "-----BEGIN PRIVATE KEY-----" in private_key
-            and "-----END PRIVATE KEY-----" in private_key
-            and re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", existing_public)
-            is not None
+            self._read_helper_keypair(SHIZUKU_HELPER_PACKAGE) is not None
         )
-        if not key_exists:
+        if key_exists:
+            self.shizuku_key_source = "existing"
+        else:
+            # The helper holds no pair — the normal state after
+            # autoroot staging removed the helper app. Before
+            # generating a fresh pair (which no race has authorized,
+            # and which a channel apply cannot authorize), seed the
+            # helper from the autoroot helper's copy: that pair is
+            # the one already authorized in adb_keys, so the run
+            # converges on the authorized key instead of rotating
+            # away from it.
+            seeded = self._read_helper_keypair(AUTOROOT_HELPER_PACKAGE)
             with tempfile.TemporaryDirectory(prefix="portal-shizuku-key-") as temp:
                 key = pathlib.Path(temp) / "adbkey"
-                self._run(["adb", "keygen", str(key)], timeout=30, check=True)
-                for source, remote, destination in (
-                    (key, "/data/local/tmp/portal-shizuku-key.tmp", "files/adbkey"),
-                    (
-                        pathlib.Path(str(key) + ".pub"),
-                        "/data/local/tmp/portal-shizuku-key.pub.tmp",
-                        "files/adbkey.pub",
-                    ),
-                ):
-                    self._adb_run(["push", str(source), remote], timeout=15, check=True)
-                    self._adb_run(["shell", "chmod", "0644", remote], timeout=5, check=True)
-                    self._adb_run(
-                        ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "mkdir", "-p", "files"],
-                        timeout=10,
-                        check=True,
+                public_path = pathlib.Path(str(key) + ".pub")
+                if seeded is not None:
+                    key.write_text(seeded[0], encoding="utf-8")
+                    public_path.write_text(seeded[1] + "\n", encoding="utf-8")
+                    self.shizuku_key_source = "autoroot-seed"
+                else:
+                    self._run(
+                        ["adb", "keygen", str(key)], timeout=30, check=True
                     )
-                    self._adb_run(
-                        ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "cp", remote, destination],
-                        timeout=10,
-                        check=True,
-                    )
-                    self._adb_run(
-                        ["shell", "run-as", SHIZUKU_HELPER_PACKAGE, "chmod", "0600", destination],
-                        timeout=10,
-                        check=True,
-                    )
-                    self._adb_run(["shell", "rm", "-f", remote], timeout=5)
+                    self.shizuku_key_source = "keygen"
+                self._push_keypair_into_shizuku_helper(key, public_path)
+            if seeded is not None:
+                print(
+                    "SHIZUKU_KEY_SEEDED source=autoroot-helper "
+                    "reason=already-authorized",
+                    flush=True,
+                )
 
         public = self._adb_run(
             [

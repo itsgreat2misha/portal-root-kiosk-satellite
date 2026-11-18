@@ -21,6 +21,7 @@ environment builder reads it on the provisioner).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import pathlib
 import re
 import shlex
@@ -31,7 +32,10 @@ import time
 from typing import Callable
 
 from device_session import ProvisionError
-from features.shizuku import SHIZUKU_HELPER_PACKAGE
+from features.shizuku import (
+    SHIZUKU_HELPER_PACKAGE,
+    SHIZUKU_SAVED_KEY_REMOTE,
+)
 from portal_targets import PortalTarget
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -122,6 +126,11 @@ class PayloadFeature:
         self.uid1000_runtime_apk_remote: str | None = None
         self.uid1000_runtime_library_remote: str | None = None
         self.uid1000_runtime_package_installed = False
+        # SHA-256 of the public key stage_autoroot_payload last
+        # copied into the autoroot helper; the provisioner records
+        # it in the run manifest so a later authorization failure is
+        # attributable to a key generation at a glance.
+        self.staged_autoroot_key_sha256: str | None = None
 
     @property
     def _config(self) -> PayloadConfig:
@@ -472,6 +481,58 @@ class PayloadFeature:
             line.strip() == "OTA_NODEMON=1" for line in existing.splitlines()
         )
 
+    def _verify_keypair_to_stage_is_authorized(self) -> str | None:
+        """Return the public key staging is about to copy into the
+        autoroot helper, refusing a pair that was never authorized.
+
+        The saved-marker file holds the last public key a race win
+        authorized (pushed by finalize_buffered_shizuku_key on
+        buffered targets, saved by the native authorize itself on
+        the others), so it is updated in the same run that
+        authorizes a new pair, before staging can run. A pair that
+        differs from the marker was therefore never authorized —
+        staging it would leave the autoroot helper holding a key
+        adb_keys does not contain, and recovery would die on its
+        first unguarded boot with "key is not authorized". Fail
+        loudly instead; on the channel path this raise is what
+        routes the run back to the race, whose install loop can
+        authorize the pair. With no marker there is no recorded
+        authorization to contradict (first provision, or after
+        --remove-shizuku deleted it), and the comparison is skipped;
+        it is likewise skipped when the helper's key does not read
+        back in the well-formed shape install validates, which is
+        install's failure to surface, not staging's. This is a pure
+        host-side file comparison: the shell-domain root channel
+        cannot read adb_keys itself.
+        """
+        public = self._adb_run(
+            [
+                "exec-out",
+                "run-as",
+                SHIZUKU_HELPER_PACKAGE,
+                "cat",
+                "files/adbkey.pub",
+            ],
+            timeout=10,
+        ).stdout.strip()
+        if not re.fullmatch(r"[A-Za-z0-9+/=]+ [^\r\n]+", public):
+            return None
+        marker = self._adb_run(
+            ["shell", "cat", SHIZUKU_SAVED_KEY_REMOTE],
+            timeout=10,
+        ).stdout.strip()
+        if marker and marker != public:
+            raise ProvisionError(
+                "autoroot staging would copy an ADB keypair that "
+                "was never authorized: staged key sha256="
+                f"{hashlib.sha256(public.encode('utf-8')).hexdigest()} "
+                "does not match the last authorized key sha256="
+                f"{hashlib.sha256(marker.encode('utf-8')).hexdigest()} "
+                f"({SHIZUKU_SAVED_KEY_REMOTE}); a race win must "
+                "authorize the new key before it can be staged"
+            )
+        return public
+
     def stage_autoroot_payload(self) -> None:
         """Stage the on-device autoroot runner and its boot helper.
 
@@ -533,7 +594,16 @@ class PayloadFeature:
         self._verify_package_verifier_state()
         # Give the boot helper the Shizuku helper's ADB keypair: that
         # public key is already authorized on the device, so the helper
-        # can drive loopback ADB without another privileged grant.
+        # can drive loopback ADB without another privileged grant. The
+        # check enforces the "already authorized" half of that claim:
+        # install can rotate the pair (a fresh keygen when neither
+        # helper held one), and a rotated pair is authorized only
+        # once a race win has run for it in this run.
+        staged_public = self._verify_keypair_to_stage_is_authorized()
+        if staged_public is not None:
+            self.staged_autoroot_key_sha256 = hashlib.sha256(
+                staged_public.encode("utf-8")
+            ).hexdigest()
         for name in ("adbkey", "adbkey.pub"):
             staged = f"/data/local/tmp/portal-autoroot-{name}.tmp"
             self._adb_run(
@@ -582,6 +652,12 @@ class PayloadFeature:
                 check=True,
             )
             self._adb_run(["shell", "rm", "-f", staged], timeout=5)
+        if self.staged_autoroot_key_sha256 is not None:
+            print(
+                "AUTOROOT_KEY_STAGED "
+                f"sha256={self.staged_autoroot_key_sha256}",
+                flush=True,
+            )
         self._adb_run(
             ["shell", "mkdir", "-p", AUTOROOT_REMOTE_DIR],
             timeout=5,

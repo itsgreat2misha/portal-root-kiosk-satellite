@@ -105,6 +105,22 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The Shizuku/autoroot ADB keypair could rotate away from the
+  authorized key and strand recovery: the two helpers share one
+  keypair, autoroot staging removes the Shizuku helper, and the
+  next run's install generated a fresh pair — which a root-channel
+  apply then staged into the autoroot helper with no authorization
+  (the channel cannot write adb_keys), so the next unguarded boot
+  failed with "Portal helper ADB key is not authorized". Install
+  now seeds the Shizuku helper from the autoroot helper's
+  already-authorized pair before generating a new one; a channel
+  apply that still ends up with a freshly generated pair falls
+  back to the race run instead of staging it; autoroot staging
+  compares the pair it is about to copy against the saved marker
+  (the last authorized public key) and fails loudly on a mismatch;
+  and the staged pair's SHA-256 is recorded in the run manifest
+  (`autoroot_key_sha256`) and shown by `--status`, so a future
+  authorization failure names the key generation that was live.
 - A winning autoroot attempt whose process tree wedged (spinning
   or ptrace-stopped) held the Shizuku handoff for ~13 minutes
   until the processes happened to exit: the service now sweeps
