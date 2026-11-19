@@ -381,21 +381,29 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         setattr(args, attribute, False)
     for name in args.restore:
         setattr(args, RESTORE_FLAG_MAP[name], True)
-    # --dns replaces --dhcp-dns / --privacy-dns: "off" is the DHCP
-    # mode, anything else is the resolver hostname.
     args.privacy_dns = None
     args.dhcp_dns = False
+    # --full expands to exactly the documented full-setup line.
+    if args.full:
+        for attribute, value in FULL_PRESET.items():
+            setattr(args, attribute, value)
+    # --dns replaces --dhcp-dns / --privacy-dns: "off" is the DHCP
+    # mode, anything else is the resolver hostname. An explicit
+    # --dns also replaces the --full preset's DNS component: the
+    # pair is reset before the value is applied, so a composed
+    # config never carries two contradictory DNS intents (the
+    # applies, the verify, the manifest recording and the
+    # recorded-state readers all key off this pair and cannot
+    # agree on one that holds both).
     if args.dns is not None:
+        args.privacy_dns = None
+        args.dhcp_dns = False
         if args.dns.lower() == "off":
             args.dhcp_dns = True
         elif args.dns.strip():
             args.privacy_dns = args.dns
         else:
             parser.error("--dns needs 'off' or a resolver hostname")
-    # --full expands to exactly the documented full-setup line.
-    if args.full:
-        for attribute, value in FULL_PRESET.items():
-            setattr(args, attribute, value)
     # Apply/restore pairs for one feature stay mutually exclusive,
     # as they were when each pair had its own flag group.
     for apply_attribute, restore_name, apply_label in (
