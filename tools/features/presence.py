@@ -73,6 +73,11 @@ SYSTEM_THEME_PROPERTY = "debug.portal.system_theme"
 SYSTEM_THEME_SETTING = "ui_night_mode"
 SYSTEM_THEME_CONTROL_MARKER = "system-theme-control-enabled"
 SYSTEM_THEME_BACKUP_REMOTE = "/data/local/tmp/portal-system-theme-before-v1.json"
+# ui_night_mode value -> `cmd uimode night` argument / manager state.
+UIMODE_NIGHT_BY_SETTING_VALUE = {"0": "auto", "1": "no", "2": "yes"}
+# The manager state an ABSENT ui_night_mode key represents: at
+# boot, with no key, UiModeManager falls back to night off.
+UIMODE_ABSENT_KEY_MANAGER_STATE = "no"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -181,6 +186,48 @@ class PresenceFeature:
         return self._config_factory()
 
 
+    def _shell_uimode_transport(self) -> bool:
+        """True where the theme end state is driven through
+        `cmd uimode` — every target except the UID-1000 ones,
+        matching the transport choice in apply_system_theme_request."""
+        target = self._target()
+        return not (target and target.system_theme_uid1000_required)
+
+    def _read_uimode_night_state(self) -> str | None:
+        """The manager-side night state from `cmd uimode night`:
+        "yes" / "no" / "auto", or None when unreadable."""
+        result = self._adb_run(
+            ["shell", "cmd", "uimode", "night"], timeout=5
+        )
+        match = re.search(
+            r"Night mode:\s*(yes|no|auto)", result.stdout or ""
+        )
+        return match.group(1) if match else None
+
+    def _set_uimode_night(self, night_arg: str, expected_key: str) -> None:
+        """Drive UiModeManager to night_arg through `cmd uimode`
+        so the manager state and the ui_night_mode key land
+        together (the transport writes the key itself). A
+        same-state `cmd uimode night` call is a no-op that never
+        rewrites the key, so when the manager already reports
+        the target state but the key disagrees, transition
+        through the opposite state first to force a real one."""
+        if (
+            self._read_uimode_night_state() == night_arg
+            and self._read_system_theme_setting() != expected_key
+        ):
+            intermediate = "yes" if night_arg == "no" else "no"
+            self._adb_run(
+                ["shell", "cmd", "uimode", "night", intermediate],
+                timeout=10,
+                check=True,
+            )
+        self._adb_run(
+            ["shell", "cmd", "uimode", "night", night_arg],
+            timeout=10,
+            check=True,
+        )
+
     def apply_system_theme_request(self) -> None:
         if self._config.system_theme_control not in {"light", "dark"}:
             raise ProvisionError("system theme must be light or dark")
@@ -217,11 +264,8 @@ class PresenceFeature:
             transport = "uid1000-property"
         else:
             night_mode = "yes" if self._config.system_theme_control == "dark" else "no"
-            self._adb_run(
-                ["shell", "cmd", "uimode", "night", night_mode],
-                timeout=10,
-                check=True,
-            )
+            expected_key = "2" if self._config.system_theme_control == "dark" else "1"
+            self._set_uimode_night(night_mode, expected_key)
             transport = "shell-uimode"
         print(
             "SYSTEM_THEME_REQUEST "
@@ -247,8 +291,12 @@ class PresenceFeature:
             raise ProvisionError("UID-1000 system theme control is not installed")
 
         expected = "2" if self._config.system_theme_control == "dark" else "1"
+        expected_manager = (
+            "yes" if self._config.system_theme_control == "dark" else "no"
+        )
         deadline = time.monotonic() + wait_seconds
         observed = ""
+        manager = ""
         process = ""
         helper_log = ""
         while time.monotonic() < deadline:
@@ -256,6 +304,12 @@ class PresenceFeature:
                 ["shell", "settings", "get", "secure", SYSTEM_THEME_SETTING],
                 timeout=5,
             ).stdout.strip()
+            if not uid1000_required:
+                # The key alone is not proof on shell-uimode
+                # targets: the manager state must agree, or the
+                # pair is diverged and a later same-state apply
+                # would no-op against it.
+                manager = self._read_uimode_night_state() or ""
             if uid1000_required:
                 processes = self._adb_run(
                     ["shell", "ps", "-A", "-o", "USER,PID,PPID,NAME,ARGS"],
@@ -289,6 +343,7 @@ class PresenceFeature:
             )
             if (
                 observed == expected
+                and (manager == expected_manager or uid1000_required)
                 and (process or not uid1000_required)
                 and runtime_verified
             ):
@@ -299,10 +354,25 @@ class PresenceFeature:
                 )
                 return
             time.sleep(1)
-        raise ProvisionError(
-            "system theme request did not apply: "
+        detail = (
             f"expected={expected} observed={observed!r} process={process!r} "
             f"helper_log={helper_log[-1000:]!r}"
+        )
+        if not uid1000_required:
+            detail += (
+                f" manager={manager!r} "
+                f"expected_manager={expected_manager!r}"
+            )
+            implied_manager = UIMODE_NIGHT_BY_SETTING_VALUE.get(
+                observed, UIMODE_ABSENT_KEY_MANAGER_STATE
+            )
+            if implied_manager != manager:
+                detail += (
+                    " (ui_night_mode key and UiModeManager state "
+                    "diverged)"
+                )
+        raise ProvisionError(
+            f"system theme request did not apply: {detail}"
         )
 
     def system_theme_control_preflight(self) -> bool:
@@ -389,9 +459,26 @@ class PresenceFeature:
     def restore_system_theme(self) -> None:
         """Two-tier restore: replay the recorded ui_night_mode; with
         no record, return to the factory default — the key ABSENT
-        (verified fleet-wide on stock devices), so delete it."""
+        (verified fleet-wide on stock devices), so delete it. On
+        shell-uimode targets both tiers drive the end state
+        through the uimode transport: writing or deleting the key
+        alone never transitions UiModeManager, so the manager
+        would stay wherever the last apply left it and the pair
+        would verify on the key while diverged — and a later
+        same-state apply then no-ops against that manager."""
         recorded, value = self._recorded_system_theme()
-        if value is not None:
+        if (
+            value is not None
+            and self._shell_uimode_transport()
+            and value in UIMODE_NIGHT_BY_SETTING_VALUE
+        ):
+            # The transport writes the key itself as it drives
+            # the manager to the recorded mode.
+            self._set_uimode_night(
+                UIMODE_NIGHT_BY_SETTING_VALUE[value], value
+            )
+            source = "recorded"
+        elif value is not None:
             self._adb_run(
                 [
                     "shell", "settings", "put", "secure",
@@ -402,6 +489,24 @@ class PresenceFeature:
             )
             source = "recorded"
         else:
+            if self._shell_uimode_transport() and (
+                self._read_uimode_night_state()
+                != UIMODE_ABSENT_KEY_MANAGER_STATE
+            ):
+                # Transition the manager to the state an absent
+                # key represents (its boot-time default) BEFORE
+                # deleting the key: the transport writes the key
+                # as it transitions, and the delete then leaves
+                # the pair in the stock shape — key absent,
+                # manager at the default.
+                self._adb_run(
+                    [
+                        "shell", "cmd", "uimode", "night",
+                        UIMODE_ABSENT_KEY_MANAGER_STATE,
+                    ],
+                    timeout=10,
+                    check=True,
+                )
             self._adb_run(
                 ["shell", "settings", "delete", "secure", SYSTEM_THEME_SETTING],
                 timeout=5,
@@ -421,6 +526,22 @@ class PresenceFeature:
                 "system theme was not restored: "
                 f"expected={value!r} observed={observed!r}"
             )
+        if self._shell_uimode_transport():
+            expected_manager = (
+                UIMODE_ABSENT_KEY_MANAGER_STATE
+                if value is None
+                else UIMODE_NIGHT_BY_SETTING_VALUE.get(value)
+            )
+            if expected_manager is not None:
+                manager = self._read_uimode_night_state()
+                if manager != expected_manager:
+                    raise ProvisionError(
+                        "system theme restore left the "
+                        "ui_night_mode key and UiModeManager state "
+                        f"diverged: key={observed!r} "
+                        f"manager={manager!r} "
+                        f"expected_manager={expected_manager!r}"
+                    )
 
     def presence_preflight(self) -> bool:
         marker_present = self._adb_run(

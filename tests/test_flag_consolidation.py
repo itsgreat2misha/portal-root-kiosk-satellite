@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import cli as cli_module  # noqa: E402
 import provision_portal as provision_portal_module  # noqa: E402
+from device_session import ProvisionError  # noqa: E402
 from features.presence import (  # noqa: E402
     PresenceConfig,
     PresenceFeature,
@@ -402,10 +403,12 @@ class OtaPackageRecordTest(unittest.TestCase):
             self.assertFalse(any("pm disable-user" in call for call in joined))
 
 
-def make_presence_feature(adb_run, push_text_atomic) -> PresenceFeature:
+def make_presence_feature(
+    adb_run, push_text_atomic, theme: str | None = None
+) -> PresenceFeature:
     return PresenceFeature(
         config=lambda: PresenceConfig(
-            system_theme_control=None, presence_fps_cap=None
+            system_theme_control=theme, presence_fps_cap=None
         ),
         adb_run=adb_run,
         run=lambda *a, **k: completed(),
@@ -455,6 +458,10 @@ class SystemThemeRecordTest(unittest.TestCase):
         self.assertEqual(puts, [])
 
     def test_restore_replays_a_recorded_value(self) -> None:
+        # On a shell-uimode target (the harness target) the
+        # recorded mode is restored through the uimode transport,
+        # which writes the key itself — a bare settings put never
+        # transitions the manager (Defect F).
         calls: list[list[str]] = []
 
         def fake_adb(args, timeout=None, check=False):
@@ -466,8 +473,13 @@ class SystemThemeRecordTest(unittest.TestCase):
         feature = make_presence_feature(fake_adb, lambda c, r: None)
         feature.restore_system_theme()
         self.assertIn(
-            ["shell", "settings", "put", "secure", "ui_night_mode", "1"],
+            ["shell", "cmd", "uimode", "night", "no"],
             calls,
+        )
+        self.assertFalse(
+            any(
+                "settings" in call and "put" in call for call in calls
+            )
         )
 
     def test_restore_without_a_record_deletes_the_key(self) -> None:
@@ -524,9 +536,16 @@ class SystemThemePreflightRecordOrderTest(unittest.TestCase):
                 # Backup absent until the record pushes it.
                 return completed("", returncode=0 if pushed else 1)
             if "uimode" in args:
-                events.append("apply")
-                live["night_mode"] = "2" if args[-1] == "yes" else "1"
-                return completed()
+                if args[-1] in {"yes", "no", "auto"}:
+                    events.append("apply")
+                    live["night_mode"] = "2" if args[-1] == "yes" else "1"
+                    return completed()
+                # Query form: report the manager state.
+                return completed(
+                    "Night mode: yes"
+                    if live["night_mode"] == "2"
+                    else "Night mode: no"
+                )
             if "settings" in args and "get" in args:
                 return completed(live["night_mode"])
             return completed()
@@ -559,6 +578,159 @@ class SystemThemePreflightRecordOrderTest(unittest.TestCase):
             json.loads(pushed[SYSTEM_THEME_BACKUP_REMOTE]),
             {"ui_night_mode": "1"},
         )
+
+
+class FakeUimodeDevice:
+    """Stateful model of the shell-uimode theme surface.
+
+    The manager state and the ui_night_mode key are separate
+    state, exactly as on device: settings put/delete move only
+    the key; `cmd uimode night <arg>` moves the manager AND
+    writes the key, but only on a real transition — a same-state
+    call is a no-op that never rewrites the key (the Defect F
+    mechanism, closure session 7)."""
+
+    KEY_BY_MANAGER = {"auto": "0", "no": "1", "yes": "2"}
+
+    def __init__(
+        self,
+        *,
+        key: str | None = None,
+        manager: str = "no",
+        backup: str | None = None,
+    ) -> None:
+        self.key = key
+        self.manager = manager
+        self.backup = backup
+        self.calls: list[list[str]] = []
+        self.uimode_sets: list[str] = []
+
+    def __call__(self, args, timeout=None, check=False):
+        del timeout, check
+        args = list(args)
+        self.calls.append(args)
+        if "cat" in args:
+            if self.backup is None:
+                return completed("", returncode=1)
+            return completed(self.backup)
+        if "uimode" in args:
+            if args[-1] in self.KEY_BY_MANAGER:
+                self.uimode_sets.append(args[-1])
+                if args[-1] != self.manager:
+                    self.manager = args[-1]
+                    self.key = self.KEY_BY_MANAGER[args[-1]]
+                return completed()
+            return completed(f"Night mode: {self.manager}")
+        if "settings" in args:
+            if "get" in args:
+                return completed(
+                    self.key if self.key is not None else "null"
+                )
+            if "put" in args:
+                self.key = args[-1]
+                return completed()
+            if "delete" in args:
+                self.key = None
+                return completed()
+        return completed()
+
+
+class SystemThemeUimodeDivergenceTest(unittest.TestCase):
+    """Defect F: the theme restore moved only the ui_night_mode
+    key, leaving UiModeManager wherever the last apply put it.
+    The pair then verified on the key while diverged, and the
+    next same-state apply no-oped against the manager and
+    failed its key-based verify permanently."""
+
+    def test_restore_to_absent_transitions_the_manager(self) -> None:
+        device = FakeUimodeDevice(
+            key="2",
+            manager="yes",
+            backup=json.dumps({"ui_night_mode": None}),
+        )
+        feature = make_presence_feature(device, lambda c, r: None)
+        feature.restore_system_theme()
+        # The manager is driven to the absent key's boot-time
+        # default BEFORE the key is deleted, and the end state
+        # verifies on both reads.
+        self.assertEqual(device.uimode_sets, ["no"])
+        self.assertIsNone(device.key)
+        self.assertEqual(device.manager, "no")
+        feature.verify_system_theme_restored()
+
+    def test_restore_to_absent_without_a_record(self) -> None:
+        device = FakeUimodeDevice(key="2", manager="yes", backup=None)
+        feature = make_presence_feature(device, lambda c, r: None)
+        feature.restore_system_theme()
+        self.assertEqual(device.uimode_sets, ["no"])
+        self.assertIsNone(device.key)
+        self.assertEqual(device.manager, "no")
+        feature.verify_system_theme_restored()
+
+    def test_restore_of_recorded_dark_goes_through_the_transport(
+        self,
+    ) -> None:
+        device = FakeUimodeDevice(
+            key="1",
+            manager="no",
+            backup=json.dumps({"ui_night_mode": "2"}),
+        )
+        feature = make_presence_feature(device, lambda c, r: None)
+        feature.restore_system_theme()
+        self.assertEqual(device.uimode_sets, ["yes"])
+        self.assertFalse(
+            any(
+                "settings" in call and "put" in call
+                for call in device.calls
+            )
+        )
+        self.assertEqual(device.key, "2")
+        self.assertEqual(device.manager, "yes")
+        feature.verify_system_theme_restored()
+
+    def test_apply_heals_the_diverged_state(self) -> None:
+        # The library unit's session-7 end state: key absent,
+        # manager at night. A dark apply must force a real
+        # transition (through the opposite state) so the
+        # transport rewrites the key; a bare same-state call
+        # would no-op and leave the key absent.
+        device = FakeUimodeDevice(key=None, manager="yes")
+        feature = make_presence_feature(
+            device, lambda c, r: None, theme="dark"
+        )
+        feature.apply_system_theme_request()
+        self.assertEqual(device.uimode_sets, ["no", "yes"])
+        self.assertEqual(device.key, "2")
+        self.assertEqual(device.manager, "yes")
+        feature.verify_system_theme_control(wait_seconds=5)
+
+    def test_the_pre_fix_restore_output_fails_verification(
+        self,
+    ) -> None:
+        # Session 7 reproduced: the pre-fix restore's whole
+        # effect was deleting the key under a night manager.
+        # That end state must now fail verification as diverged.
+        device = FakeUimodeDevice(
+            key="2",
+            manager="yes",
+            backup=json.dumps({"ui_night_mode": None}),
+        )
+        device(["shell", "settings", "delete", "secure", "ui_night_mode"])
+        feature = make_presence_feature(device, lambda c, r: None)
+        with self.assertRaises(ProvisionError) as raised:
+            feature.verify_system_theme_restored()
+        self.assertIn("diverged", str(raised.exception))
+
+    def test_apply_verification_fails_loudly_on_divergence(
+        self,
+    ) -> None:
+        device = FakeUimodeDevice(key=None, manager="yes")
+        feature = make_presence_feature(
+            device, lambda c, r: None, theme="dark"
+        )
+        with self.assertRaises(ProvisionError) as raised:
+            feature.verify_system_theme_control(wait_seconds=1)
+        self.assertIn("diverged", str(raised.exception))
 
 
 def make_settings_feature(config: SettingsConfig, **overrides) -> SettingsFeature:
