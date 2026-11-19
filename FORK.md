@@ -467,23 +467,40 @@ flag state is restored at exit. Credential bootstraps under
 unconfigured: they are install mechanisms, not action applies. On a
 never-provisioned device `--force` behaves as a normal run.
 
-**Audio eligibility signal** (`AUDIO_CHANNEL_PREFLIGHT`): the
-channel gate's audio check does not reuse `audio_preflight()` —
-that check's health half is a logcat probe for the current boot's
-`PortalAudioPersist` lines, which rotate out of logcat as uptime
-grows, so on a long-uptime device it reported a healthy install as
-needing repair and the channel path refused itself (Run 33 step 1).
-Eligibility instead reads durable + live evidence: the installed
-marker (written only after a fully verified boot), the staged
-persist artifact the watchdog loads from, and the aiservice process
-— the watchdog's host — alive at check time. No logcat history is
-consulted, so the answer is independent of boot age; any missing
-signal declines to the race fallback. The channel apply's final
-verification uses the same signal for audio
-(`verify_requested_state(via_channel=True)`): it verifies on the
-device's current boot, so the logcat probe would fail there for
-the same reason. The race path's own fresh-boot verification is
-unchanged.
+**Audio health verdict** (`AUDIO_PREFLIGHT` /
+`AUDIO_CHANNEL_PREFLIGHT`): one evaluation, `audio_health()`,
+backs both preflights and the channel apply's final verification,
+so the eligibility gate and the apply path cannot disagree about
+the same boot state (Defect H, closure session 9.5: the gate read
+skip while the apply path read repair on the same long-uptime
+boot, and the run entered a race for a repair nothing needed).
+The verdict reads durable + live evidence: the installed marker
+(written only after a fully verified boot), the staged persist
+artifact the watchdog loads from, and the aiservice process —
+the watchdog's host — alive at check time. No logcat history is
+consulted for an installed device, so the answer is independent
+of boot age: the logcat probe (`verify_watchdog()`) reads the
+current boot's `PortalAudioPersist` lines, which rotate out of
+logcat as uptime grows and reported a healthy install as needing
+repair (Run 33 step 1). The probe keeps the two roles where boot
+age is not a factor: verifying a boot the run itself just caused
+(the race path's post-reboot verification is unchanged), and the
+marker-absent private-install probe — on an installer-credential
+target whose watchdog verifies on this boot, the install is a
+private one this provisioner did not make, and the probe writes
+the marker so later reads are durable. A repair verdict (marker
+present, a live signal missing) is routed before the channel can
+engage: `_channel_blocker` returns `audio-repair-bootstrap`, the
+fast path skips the channel with that reason, and the race path's
+dedicated installer-credential bootstrap owns the repair from the
+start. No channel mechanism performs the repair — the install is
+a private credential action, re-pushing the staged artifact
+would not make the running watchdog load it, and nothing on the
+channel path restarts aiservice — so the bootstrap stays
+race-only. The final report names the outcome
+(`AUDIO_REPAIR_OUTCOME route=bootstrap result=performed|deferred`),
+judged against the device's end state; a deferred repair fails
+the run.
 
 **Channel verification audit** (2026-11-15): every check the
 channel path runs — the eligibility gate and the final

@@ -459,6 +459,14 @@ class PortalProvisioner:
         # report_deferred_failures() surfaces it in the final
         # report without failing the run.
         self.presence_deferred = False
+        # Set when the fast path skipped the root-channel apply up
+        # front because the unified audio verdict read repair: the
+        # repair is performable only by the dedicated installer-
+        # credential bootstrap on the race path, so the channel
+        # never engages for it (Defect H). report_deferred_failures()
+        # names the outcome at the end, judged against the device's
+        # end state (the C3-B verification-at-the-end shape).
+        self.audio_repair_channel_skipped = False
         # Set when any win in this run (a nested bootstrap run's win
         # included, propagated by the phase that ran it) set
         # otad.nodemon and read it back true. The posture judgment
@@ -1578,8 +1586,23 @@ class PortalProvisioner:
             and not self.adb_framework_boot_configured
         ):
             return "adb-framework-bootstrap"
-        if self.audio and not self.audio_channel_preflight():
-            return "audio-not-configured"
+        if self.audio:
+            # The routing decision is made HERE, before the channel
+            # can engage, from the one audio verdict both preflights
+            # print (Defect H). A repair verdict is its own blocker:
+            # the repair is a private install performed by the
+            # dedicated bootstrap with the installer credential a
+            # race win obtains, and no channel mechanism performs it
+            # (re-pushing the staged artifact would not make the
+            # running watchdog load it, and nothing on the channel
+            # path restarts aiservice), so the race path owns it
+            # from the start rather than after an engaged channel
+            # run falls back into it.
+            audio_action = self.audio_health().action
+            if audio_action == "repair":
+                return "audio-repair-bootstrap"
+            if audio_action != "skip":
+                return "audio-not-configured"
         if (
             self.disable_updates
             and not self.ota_preflight()
@@ -2071,6 +2094,8 @@ class PortalProvisioner:
                 f"PROVISION_CHANNEL_SKIP reason={channel_blocker}",
                 flush=True,
             )
+            if channel_blocker == "audio-repair-bootstrap":
+                self.audio_repair_channel_skipped = True
             return False
         return self._apply_via_channel(blocker)
 
@@ -2533,6 +2558,32 @@ class PortalProvisioner:
                 "report=final",
                 flush=True,
             )
+        if self.audio_repair_channel_skipped:
+            # The channel was skipped up front because the unified
+            # audio verdict read repair (Defect H): the repair is
+            # race-only, so this run's stages path owned it. Judge
+            # the outcome against the device's current state, the
+            # same verification-at-the-end shape as the OTA re-judge
+            # above: performed when the verdict now reads skip,
+            # deferred otherwise — and a deferred repair joins the
+            # failure entries (unless the audio bootstrap's own
+            # deferred entry already names it), so the run cannot
+            # report complete over an unrepaired install.
+            performed = self.audio_health().action == "skip"
+            print(
+                "AUDIO_REPAIR_OUTCOME route=bootstrap "
+                f"result={'performed' if performed else 'deferred'}",
+                flush=True,
+            )
+            if not performed and not any(
+                entry.startswith("audio")
+                for entry in self.deferred_phase_failures
+            ):
+                self.deferred_phase_failures.append(
+                    "audio: repair deferred (channel skipped up "
+                    "front, reason=audio-repair-bootstrap; the "
+                    "end-state verdict still reads repair)"
+                )
         if self.deferred_phase_failures:
             raise ProvisionError(
                 "bootstrap phases failed: "
@@ -4718,6 +4769,9 @@ class PortalProvisioner:
 
     def audio_preflight(self) -> bool:
         return self.audio_feature.audio_preflight()
+
+    def audio_health(self):
+        return self.audio_feature.audio_health()
 
     def audio_channel_preflight(self) -> bool:
         return self.audio_feature.audio_channel_preflight()
@@ -7208,10 +7262,9 @@ class PortalProvisioner:
             if via_channel:
                 # The channel apply verifies on the device's current
                 # boot, however old: verify_watchdog()'s logcat probe
-                # rotates away on long uptimes (see
-                # audio_channel_preflight), so the channel verifies
-                # audio with the same durable + live signal the
-                # eligibility gate used.
+                # rotates away on long uptimes, so the channel verifies
+                # audio with the one durable + live verdict the
+                # eligibility gate used (audio_health).
                 if not self.audio_channel_preflight():
                     raise ProvisionError(
                         "audio did not verify after the channel apply"

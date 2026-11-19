@@ -21,6 +21,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable
+from typing import NamedTuple
 
 from device_session import ProvisionError
 from mha_tuning import OMNI_STOCK_SHA256, patch_omni_tuning, sha256
@@ -80,6 +81,29 @@ def audio_processing_disabled_observed(
     aec = re.search(r"param=3001 .*after=0 .*ok=1", logs)
     ns = re.search(r"param=4001 .*after=0 .*ok=1", logs)
     return bool(aec and ns)
+
+
+class AudioHealth(NamedTuple):
+    """The one audio health verdict (Defect H).
+
+    installed: the durable install marker is present (or was just
+        written by the private-install probe below).
+    private: no marker, but an installer-credential target's
+        watchdog verified on this boot — a private install made
+        outside this provisioner (upstream's shape).
+    staged: the persist artifact the watchdog loads from is staged.
+    aiservice: the watchdog's host process is alive right now.
+    healthy / action: "skip" when the audio feature is in its
+        configured end state, "install" when nothing is installed,
+        "repair" when an install is present but a live signal
+        disagrees."""
+
+    installed: bool
+    private: bool
+    staged: bool
+    aiservice: bool
+    healthy: bool
+    action: str
 
 
 class AudioFeature:
@@ -167,57 +191,66 @@ class AudioFeature:
         )
         return stock_path, patched_path
 
-    def audio_preflight(self) -> bool:
-        marker = "/data/local/tmp/portal-audio-backup/installed-v1"
-        installed = self._adb_run(
-            ["shell", "test", "-f", marker], timeout=5
-        ).returncode == 0
-        if not installed and self._target() and self._target().audio_installer_credentials:
-            try:
-                self.verify_watchdog(wait_seconds=5)
-            except ProvisionError:
-                print("AUDIO_PREFLIGHT installed=0 healthy=0 action=install")
-                return False
-            print(
-                "AUDIO_PREFLIGHT installed=private healthy=1 action=skip"
-            )
-            return True
-        if not installed:
-            print("AUDIO_PREFLIGHT installed=0 healthy=0 action=install")
-            return False
-        try:
-            self.verify_watchdog(wait_seconds=5)
-        except ProvisionError:
-            print("AUDIO_PREFLIGHT installed=1 healthy=0 action=repair")
-            return False
-        print("AUDIO_PREFLIGHT installed=1 healthy=1 action=skip")
-        return True
+    def audio_health(self) -> AudioHealth:
+        """The ONE audio health evaluation; both preflights print
+        from it, so the channel eligibility gate and the apply path
+        cannot disagree about the same boot state (Defect H,
+        closure session 9.5: the gate read the durable signals
+        healthy while the apply path's logcat probe read repair on
+        the same long-uptime boot, and the run entered a race for a
+        repair nothing needed).
 
-    def audio_channel_preflight(self) -> bool:
-        """Boot-age-independent audio health for channel eligibility.
-
-        audio_preflight()'s health half is verify_watchdog(), a
-        logcat probe for this boot's PortalAudioPersist lines; those
-        lines rotate out of logcat as uptime grows, so on any
-        long-uptime device the probe reports a healthy install as
-        needing repair and the channel path refuses itself (Run 33
-        step 1). Eligibility therefore uses durable + live evidence
-        instead: the installed marker (written by verify_watchdog
-        only after a fully verified boot), the staged persist
-        artifact the watchdog loads from, and the aiservice process
-        — the watchdog's host — alive right now. No logcat history
-        is consulted, so the answer does not depend on boot age.
-        Any missing or disagreeing signal declines: the race
-        fallback is the safe direction."""
+        The criteria are the durable + live signals: the installed
+        marker (written by verify_watchdog only after a fully
+        verified boot), the staged persist artifact the watchdog
+        loads from, and the aiservice process — the watchdog's
+        host — alive right now. No logcat history is consulted for
+        an installed device, so the answer does not depend on boot
+        age: verify_watchdog()'s probe reads this boot's
+        PortalAudioPersist lines, which rotate out of logcat as
+        uptime grows and reported a healthy install as needing
+        repair on any long-uptime device (Run 33 step 1). The
+        logcat probe keeps two roles where boot age is not a
+        factor: verifying a boot this run just caused
+        (verify_watchdog after a race/reboot), and the
+        marker-absent probe below — an installer-credential
+        target whose watchdog verifies on this boot carries a
+        private install this provisioner did not make; the probe
+        also writes the marker, converting the device to the
+        durable shape for every later read."""
         installed = self._adb_run(
             ["shell", "test", "-f", AUDIO_INSTALLED_MARKER], timeout=5
         ).returncode == 0
         if not installed:
-            print(
-                "AUDIO_CHANNEL_PREFLIGHT installed=0 staged=0 "
-                "aiservice=0 action=decline"
+            target = self._target()
+            if target is not None and target.audio_installer_credentials:
+                try:
+                    self.verify_watchdog(wait_seconds=5)
+                except ProvisionError:
+                    return AudioHealth(
+                        installed=False,
+                        private=False,
+                        staged=False,
+                        aiservice=False,
+                        healthy=False,
+                        action="install",
+                    )
+                return AudioHealth(
+                    installed=False,
+                    private=True,
+                    staged=False,
+                    aiservice=True,
+                    healthy=True,
+                    action="skip",
+                )
+            return AudioHealth(
+                installed=False,
+                private=False,
+                staged=False,
+                aiservice=False,
+                healthy=False,
+                action="install",
             )
-            return False
         target = self._target()
         artifact = (
             AUDIO_PERSIST_JAVA_REMOTE
@@ -231,12 +264,37 @@ class AudioFeature:
             ["shell", "pidof", AISERVICE_PACKAGE], timeout=5
         ).stdout.strip()
         live = bool(staged and pid)
-        print(
-            "AUDIO_CHANNEL_PREFLIGHT installed=1 "
-            f"staged={int(staged)} aiservice={int(bool(pid))} "
-            f"action={'skip' if live else 'decline'}"
+        return AudioHealth(
+            installed=True,
+            private=False,
+            staged=staged,
+            aiservice=bool(pid),
+            healthy=live,
+            action="skip" if live else "repair",
         )
-        return live
+
+    def audio_preflight(self) -> bool:
+        health = self.audio_health()
+        installed = "private" if health.private else int(health.installed)
+        print(
+            f"AUDIO_PREFLIGHT installed={installed} "
+            f"healthy={int(health.healthy)} action={health.action}"
+        )
+        return health.action == "skip"
+
+    def audio_channel_preflight(self) -> bool:
+        """Channel eligibility view of the one verdict: prints the
+        raw durable + live signals behind audio_health() and
+        declines on anything but a skip verdict."""
+        health = self.audio_health()
+        installed = "private" if health.private else int(health.installed)
+        print(
+            f"AUDIO_CHANNEL_PREFLIGHT installed={installed} "
+            f"staged={int(health.staged)} "
+            f"aiservice={int(health.aiservice)} "
+            f"action={'skip' if health.action == 'skip' else 'decline'}"
+        )
+        return health.action == "skip"
 
     def verify_watchdog(self, wait_seconds: int = 25) -> str:
         deadline = time.monotonic() + wait_seconds

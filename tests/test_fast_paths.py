@@ -32,6 +32,7 @@ sys.path.insert(
     0, str(pathlib.Path(__file__).resolve().parents[1] / "tools")
 )
 
+from features.audio import AudioHealth  # noqa: E402
 from portal_targets import TARGETS  # noqa: E402
 from provision_portal import (  # noqa: E402
     PortalProvisioner,
@@ -175,6 +176,14 @@ def eligible_provisioner(temporary: str, **overrides):
         "remote_wipe_preflight",
     ):
         setattr(provisioner, name, lambda: True)
+    provisioner.audio_health = lambda: AudioHealth(
+        installed=True,
+        private=False,
+        staged=True,
+        aiservice=True,
+        healthy=True,
+        action="skip",
+    )
     return provisioner, device
 
 
@@ -290,11 +299,37 @@ class ChannelBlockerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             provisioner, device = eligible_provisioner(temporary)
             state = good_state(provisioner)
-            provisioner.audio_channel_preflight = lambda: False
+            provisioner.audio_health = lambda: AudioHealth(
+                installed=False,
+                private=False,
+                staged=False,
+                aiservice=False,
+                healthy=False,
+                action="install",
+            )
             self.assertEqual(
                 provisioner._channel_blocker(state), "audio-not-configured"
             )
-            provisioner.audio_channel_preflight = lambda: True
+            provisioner.audio_health = lambda: AudioHealth(
+                installed=True,
+                private=False,
+                staged=False,
+                aiservice=True,
+                healthy=False,
+                action="repair",
+            )
+            self.assertEqual(
+                provisioner._channel_blocker(state),
+                "audio-repair-bootstrap",
+            )
+            provisioner.audio_health = lambda: AudioHealth(
+                installed=True,
+                private=False,
+                staged=True,
+                aiservice=True,
+                healthy=True,
+                action="skip",
+            )
             provisioner.ota_preflight = lambda: False
             self.assertEqual(
                 provisioner._channel_blocker(state), "ota-not-configured"
@@ -332,12 +367,16 @@ class ChannelBlockerTest(unittest.TestCase):
 
 
 class AudioChannelPreflightTest(unittest.TestCase):
-    """The channel eligibility audio check must be boot-age
-    independent: durable marker + staged persist artifact + the
-    aiservice process alive now, with no logcat consultation (the
-    logcat probe in audio_preflight rotates away on long uptimes —
-    Run 33 step 1). Each signal missing must decline, sending the
-    run to the race fallback."""
+    """ONE audio verdict (Defect H): audio_preflight() and
+    audio_channel_preflight() print from the same audio_health()
+    evaluation — durable marker + staged persist artifact + the
+    aiservice process alive now, with no logcat consultation for
+    an installed device (the logcat probe rotates away on long
+    uptimes — Run 33 step 1, closure session 9.5). The two
+    preflights must agree on every device state: healthy,
+    repair (a live signal missing), install (nothing installed),
+    and the marker-absent private install an installer-credential
+    target's watchdog verifies on this boot."""
 
     def _provisioner(self, temporary: str, device: FakeDevice):
         provisioner = make_provisioner(temporary, **DOCUMENTED)
@@ -365,15 +404,21 @@ class AudioChannelPreflightTest(unittest.TestCase):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 self.assertTrue(provisioner.audio_channel_preflight())
+                self.assertTrue(provisioner.audio_preflight())
                 self.assertIsNone(
                     provisioner._channel_blocker(
                         good_state(provisioner)
                     )
                 )
+            output = stdout.getvalue()
             self.assertIn(
                 "AUDIO_CHANNEL_PREFLIGHT installed=1 staged=1 "
                 "aiservice=1 action=skip",
-                stdout.getvalue(),
+                output,
+            )
+            self.assertIn(
+                "AUDIO_PREFLIGHT installed=1 healthy=1 action=skip",
+                output,
             )
 
     def test_marker_present_but_aiservice_not_live_declines(self) -> None:
@@ -384,32 +429,183 @@ class AudioChannelPreflightTest(unittest.TestCase):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 self.assertFalse(provisioner.audio_channel_preflight())
+                self.assertFalse(provisioner.audio_preflight())
                 self.assertEqual(
                     provisioner._channel_blocker(
                         good_state(provisioner)
                     ),
-                    "audio-not-configured",
+                    "audio-repair-bootstrap",
                 )
-            self.assertIn("action=decline", stdout.getvalue())
+            output = stdout.getvalue()
+            self.assertIn("action=decline", output)
+            self.assertIn(
+                "AUDIO_PREFLIGHT installed=1 healthy=0 action=repair",
+                output,
+            )
 
     def test_marker_present_but_artifact_missing_declines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             device = FakeDevice()
             device.audio_artifact = False
             provisioner = self._provisioner(temporary, device)
-            with redirect_stdout(io.StringIO()):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
                 self.assertFalse(provisioner.audio_channel_preflight())
+                self.assertFalse(provisioner.audio_preflight())
+            self.assertIn("action=repair", stdout.getvalue())
 
     def test_nothing_staged_declines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             device = FakeDevice()
             device.audio_marker = False
             provisioner = self._provisioner(temporary, device)
+            # A target without installer credentials takes no
+            # private-install probe: marker absent is an install
+            # verdict for both preflights.
+            provisioner.target = next(
+                target
+                for target in TARGETS
+                if target.key == "portal-10-omni-3051355900018050"
+            )
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 self.assertFalse(provisioner.audio_channel_preflight())
+                self.assertFalse(provisioner.audio_preflight())
+            output = stdout.getvalue()
             self.assertIn(
-                "AUDIO_CHANNEL_PREFLIGHT installed=0", stdout.getvalue()
+                "AUDIO_CHANNEL_PREFLIGHT installed=0", output
+            )
+            self.assertIn(
+                "AUDIO_PREFLIGHT installed=0 healthy=0 action=install",
+                output,
+            )
+
+    def test_private_install_agrees_via_watchdog_probe(self) -> None:
+        """Marker absent on an installer-credential target, but
+        this boot's watchdog verifies: both preflights read the
+        private install as configured (the probe is the one
+        logcat use the verdict keeps, and it writes the marker)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            device = FakeDevice()
+            device.audio_marker = False
+            provisioner = self._provisioner(temporary, device)
+            provisioner.logcat_poll = lambda tag, since, timeout=10: (
+                "persistent audio watchdog started\n"
+                "audio processing verified aec=0 ns=0\n"
+            )
+            provisioner.logcat_watermark = lambda: None
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner.audio_preflight())
+                self.assertTrue(provisioner.audio_channel_preflight())
+            output = stdout.getvalue()
+            self.assertIn(
+                "AUDIO_PREFLIGHT installed=private healthy=1 "
+                "action=skip",
+                output,
+            )
+            self.assertIn(
+                "AUDIO_CHANNEL_PREFLIGHT installed=private", output
+            )
+
+
+class AudioRepairRoutingTest(unittest.TestCase):
+    """A repair verdict is routed BEFORE the channel engages
+    (Defect H): the fast path skips the channel with the named
+    reason audio-repair-bootstrap, never engages it, writes no
+    pending manifest from the channel path, and the final report
+    names the repair outcome judged against the end state."""
+
+    def _repair_provisioner(self, temporary: str):
+        provisioner, _device = eligible_provisioner(temporary)
+        provisioner.audio_health = lambda: AudioHealth(
+            installed=True,
+            private=False,
+            staged=False,
+            aiservice=True,
+            healthy=False,
+            action="repair",
+        )
+        state = good_state(provisioner)
+        state["tool_revision"] = "deadbeef"
+        provisioner.read_state = lambda: state
+        return provisioner
+
+    def test_repair_skips_channel_before_engagement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self._repair_provisioner(temporary)
+            engaged: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: engaged.append(reason) or True
+            )
+            writes: list = []
+            provisioner.write_state = (
+                lambda *a, **k: writes.append((a, k))
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertFalse(provisioner._run_fast_path())
+            output = stdout.getvalue()
+            self.assertIn(
+                "PROVISION_CHANNEL_SKIP reason=audio-repair-bootstrap",
+                output,
+            )
+            self.assertNotIn("PROVISION_CHANNEL_ENGAGED", output)
+            self.assertEqual(engaged, [])
+            self.assertEqual(writes, [])
+            self.assertTrue(provisioner.audio_repair_channel_skipped)
+
+    def test_repair_outcome_performed_when_end_state_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, audio=True)
+            provisioner.audio_repair_channel_skipped = True
+            provisioner.audio_health = lambda: AudioHealth(
+                installed=True,
+                private=False,
+                staged=True,
+                aiservice=True,
+                healthy=True,
+                action="skip",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.report_deferred_failures()
+            self.assertIn(
+                "AUDIO_REPAIR_OUTCOME route=bootstrap "
+                "result=performed",
+                stdout.getvalue(),
+            )
+
+    def test_repair_outcome_deferred_fails_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, audio=True)
+            provisioner.audio_repair_channel_skipped = True
+            provisioner.audio_health = lambda: AudioHealth(
+                installed=True,
+                private=False,
+                staged=False,
+                aiservice=True,
+                healthy=False,
+                action="repair",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                with self.assertRaises(ProvisionError):
+                    provisioner.report_deferred_failures()
+            self.assertIn(
+                "AUDIO_REPAIR_OUTCOME route=bootstrap "
+                "result=deferred",
+                stdout.getvalue(),
+            )
+
+    def test_no_outcome_line_without_a_channel_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, audio=True)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.report_deferred_failures()
+            self.assertNotIn(
+                "AUDIO_REPAIR_OUTCOME", stdout.getvalue()
             )
 
 

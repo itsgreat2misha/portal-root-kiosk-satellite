@@ -167,6 +167,31 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The two audio preflights disagreed about the same boot, and a
+  repair demanded mid-run had no channel route (Defect H, Phase D
+  closure session 9.5, Nov 19, 2026). The channel gate read the
+  durable signals (marker, staged artifact, aiservice alive) and
+  reported skip, while the apply path's health half was a logcat
+  probe for the current boot's watchdog lines — rotated out on
+  the session's long-uptime boot — so minutes later the same
+  device read repair, and a `--full` run that had engaged the
+  channel fell into the race path for a repair nothing needed.
+  Both preflights now print from one verdict, `audio_health()`:
+  the durable + live signals are the criteria for every reader,
+  and the logcat probe keeps only its boot-age-independent roles
+  (post-reboot verification on the race path, and the
+  marker-absent private-install probe, which also writes the
+  marker). Repair routing is decided before the channel engages:
+  a repair verdict is the up-front channel blocker
+  `audio-repair-bootstrap`, because no channel mechanism performs
+  the repair — the install is a private installer-credential
+  action, re-pushing the staged artifact would not make the
+  running watchdog load it, and nothing on the channel path
+  restarts aiservice — so the dedicated bootstrap stays race-only
+  and owns the repair from the start. The final report names the
+  outcome (`AUDIO_REPAIR_OUTCOME route=bootstrap
+  result=performed|deferred`), judged against the device's end
+  state; a deferred repair fails the run.
 - The root-channel apply path staged the PortalComponentCtl
   actions file but never executed the jar, so any channel run
   that had to actually change component state failed its own
