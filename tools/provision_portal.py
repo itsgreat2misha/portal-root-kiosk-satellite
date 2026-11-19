@@ -187,6 +187,53 @@ ADB_ENABLED_SETTING = "adb_enabled"
 #: holding two — a pre-#64 pair the manifest merges preserved —
 #: shadows the intent the later one established (Defect D).
 DNS_ACTION_KEYS = ("dhcp_dns", "privacy_dns", "restore_privacy_dns")
+#: The manifest action keys that record an operation — a
+#: --restore <name> action, plus the Shizuku removal — rather
+#: than a persistent end state (Defect E). A recorded operation
+#: says it ran once, not that the live state still matches what
+#: it produced, so the no-op gate must never satisfy one from
+#: the record: a requested operation always executes and
+#: verifies its live end state.
+OPERATION_ACTION_KEYS = (
+    "restore_adb_auth_timeout",
+    "restore_audio",
+    "enable_updates",
+    "restore_bloat",
+    "restore_remote_wipe",
+    "restore_presence_profile",
+    "restore_presence_fps",
+    "restore_privacy_dns",
+    "restore_app_verifier",
+    "restore_camera_light",
+    "restore_autoroot",
+    "restore_wireless_adb",
+    "restore_theme",
+    "restore_meta_authenticators",
+    "remove_shizuku",
+)
+#: Apply/restore action pairs for one feature (Defect E record
+#: hygiene, mirroring the DNS family drop): a completed record
+#: must not carry both sides — the pair is contradictory, and
+#: the stale side misstates the device's state to every reader.
+#: The DNS pair is the family's own mechanism (DNS_ACTION_KEYS)
+#: and is not repeated here. Autoroot has no apply action key —
+#: its apply side is the staging request itself, handled in
+#: write_state from the autoroot flag.
+APPLY_RESTORE_PAIRS = (
+    ("audio", "restore_audio"),
+    ("disable_updates", "enable_updates"),
+    ("debloat", "restore_bloat"),
+    ("block_remote_wipe", "restore_remote_wipe"),
+    ("remove_meta_accounts", "restore_meta_authenticators"),
+    ("optimize_presence", "restore_presence_profile"),
+    ("presence_fps_cap", "restore_presence_fps"),
+    ("allow_app_updates", "restore_app_verifier"),
+    ("disable_adb_auth_timeout", "restore_adb_auth_timeout"),
+    ("disable_camera_light", "restore_camera_light"),
+    ("persistent_wireless_adb", "restore_wireless_adb"),
+    ("system_theme_control", "restore_theme"),
+    ("shizuku", "remove_shizuku"),
+)
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
 ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
@@ -1363,6 +1410,15 @@ class PortalProvisioner:
         if not isinstance(recorded_actions, dict):
             return "actions-unrecorded"
         for name, value in self.requested_actions().items():
+            if name in OPERATION_ACTION_KEYS:
+                # Operations are not states (Defect E): the
+                # record satisfied a repeated --restore theme
+                # against a live ui_night_mode a later apply had
+                # changed, and the run no-oped without executing
+                # (closure session 6, Nov 19, 2026). A requested
+                # operation blocks the no-op unconditionally so
+                # it executes and verifies its live end state.
+                return f"actions-{name}"
             if recorded_actions.get(name) == value:
                 continue
             if (
@@ -2663,6 +2719,27 @@ class PortalProvisioner:
         own_dns_keys = [
             name for name in DNS_ACTION_KEYS if actions.get(name)
         ]
+        # The pair sides THIS run's own action set drops from the
+        # merged record (Defect E record hygiene, applied after
+        # the merge below, with the DNS drop): a run that
+        # completes one side of an apply/restore pair must drop
+        # the recorded other side — the merge preserves prior
+        # actions per key, so without an active drop the record
+        # carries the contradictory pair forever (a channel theme
+        # apply left system_theme_control beside the restore_theme
+        # an earlier restore had recorded). Autoroot's apply side
+        # is the staging request itself, not an action key.
+        own_pair_drops = [
+            other
+            for apply_key, restore_key in APPLY_RESTORE_PAIRS
+            for own, other in (
+                (apply_key, restore_key),
+                (restore_key, apply_key),
+            )
+            if actions.get(own)
+        ]
+        if self.autoroot:
+            own_pair_drops.append("restore_autoroot")
         if merge_prior:
             # Merge into the manifest this run started from instead
             # of replacing it: the recorded manifest is the device's
@@ -2714,6 +2791,16 @@ class PortalProvisioner:
                     for name in DNS_ACTION_KEYS:
                         if name != own_dns_keys[0]:
                             actions.pop(name, None)
+                for name in own_pair_drops:
+                    # Defect E hygiene, with the DNS drop above and
+                    # before the count below is logged: the merged
+                    # record carries only the pair side this run
+                    # established. (On a replace write this could
+                    # never fire — the CLI keeps a run's own set
+                    # pair-clean — so the drop lives here with the
+                    # merge it corrects. A run establishing neither
+                    # side leaves the recorded pair untouched.)
+                    actions.pop(name, None)
                 print(
                     "STATE_MANIFEST_MERGED "
                     f"actions={len(actions)} "

@@ -322,6 +322,15 @@ class PresenceFeature:
         ).returncode != 0:
             print("SYSTEM_THEME_PREFLIGHT action=install control=absent")
             return False
+        # This preflight APPLIES the theme as its probe, and the
+        # channel gate calls it before the stages path reaches
+        # its own record step — so the original must be recorded
+        # here, at the apply point, or a channel-route first
+        # apply overwrites it before anyone records it and the
+        # recorded-original restore tier can never engage
+        # (Defect E). First record wins, so on the stages path,
+        # whose record step already ran, this is a no-op.
+        self.record_system_theme_original()
         self.apply_system_theme_request()
         try:
             self.verify_system_theme_control(wait_seconds=10)

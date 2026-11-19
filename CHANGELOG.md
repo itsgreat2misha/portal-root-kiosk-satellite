@@ -167,6 +167,43 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A recorded restore could satisfy itself, so a repeated
+  restore silently no-oped against a changed live state
+  (Defect E, Phase D closure session 6, Nov 19, 2026).
+  Restores were recorded as persistent manifest actions, and
+  the no-op gate satisfies requested actions from the record:
+  after `--restore theme` completed and recorded
+  `restore_theme`, a channel theme apply set the live
+  `ui_night_mode`, and a second `--restore theme` reported
+  already-provisioned without executing. Three fixes. Gate
+  semantics: operation actions (every `--restore` action,
+  plus the Shizuku removal — operations, not states) are
+  excluded from record-only satisfaction in the no-op gate,
+  so a requested operation always executes and verifies its
+  live end state; non-restore actions keep the record
+  comparison exactly as before. Record hygiene, mirroring
+  the Defect D DNS family drop: a completion write whose run
+  established one side of an apply/restore pair now drops
+  the recorded other side from the merged record, so the
+  record never carries the contradictory pair (the same
+  session's record held `system_theme_control: "dark"`
+  beside `restore_theme: true`); autoroot's apply side is
+  its staging request rather than an action key and drops a
+  recorded `restore_autoroot` the same way. Recording order:
+  the theme preflight applies the theme as its probe, and
+  the channel gate calls it before the stages path's record
+  step, so on the channel route the recorded original could
+  never engage; the preflight now records the original at
+  the apply point, before applying (first record wins, so
+  the stages path is unchanged). The other
+  recorded-original features were checked for the same
+  channel-applies-before-record shape and do not share it:
+  Private DNS, the ADB authorization timeout, the app
+  verifier and debloat each record inside their apply
+  function, Meta accounts record inside the preflight both
+  routes call before any removal, and remote wipe ensures
+  its backup inside the shared apply sequence. Live
+  validation is deferred to the next device session.
 - An explicit `--dns` request could silently no-op against a
   contradicting live state (Defect D, Phase D closure session 3,
   Nov 19, 2026). A manifest recorded by a pre-#64 run can carry
