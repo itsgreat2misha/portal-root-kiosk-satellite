@@ -185,6 +185,31 @@ the fork diverged from upstream:
   end-of-run verification and posture judgment, and nothing
   records the action verified from the trust path. Live
   validation is deferred to a later session.
+- The presence runtime verification demanded a live, streaming
+  pipeline, but with the camera lens cover closed the pipeline
+  is off by design — it configures, starts, and pauses without
+  ever opening the camera — so a healthy covered unit failed
+  the whole run (the guest Mini's repeated presence failures,
+  Nov 18, 2026; its cover was closed throughout). Both
+  verification variants now read `shutter_state` from
+  `dumpsys platform_state_service` first (the privacy signals
+  the check already sampled do not track the cover). Cover
+  open — or the state unreadable, as on aloha — the live check
+  runs exactly as before. Cover closed, the durable end state
+  is verified instead (aiservice running, CAMERA appop
+  allowed, the profile evidenced by the installed marker or
+  this boot's config-load lines, the FPS cap by its marker)
+  and the verification returns a distinct deferred outcome
+  (`PRESENCE_VERIFY_DEFERRED reason=shutter_closed`) instead
+  of failing; a durable failure still fails the run. A
+  deferred verification never records as verified: the
+  manifest records the presence actions as `"deferred"` (the
+  OTA `"unverified"` pattern), the no-op gate's exact-match
+  comparison therefore refuses a later no-op claim, and a
+  later run with the cover open re-attempts the streaming
+  verification. The final report surfaces the deferral
+  without failing the run. Live validation is deferred until
+  a covered unit is next provisioned.
 - The stages path's single-action exits kept the replace
   semantics the channel fix below left behind: a theme-only,
   presence-only or similar subset run that found its action

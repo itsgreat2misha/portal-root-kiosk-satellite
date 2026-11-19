@@ -83,6 +83,23 @@ class PresenceConfig:
     presence_fps_cap: int | None
 
 
+def loaded_profile_keys(logs: str) -> set[str]:
+    """Presence profile keys whose settings_config.xml load lines
+    (carrying the expected values) appear in a logcat dump."""
+    return {
+        key
+        for key, expected in PRESENCE_PROFILE_SETTINGS.items()
+        if any(
+            "settings_config.xml" in line
+            and key in line
+            and re.search(
+                rf"\b{str(expected).lower()}\b", line, re.IGNORECASE
+            )
+            for line in logs.splitlines()
+        )
+    }
+
+
 def presence_full_scene_active(
     logs: str, camera: str, target: PortalTarget | None
 ) -> bool:
@@ -150,6 +167,12 @@ class PresenceFeature:
         self.system_theme_control_runtime_verified = False
         self.system_theme_control_log_count_before = 0
         self.presence_public_key: pathlib.Path | None = None
+        # Outcome of the most recent presence runtime verification:
+        # True only when it deferred (lens cover closed, durable
+        # state verified, streaming unverified). Reset by every
+        # verify call; read by the preflights and, through them,
+        # the provisioner's own presence_deferred flag.
+        self.presence_verify_deferred = False
 
     @property
     def _config(self) -> PresenceConfig:
@@ -401,6 +424,13 @@ class PresenceFeature:
         except ProvisionError as exc:
             print(f"PRESENCE_PREFLIGHT action=install reason={exc}")
             return False
+        if self.presence_verify_deferred:
+            print(
+                "PRESENCE_PREFLIGHT action=skip profile=durable "
+                "deferred=shutter_closed "
+                f"verified_marker={int(marker_present)}"
+            )
+            return True
         print(
             "PRESENCE_PREFLIGHT action=skip profile=active "
             f"verified_marker={int(marker_present)}"
@@ -435,6 +465,13 @@ class PresenceFeature:
         except ProvisionError as exc:
             print(f"PRESENCE_FPS_PREFLIGHT action=install reason={exc}")
             return False
+        if self.presence_verify_deferred:
+            print(
+                "PRESENCE_FPS_PREFLIGHT action=skip "
+                f"fps={self._config.presence_fps_cap} "
+                "deferred=shutter_closed"
+            )
+            return True
         print(
             "PRESENCE_FPS_PREFLIGHT action=skip "
             f"fps={self._config.presence_fps_cap} activation=uid1000"
@@ -644,12 +681,130 @@ class PresenceFeature:
             return
         self.compile_camera_light_host_speed()
 
+    def _presence_fps_configured_path(self) -> str:
+        return (
+            "/data/local/tmp/portal-presence-backup/fps-cap-v1"
+            if self._target() and self._target().uid1000_embedded_helper
+            else self._uid1000_path("presence-fps")
+        )
+
+    def _presence_shutter_closed(self) -> bool:
+        """The camera lens cover state, from the platform state
+        service: shutter_state=1 is the covered state (the device's
+        own analytics name it CAMERA_LENS_COVERED). The privacy-mode
+        signals the live check samples do NOT track the cover. An
+        unreadable or absent value reads as open, so the live check
+        decides exactly as it did before this gate existed (the
+        aloha target exposes no shutter state at all)."""
+        result = self._adb_run(
+            ["shell", "dumpsys", "platform_state_service"], timeout=10
+        )
+        match = re.search(r"shutter_state=(\d+)", result.stdout or "")
+        return match is not None and match.group(1) == "1"
+
+    def _presence_service_problems(self) -> list[str]:
+        """Durable service-level presence state, readable with the
+        lens cover shut: the aiservice process is running and its
+        CAMERA appop is allowed."""
+        problems: list[str] = []
+        pid = self._adb_run(
+            ["shell", "pidof", "com.facebook.portal.aiservice"],
+            timeout=5,
+        ).stdout.strip()
+        if not pid:
+            problems.append("aiservice-not-running")
+        appops = self._adb_run(
+            [
+                "shell",
+                "cmd",
+                "appops",
+                "get",
+                "com.facebook.portal.aiservice",
+                "CAMERA",
+            ],
+            timeout=10,
+        ).stdout
+        if "CAMERA: allow" not in appops:
+            problems.append("camera-appop-not-allow")
+        return problems
+
+    def _presence_profile_evidenced(
+        self, required_profile_keys: set[str]
+    ) -> bool:
+        """Durable profile evidence usable with the cover shut: the
+        installed marker (written only after a full streaming
+        verification has passed once) or this boot's config-load
+        lines still in logcat — aiservice loads settings_config.xml
+        when it starts, and a run that applied the profile leaves
+        them fresh in the buffer."""
+        if self._adb_run(
+            ["shell", "test", "-f", PRESENCE_INSTALLED_REMOTE],
+            timeout=5,
+        ).returncode == 0:
+            return True
+        logs = self._adb_run(
+            [
+                "shell",
+                "logcat",
+                "-d",
+                "-v",
+                "brief",
+                "-e",
+                PRESENCE_LOGCAT_REGEX,
+            ],
+            timeout=20,
+        ).stdout
+        return required_profile_keys.issubset(loaded_profile_keys(logs))
+
+    def _verify_presence_durable(
+        self,
+        require_profile: bool,
+        expected_analysis_fps: int | None,
+        required_profile_keys: set[str],
+    ) -> None:
+        """Everything about the presence end state that can be
+        verified with the lens cover shut. Raises ProvisionError
+        listing every problem found; returns when the durable
+        state holds. The FPS cap is evidenced by its marker file,
+        whose content the live check already trusts the same way."""
+        problems = self._presence_service_problems()
+        if require_profile and not self._presence_profile_evidenced(
+            required_profile_keys
+        ):
+            problems.append("profile-not-evidenced")
+        if expected_analysis_fps is not None:
+            configured = self._adb_run(
+                ["shell", "cat", self._presence_fps_configured_path()],
+                timeout=5,
+            )
+            if (
+                configured.returncode != 0
+                or configured.stdout.strip() != str(expected_analysis_fps)
+            ):
+                problems.append("fps-cap-marker-mismatch")
+        if problems:
+            raise ProvisionError(
+                "presence durable state did not verify with the "
+                "camera cover closed: " + ", ".join(problems)
+            )
+
     def verify_presence_runtime(
         self,
         require_profile: bool,
         expected_analysis_fps: int | None = None,
         wait_seconds: int = 90,
-    ) -> None:
+    ) -> str:
+        """Live presence verification. Returns "verified" when the
+        pipeline was observed streaming, or "deferred" when the
+        camera lens cover is closed: the cover gates the pipeline
+        by design (it configures, starts, and pauses without ever
+        opening the camera), so the streaming evidence can never
+        appear while it is shut no matter how healthy the
+        provisioned state is. In that case the durable end state
+        is verified instead and the streaming verification is
+        deferred to a later run with the cover open. A durable
+        failure raises ProvisionError, as a live failure does."""
+        self.presence_verify_deferred = False
         deadline = time.monotonic() + wait_seconds
         pid = ""
         camera_active = False
@@ -673,18 +828,29 @@ class PresenceFeature:
             else PRESENCE_PROFILE_KEYS
         )
         if expected_analysis_fps is not None:
-            configured_path = (
-                "/data/local/tmp/portal-presence-backup/fps-cap-v1"
-                if self._target() and self._target().uid1000_embedded_helper
-                else self._uid1000_path("presence-fps")
-            )
             configured = self._adb_run(
-                ["shell", "cat", configured_path], timeout=5
+                ["shell", "cat", self._presence_fps_configured_path()],
+                timeout=5,
             )
             uid1000_configured = (
                 configured.returncode == 0
                 and configured.stdout.strip() == str(expected_analysis_fps)
             )
+        if self._presence_shutter_closed():
+            self._verify_presence_durable(
+                require_profile,
+                expected_analysis_fps,
+                required_profile_keys,
+            )
+            self.presence_verify_deferred = True
+            print(
+                "PRESENCE_VERIFY_DEFERRED reason=shutter_closed "
+                f"require_profile={int(require_profile)} "
+                f"analysis_fps={expected_analysis_fps or 'unlimited'} "
+                "durable=ok",
+                flush=True,
+            )
+            return "deferred"
         threads = ""
         while time.monotonic() < deadline:
             pid = self._adb_run(
@@ -740,18 +906,7 @@ class PresenceFeature:
             wide_frame = wide_frame or presence_full_scene_active(
                 logs, camera, self._target()
             )
-            loaded_keys.update({
-                key
-                for key, expected in PRESENCE_PROFILE_SETTINGS.items()
-                if any(
-                    "settings_config.xml" in line
-                    and key in line
-                    and re.search(
-                        rf"\b{str(expected).lower()}\b", line, re.IGNORECASE
-                    )
-                    for line in logs.splitlines()
-                )
-            })
+            loaded_keys.update(loaded_profile_keys(logs))
             analysis_fps_applied = analysis_fps_applied or (
                 expected_analysis_fps is not None
                 and any(
@@ -860,7 +1015,7 @@ class PresenceFeature:
                     f"activation_host={'uid1000' if expected_analysis_fps else 'none'} "
                     f"workers_absent={','.join(disabled_workers) or 'none'}"
                 )
-                return
+                return "verified"
             time.sleep(2)
         camera_hint = (
             " Check that the Portal's physical camera cover is open and its "
@@ -893,7 +1048,7 @@ class PresenceFeature:
         expected_analysis_fps: int | None = None,
         require_marker: bool = True,
         wait_seconds: int = 90,
-    ) -> None:
+    ) -> str:
         """End-state presence verification for the root-channel path.
 
         verify_presence_runtime() proves the profile from logcat
@@ -914,7 +1069,15 @@ class PresenceFeature:
         marker file whose content the race verify already reads.
         Guarantee preserved: the presence profile is the applied
         one (durable markers) and the presence pipeline is live
-        with it now (live subset)."""
+        with it now (live subset).
+
+        Returns "verified" or "deferred", like
+        verify_presence_runtime(): with the camera lens cover
+        closed the live subset can never pass (the pipeline never
+        opens the camera), so once the durable checks above hold
+        and the service-level state verifies, the streaming
+        verification defers instead of failing the run."""
+        self.presence_verify_deferred = False
         if require_marker and self._adb_run(
             ["shell", "test", "-f", PRESENCE_INSTALLED_REMOTE],
             timeout=5,
@@ -925,13 +1088,9 @@ class PresenceFeature:
                 "verification on this device"
             )
         if expected_analysis_fps is not None:
-            configured_path = (
-                "/data/local/tmp/portal-presence-backup/fps-cap-v1"
-                if self._target() and self._target().uid1000_embedded_helper
-                else self._uid1000_path("presence-fps")
-            )
             configured = self._adb_run(
-                ["shell", "cat", configured_path], timeout=5
+                ["shell", "cat", self._presence_fps_configured_path()],
+                timeout=5,
             )
             if (
                 configured.returncode != 0
@@ -942,6 +1101,20 @@ class PresenceFeature:
                     f"channel path: expected={expected_analysis_fps} "
                     f"marker={configured.stdout.strip()!r}"
                 )
+        if self._presence_shutter_closed():
+            problems = self._presence_service_problems()
+            if problems:
+                raise ProvisionError(
+                    "presence durable state did not verify with the "
+                    "camera cover closed: " + ", ".join(problems)
+                )
+            self.presence_verify_deferred = True
+            print(
+                "PRESENCE_VERIFY_DEFERRED reason=shutter_closed "
+                "path=channel durable=ok",
+                flush=True,
+            )
+            return "deferred"
         deadline = time.monotonic() + wait_seconds
         pid = ""
         camera_active = False
@@ -1033,7 +1206,7 @@ class PresenceFeature:
                     "frame_processor=loaded profile=durable-marker "
                     f"analysis_fps={expected_analysis_fps or 'unlimited'}"
                 )
-                return
+                return "verified"
             time.sleep(2)
         camera_hint = (
             " Check that the Portal's physical camera cover is open "
