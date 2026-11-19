@@ -167,6 +167,26 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A delta run on the root-channel path replaced the recorded
+  state manifest with a record of itself: a bare `--dns
+  one.one.one.one` channel run on a fully provisioned unit
+  rewrote the manifest with only the DNS action, a third of the
+  artifact hashes, and no `autoroot_key_sha256`, even though the
+  run had un-applied nothing. The manifest is the device's
+  accumulated recorded state — the no-op and channel gates, the
+  OTA posture trust and `--status` all read it — so the next
+  `--full` run failed both fast paths
+  (`PROVISION_CHANNEL_SKIP reason=ota-not-configured`, because
+  `disable_updates` was no longer recorded) and had to race.
+  The channel completion write now merges into the manifest the
+  run started from: prior actions and artifact hashes are
+  preserved with the completing run's values winning per key,
+  the recorded autoroot key hash survives unless the run
+  restaged autoroot, and the recorded verification boots carry
+  over; the tool revision and desired state follow the
+  completing run as before. The race/stages completion writes
+  keep their replace semantics. Live validation is deferred to
+  a later session.
 - `--full --dns <hostname>` could never complete through the
   channel: the preset expansion ran after the `--dns` translation
   and set `dhcp_dns` on top of it, so the composed config carried
