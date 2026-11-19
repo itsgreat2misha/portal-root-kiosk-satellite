@@ -1399,6 +1399,114 @@ class PayloadTerminalManifestMergeTest(unittest.TestCase):
                 "prior/only-artifact.bin", captured["artifact_sha256"]
             )
 
+class CombinedRunVerificationBootsTest(unittest.TestCase):
+    """Defect K: in a combined (stages + custom payload) run the
+    standard install phase verifies the two boots and writes
+    them, then the payload phase's terminal merged write merged
+    against the run's START snapshot and carried its verification
+    block forward over the boots the run itself had just
+    recorded. Closure session 13 (Nov 19, 2026): the run printed
+    PROVISION_OK first_boot=d7f8e5ba second_boot=f8d5ccb5, but
+    the final manifest's verification block was null/null. The
+    boots a run establishes now win over the start record's
+    block in merged writes, and the OTA manifest corrections
+    fall back to them the same way."""
+
+    def _prior_record(self, temporary: str) -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        return {
+            "schema": 1,
+            "status": "complete",
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": dict(full.requested_actions()),
+            "artifact_sha256": dict(full.selected_artifact_hashes()),
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {"first_boot": None, "second_boot": None},
+        }
+
+    def _capture_writes(self, provisioner: PortalProvisioner) -> list:
+        writes: list = []
+
+        def fake_write_state(status, **state_kwargs):
+            writes.append((status, state_kwargs))
+
+        unittest.mock.patch.object(
+            provisioner,
+            "adb_run",
+            return_value=completed([], ALOHA.fingerprint + "\n"),
+        ).start()
+        self.addCleanup(unittest.mock.patch.stopall)
+        unittest.mock.patch.object(
+            provisioner.run_state, "write_state", fake_write_state
+        ).start()
+        return writes
+
+    def test_combined_run_boots_survive_the_terminal_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, **DOCUMENTED)
+            provisioner._start_state = self._prior_record(temporary)
+            provisioner.verify_boots = 2
+            provisioner.adb_framework_boot_install_requested = lambda: False
+            provisioner.verify_requested_state = lambda: None
+            reboots = iter([("boot-0", "boot-1"), ("boot-1", "boot-2")])
+            provisioner.reboot = lambda: next(reboots)
+            writes = self._capture_writes(provisioner)
+            with redirect_stdout(io.StringIO()):
+                # The standard install phase's verification: it
+                # writes the boots it established.
+                provisioner.verify_across_two_reboots()
+                install_write = writes[-1][1]
+                self.assertEqual(install_write["first_boot"], "boot-1")
+                self.assertEqual(install_write["second_boot"], "boot-2")
+                # The payload phase's terminal merged write
+                # supplies no boots; the run's own verified boots
+                # must survive it, not the start record's nulls.
+                provisioner.write_state("complete", merge_prior=True)
+            terminal_write = writes[-1][1]
+            self.assertEqual(terminal_write["first_boot"], "boot-1")
+            self.assertEqual(terminal_write["second_boot"], "boot-2")
+
+    def test_merged_write_without_verified_boots_records_nulls(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, **DOCUMENTED)
+            provisioner._start_state = self._prior_record(temporary)
+            writes = self._capture_writes(provisioner)
+            with redirect_stdout(io.StringIO()):
+                provisioner.write_state("complete", merge_prior=True)
+            captured = writes[-1][1]
+            # No fabricated boots: a run that verified none
+            # records the start record's nulls as nulls.
+            self.assertIsNone(captured["first_boot"])
+            self.assertIsNone(captured["second_boot"])
+
+    def test_ota_correction_falls_back_to_the_runs_boots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, **DOCUMENTED)
+            provisioner._verified_boots = ("boot-1", "boot-2")
+            provisioner.read_state = lambda: {
+                "status": "complete",
+                "actions": {"disable_updates": True},
+                "verification": {
+                    "first_boot": None,
+                    "second_boot": None,
+                },
+            }
+            calls: list = []
+            provisioner.write_state = (
+                lambda status, first=None, second=None, **kw: calls.append(
+                    (status, first, second)
+                )
+            )
+            with redirect_stdout(io.StringIO()):
+                provisioner._correct_manifest_for_unverified_ota()
+            self.assertEqual(calls, [("complete", "boot-1", "boot-2")])
+
+
 class VerifyRequestedStateAudioTest(unittest.TestCase):
     """The channel apply's final verification runs on the device's
     current boot, however old, so its audio check must use the

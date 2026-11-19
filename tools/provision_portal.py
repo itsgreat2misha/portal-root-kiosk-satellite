@@ -554,6 +554,15 @@ class PortalProvisioner:
         # repair routed through the channel path.
         self._start_state: dict[str, object] | None = None
         self._start_state_captured = False
+        # The verification boots THIS run established, recorded by
+        # verify_across_two_reboots. A merged completion write
+        # takes them over the start manifest's verification block:
+        # in a combined run the standard install phase verifies
+        # the boots and writes them, and the payload phase's
+        # terminal merged write then merged against the START
+        # snapshot, carrying its (null) verification forward over
+        # the boots the run itself had just recorded (Defect K).
+        self._verified_boots: tuple[str | None, str | None] | None = None
         self._dns_apply_deferred = False
         self._dns_repair_expectation: tuple[str, str] | None = None
         self.shizuku_apk = shizuku_apk
@@ -2842,6 +2851,29 @@ class PortalProvisioner:
             pass
         return self._ota_install_verified_this_run
 
+    def _manifest_boots(
+        self, state: dict[str, object]
+    ) -> tuple[str | None, str | None]:
+        """The verification boots a manifest re-write preserves:
+        the record's own block first, then the boots this run
+        itself established where the record's block is missing
+        them (Defect K: a correction re-write must not carry a
+        stale null block over the run's verified boots)."""
+        first_boot = second_boot = None
+        verification = state.get("verification")
+        if isinstance(verification, dict):
+            if isinstance(verification.get("first_boot"), str):
+                first_boot = verification["first_boot"]
+            if isinstance(verification.get("second_boot"), str):
+                second_boot = verification["second_boot"]
+        if self._verified_boots is not None:
+            own_first, own_second = self._verified_boots
+            if first_boot is None:
+                first_boot = own_first
+            if second_boot is None:
+                second_boot = own_second
+        return first_boot, second_boot
+
     def _correct_manifest_for_unverified_ota(self) -> None:
         """Re-write a completed manifest that claimed the OTA
         action done now that the final judgment marks it
@@ -2860,13 +2892,7 @@ class PortalProvisioner:
             return
         if actions.get("disable_updates") is not True:
             return
-        first_boot = second_boot = None
-        verification = state.get("verification")
-        if isinstance(verification, dict):
-            if isinstance(verification.get("first_boot"), str):
-                first_boot = verification["first_boot"]
-            if isinstance(verification.get("second_boot"), str):
-                second_boot = verification["second_boot"]
+        first_boot, second_boot = self._manifest_boots(state)
         self.write_state("complete", first_boot, second_boot)
         print(
             "OTA_MANIFEST_CORRECTED action=disable_updates "
@@ -2894,13 +2920,7 @@ class PortalProvisioner:
             return
         if actions.get("disable_updates") != "unverified":
             return
-        first_boot = second_boot = None
-        verification = state.get("verification")
-        if isinstance(verification, dict):
-            if isinstance(verification.get("first_boot"), str):
-                first_boot = verification["first_boot"]
-            if isinstance(verification.get("second_boot"), str):
-                second_boot = verification["second_boot"]
+        first_boot, second_boot = self._manifest_boots(state)
         self.write_state("complete", first_boot, second_boot)
         print(
             "OTA_MANIFEST_CORRECTED action=disable_updates "
@@ -3066,11 +3086,13 @@ class PortalProvisioner:
             # This run's applied actions and artifact hashes win
             # per key; the recorded autoroot key hash survives
             # unless this run restaged autoroot (then the staged
-            # hash above is the new one); the recorded verification
-            # boots carry over where this write supplies none (the
-            # manifest-correction re-writes preserve them the same
-            # way). Tool revision and desired state follow the
-            # completing run, as in every other write.
+            # hash above is the new one); the verification boots
+            # this run itself established win over the start
+            # record's block, which otherwise carries over where
+            # this write supplies none (the manifest-correction
+            # re-writes preserve them the same way). Tool revision
+            # and desired state follow the completing run, as in
+            # every other write.
             prior = self._start_state
             if isinstance(prior, dict) and prior.get("status") == "complete":
                 prior_actions = prior.get("actions")
@@ -3083,6 +3105,20 @@ class PortalProvisioner:
                     recorded_key = prior.get("autoroot_key_sha256")
                     if isinstance(recorded_key, str):
                         autoroot_key_sha256 = recorded_key
+                if self._verified_boots is not None:
+                    # The boots THIS run established win over the
+                    # start snapshot's block (Defect K): the merge
+                    # base predates the run's own verification, so
+                    # carrying its block forward unconditionally
+                    # overwrote the boots the run had just recorded
+                    # (a combined run's install phase writes them;
+                    # the payload phase's terminal write then
+                    # replaced them with the start record's nulls).
+                    own_first, own_second = self._verified_boots
+                    if first_boot is None:
+                        first_boot = own_first
+                    if second_boot is None:
+                        second_boot = own_second
                 verification = prior.get("verification")
                 if isinstance(verification, dict):
                     if first_boot is None and isinstance(
@@ -7629,6 +7665,11 @@ class PortalProvisioner:
                 "ADB_FRAMEWORK_BOOT_OK persistence=uid1000 "
                 "adb_enabled=1"
             )
+        # The boots this run itself established: later writes of
+        # this run (a combined run's payload terminal write, the
+        # OTA manifest corrections) record these, never a stale
+        # snapshot's verification block (Defect K).
+        self._verified_boots = (first_boot, second_boot)
         self.write_state("complete", first_boot, second_boot)
         print(
             f"PROVISION_OK first_boot={first_boot} second_boot={second_boot} "
