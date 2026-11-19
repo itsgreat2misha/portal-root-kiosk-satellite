@@ -167,6 +167,20 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The channel gate refused every device in the recorded
+  alohausers-disabled posture that requested Meta account
+  removal: the meta-accounts preflight's already-clean requires
+  the package NOT disabled, which the posture makes unreachable
+  even though the removal's end state (accounts absent,
+  authenticators disabled) holds (found in the Phase D gate
+  re-run). The channel gate now gives the meta clause the same
+  recorded-posture trust the OTA clause already had: the
+  manifest's recorded disabled posture satisfies the package
+  clause when the preflight's live reads still hold. The
+  preflight itself is unchanged, so the stages path's
+  enable-then-remove flow is unaffected. Live validation is
+  deferred to the Phase D gate re-run once the test unit
+  returns.
 - Autoroot staging through the channel path rendered the frozen
   on-device exploit environments outside the custom-payload
   phase, so the staged env files silently lacked the payload
