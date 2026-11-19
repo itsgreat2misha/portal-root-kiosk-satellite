@@ -167,6 +167,17 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- `--dns <hostname>` crashed every run after the live Private DNS
+  settings had already been changed: the apply normalized the
+  hostname and wrote it back into the frozen SettingsConfig,
+  raising FrozenInstanceError before verification and the
+  completion write (found live in the Phase D gate re-run;
+  `--dns off` was unaffected because its apply mutates nothing).
+  The apply no longer writes the config, and the verification
+  derives its expected hostname in the same normalized form the
+  applies write to the device, so the hostname path completes on
+  the channel and stages paths alike. Live validation is
+  deferred to the gate completion session.
 - Race-heavy runs could cost a unit its saved WiFi network: every
   boot auto-connects within seconds, which makes system_server
   update the saved-network record and schedule an asynchronous

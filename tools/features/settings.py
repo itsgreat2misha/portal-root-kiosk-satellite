@@ -482,7 +482,10 @@ class SettingsFeature:
                 timeout=10,
                 check=True,
             )
-            self._config.privacy_dns = hostname
+            # No write-back of the normalized hostname: the config is
+            # a frozen snapshot rebuilt from the provisioner's flags
+            # on every access, and verify_privacy_dns derives the same
+            # normalized expectation from it.
             self.verify_privacy_dns()
 
     def apply_dhcp_dns(self) -> None:
@@ -536,6 +539,12 @@ class SettingsFeature:
             ).stdout.strip()
             expected_mode = "hostname"
             expected_hostname = self._config.privacy_dns
+            if expected_hostname is not None:
+                # The applies write the normalized form to the device
+                # (and the recorded-state derivation normalizes the
+                # same way), so the expectation is normalized too
+                # rather than read back from a mutated config.
+                expected_hostname = expected_hostname.strip().lower()
             if self._config.dhcp_dns:
                 expected_mode = "off"
                 expected_hostname = "null"
