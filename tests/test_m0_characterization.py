@@ -1160,6 +1160,101 @@ class PrivateDnsBackupRoundTripTest(unittest.TestCase):
                             provisioner.restore_private_dns()
 
 
+class PrivateDnsApplyTest(unittest.TestCase):
+    """The shared apply sequence's DNS applies, driven end to end.
+
+    Regression pin: apply_privacy_dns used to write the normalized
+    hostname back into the frozen SettingsConfig and crashed with
+    FrozenInstanceError after the live settings were already changed,
+    so --dns <hostname> could not complete on any path. The off
+    spelling never hit the assignment (its apply mutates nothing)
+    and is pinned alongside for symmetry.
+    """
+
+    def _device(self, settings):
+        remote = FakeRemoteFiles()
+
+        def adb_run(arguments, timeout=None, check=False):
+            arguments = [str(argument) for argument in arguments]
+            if arguments[:4] == ["shell", "settings", "get", "global"]:
+                return subprocess.CompletedProcess(
+                    arguments, 0, settings.get(arguments[4], "null") + "\n"
+                )
+            if arguments[:4] == ["shell", "settings", "put", "global"]:
+                settings[arguments[4]] = arguments[5]
+                return subprocess.CompletedProcess(arguments, 0, "")
+            if arguments[:4] == ["shell", "settings", "delete", "global"]:
+                settings.pop(arguments[4], None)
+                return subprocess.CompletedProcess(arguments, 0, "")
+            return remote.adb_run(arguments, timeout=timeout, check=check)
+
+        return adb_run
+
+    def test_hostname_apply_through_the_shared_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            # The CLI hands the hostname over raw; normalization is
+            # the apply's job.
+            provisioner = make_provisioner(
+                temporary, privacy_dns="One.One.One.One"
+            )
+            settings = {
+                "private_dns_mode": "opportunistic",
+                "private_dns_specifier": "dns.example.org",
+            }
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=self._device(settings)
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                provisioner._apply_shell_level_state(
+                    debloat_configured=False,
+                    remote_wipe_configured=False,
+                    defer_dns=False,
+                )
+                # The end-of-run verification reads the same raw flag
+                # value and must agree with what the apply wrote.
+                provisioner.verify_privacy_dns()
+            self.assertEqual(
+                settings,
+                {
+                    "private_dns_mode": "hostname",
+                    "private_dns_specifier": "one.one.one.one",
+                },
+            )
+            self.assertIn(
+                "PRIVACY_DNS_OK action=strict mode=hostname "
+                "hostname=one.one.one.one",
+                stdout.getvalue().splitlines(),
+            )
+
+    def test_off_apply_through_the_shared_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, dhcp_dns=True)
+            settings = {
+                "private_dns_mode": "hostname",
+                "private_dns_specifier": "one.one.one.one",
+            }
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    provisioner, "adb_run", side_effect=self._device(settings)
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                provisioner._apply_shell_level_state(
+                    debloat_configured=False,
+                    remote_wipe_configured=False,
+                    defer_dns=False,
+                )
+            self.assertEqual(settings, {"private_dns_mode": "off"})
+            self.assertIn(
+                "PRIVACY_DNS_OK action=network mode=off hostname=null",
+                stdout.getvalue().splitlines(),
+            )
+
+
 class AdbAuthTimeoutBackupRoundTripTest(unittest.TestCase):
     def test_backup_bytes_and_read_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
