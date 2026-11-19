@@ -110,6 +110,36 @@ the fork diverged from upstream:
 
 ### Changed
 
+- CLI flag consolidation (Phase D), a clean break with no aliases
+  for the old spellings: `--full` is now a preset expanding to the
+  documented full-setup line plus `--autoroot`; DNS is one flag,
+  `--dns off` (network-provided DNS) or `--dns HOSTNAME` (strict
+  Private DNS), replacing `--dhcp-dns` and `--privacy-dns HOSTNAME`;
+  and every restore is one repeatable flag, `--restore <name>`
+  (audio, bloat, remote-wipe, updates, dns, presence, presence-fps,
+  adb-auth-timeout, app-verifier, camera-light, autoroot,
+  wireless-adb, theme, meta-authenticators), replacing the nine
+  `--restore-*` flags and `--enable-updates`. Internal action ids
+  and the run manifest are unchanged.
+- The updates restore now replays the OTA packages' recorded
+  pre-disable states (enabled, disabled or absent) instead of
+  enabling both unconditionally; the disable path records them
+  first at `/data/local/tmp/portal-ota-packages-before-v1.json`.
+  Devices disabled before this change have no record and keep the
+  previous all-enabled behavior.
+- Restores that had no complete undo now do, under the two-tier
+  recorded-original / factory-default rule: `--restore autoroot`
+  unstages autoroot (helper, staging, saved keys, the authorized
+  ADB key, staged daemon files); `--restore wireless-adb` clears
+  the persisted ADB port (runtime and persist-property file) and
+  removes the wireless-ADB and ADB-framework boot-enforcement
+  markers; `--restore theme` returns `ui_night_mode` to its
+  recorded original (deleting the key when the original state had
+  none) and removes the theme controller's marker and helper;
+  `--restore meta-authenticators` returns the three Meta account
+  authenticator components to their recorded states. The accounts
+  themselves remain one-way: the README now marks Meta-account
+  removal as the only feature that cannot be undone.
 - The autoroot failure-budget stand-down threshold rises from 5 to
   10 consecutive truly incomplete boots. Live sessions showed the
   verdict-less (crash/freeze) loss shape is common enough on a

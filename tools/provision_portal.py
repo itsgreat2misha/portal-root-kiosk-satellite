@@ -225,6 +225,9 @@ DEFAULT_UID1000_HOST_PACKAGE = "com.facebook.alohasdk.platformbatterystate"
 WIRELESS_ADB_INSTALLED_REMOTE = (
     "/data/local/tmp/portal-wireless-adb-installed-v1"
 )
+OTA_PACKAGES_BACKUP_REMOTE = (
+    "/data/local/tmp/portal-ota-packages-before-v1.json"
+)
 ADB_FRAMEWORK_BOOT_INSTALLED_REMOTE = (
     "/data/local/tmp/portal-adb-framework-boot-installed-v1"
 )
@@ -351,6 +354,10 @@ class PortalProvisioner:
         persistent_wireless_adb: bool = False,
         disable_adb_auth_timeout: bool = False,
         restore_adb_auth_timeout: bool = False,
+        restore_autoroot: bool = False,
+        restore_wireless_adb: bool = False,
+        restore_theme: bool = False,
+        restore_meta_authenticators: bool = False,
         wireless_adb_only: bool = False,
         adb_framework_only: bool = False,
         meta_accounts_local_only: bool = False,
@@ -597,6 +604,7 @@ class PortalProvisioner:
                 restore_bloat=self.restore_bloat,
                 block_remote_wipe=self.block_remote_wipe,
                 restore_remote_wipe=self.restore_remote_wipe,
+                restore_meta_authenticators=self.restore_meta_authenticators,
                 privacy_dns=self.privacy_dns,
                 dhcp_dns=self.dhcp_dns,
                 restore_privacy_dns=self.restore_privacy_dns,
@@ -672,6 +680,10 @@ class PortalProvisioner:
             disable_adb_auth_timeout or persistent_wireless_adb
         )
         self.restore_adb_auth_timeout = restore_adb_auth_timeout
+        self.restore_autoroot = restore_autoroot
+        self.restore_wireless_adb = restore_wireless_adb
+        self.restore_theme = restore_theme
+        self.restore_meta_authenticators = restore_meta_authenticators
         self.wireless_adb_only = wireless_adb_only
         self.adb_framework_only = adb_framework_only
         self.meta_accounts_local_only = meta_accounts_local_only
@@ -878,6 +890,19 @@ class PortalProvisioner:
             )
         )
 
+    def restore_theme_uid1000_action_requested(self) -> bool:
+        """The theme restore needs the install loop only where the
+        theme control lives behind the UID-1000 marker (its deletion
+        and the helper teardown are native work); elsewhere the
+        recorded value replays from the shell."""
+        return bool(
+            self.restore_theme
+            and (
+                self.target is None
+                or self.target.system_theme_uid1000_required
+            )
+        )
+
     def uses_native_presence_prefs(self) -> bool:
         return bool(
             self.target
@@ -901,6 +926,7 @@ class PortalProvisioner:
             or self.restore_bloat
             or (self.block_remote_wipe and not self.remote_wipe_already_configured)
             or self.restore_remote_wipe
+            or self.restore_meta_authenticators
             or (
                 (
                     self.presence_fps_action_requested()
@@ -919,6 +945,7 @@ class PortalProvisioner:
             "restore_bloat",
             "block_remote_wipe",
             "restore_remote_wipe",
+            "restore_meta_authenticators",
         }
 
     @staticmethod
@@ -1560,6 +1587,8 @@ class PortalProvisioner:
             self.allow_third_party_app_updates()
         if self.restore_app_verifier:
             self.restore_app_verifier_setting()
+        if self.restore_theme:
+            self.restore_system_theme()
         if self.needs_component_ctl():
             self.prepare_component_actions()
 
@@ -2347,6 +2376,10 @@ class PortalProvisioner:
             "remove_shizuku",
             "disable_camera_light",
             "restore_camera_light",
+            "restore_autoroot",
+            "restore_wireless_adb",
+            "restore_theme",
+            "restore_meta_authenticators",
         ):
             if getattr(self, name):
                 actions[name] = True
@@ -3091,6 +3124,10 @@ class PortalProvisioner:
                 self.remove_shizuku,
                 self.disable_camera_light,
                 self.restore_camera_light,
+                self.restore_autoroot,
+                self.restore_wireless_adb,
+                self.restore_meta_authenticators,
+                self.restore_theme_uid1000_action_requested(),
                 self.custom_payload is not None,
                 self.system_theme_uid1000_action_requested(),
             )
@@ -4117,6 +4154,10 @@ class PortalProvisioner:
             "remove_shizuku",
             "disable_camera_light",
             "restore_camera_light",
+            "restore_autoroot",
+            "restore_wireless_adb",
+            "restore_theme",
+            "restore_meta_authenticators",
             "system_theme_control",
         }
         for name, value in actions.items():
@@ -4836,6 +4877,12 @@ class PortalProvisioner:
                 )
             if self.target.wireless_adb_uid1000_boot:
                 environment["GHOSTLOCK_UID1000_WIRELESS_ADB"] = "1"
+        if self.restore_wireless_adb:
+            environment["GHOSTLOCK_RESTORE_WIRELESS_ADB"] = "1"
+            if self.target.wireless_adb_file_property:
+                environment["GHOSTLOCK_WIRELESS_ADB_FILE_PROPERTY"] = (
+                    self.target.wireless_adb_file_property
+                )
         if self.needs_uid1000_payload() and (
             self.adb_framework_boot_install_requested()
             or self.adb_framework_boot_configured
@@ -5243,7 +5290,10 @@ class PortalProvisioner:
             # attempt verdict flips to WATCH_CFI_OK=0, and a won race
             # is discarded as a miss (bisect attempt 5, 2026-11-03).
             environment["GHOSTLOCK_SHIZUKU_AUTHORIZE_KEY"] = "1"
-        if self.remove_shizuku:
+        if self.remove_shizuku or self.restore_autoroot:
+            # Autoroot staging merged the Shizuku helper's keypair
+            # into the autoroot helper, so unstaging autoroot removes
+            # the same authorized line through the same action.
             environment["GHOSTLOCK_SHIZUKU_REMOVE_KEY"] = "1"
         if self.custom_payload is not None and self._in_custom_payload_phase:
             # The payload action belongs only to the custom-payload
@@ -5274,6 +5324,8 @@ class PortalProvisioner:
             environment["GHOSTLOCK_RESTORE_CAMERA_LIGHT"] = "1"
         if self.system_theme_uid1000_action_requested():
             environment["GHOSTLOCK_UID1000_SYSTEM_THEME_CONTROL"] = "1"
+        if self.restore_theme_uid1000_action_requested():
+            environment["GHOSTLOCK_RESTORE_SYSTEM_THEME"] = "1"
         if self.target.uid1000_embedded_helper and self.needs_uid1000_payload():
             if (
                 not self.uid1000_runtime_apk_remote
@@ -5453,6 +5505,20 @@ class PortalProvisioner:
             expected_markers["wireless_adb"] = (
                 "wireless ADB persistence install",
                 True,
+            )
+        if "GHOSTLOCK_RESTORE_WIRELESS_ADB" in environment:
+            expected_markers["wireless_adb_restore"] = (
+                "wireless ADB persistence restore",
+                True,
+            )
+            expected_markers["wireless_adb_uid1000_restore"] = (
+                "UID1000 wireless ADB helper restore",
+                False,
+            )
+        if "GHOSTLOCK_RESTORE_SYSTEM_THEME" in environment:
+            expected_markers["system_theme_uid1000_restore"] = (
+                "UID1000 system theme helper restore",
+                False,
             )
         if self.adb_framework_boot_install_requested():
             expected_markers["adb_framework_config"] = (
@@ -6030,12 +6096,67 @@ class PortalProvisioner:
     def verify_audio_restored(self, wait_seconds: int = 20) -> None:
         return self.audio_feature.verify_audio_restored(wait_seconds)
 
-    def disable_ota_packages(self) -> None:
-        packages = (
+    def _ota_package_list(self) -> tuple[str, ...]:
+        return (
             self.target.ota_packages
             if self.target
             else (OTA_UI_PACKAGE, OTA_SETUP_PACKAGE)
         )
+
+    def read_ota_package_record(self) -> dict[str, str] | None:
+        """The first-run record of the OTA packages' states, or
+        None when no --disable-updates run with recording has
+        happened on this device yet."""
+        result = self.adb_run(
+            ["shell", "cat", OTA_PACKAGES_BACKUP_REMOTE], timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            parsed = json.loads(result.stdout)
+            states = parsed["packages"]
+            if not isinstance(states, dict):
+                return None
+            return {
+                str(package): str(state)
+                for package, state in states.items()
+            }
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def record_ota_package_states(self) -> None:
+        """First-run record of the OTA packages' pre-disable states
+        (restore-completeness: the updates restore used to enable
+        unconditionally). First record wins."""
+        if self.read_ota_package_record() is not None:
+            print("OTA_PACKAGES_BACKUP_OK existing=1")
+            return
+        installed, disabled = self.package_sets()
+        states = {
+            package: (
+                "absent"
+                if package not in installed
+                else "disabled"
+                if package in disabled
+                else "enabled"
+            )
+            for package in self._ota_package_list()
+        }
+        self.push_text_atomic(
+            json.dumps({"packages": states}) + "\n",
+            OTA_PACKAGES_BACKUP_REMOTE,
+        )
+        print(
+            "OTA_PACKAGES_BACKUP_OK existing=0 states="
+            + ",".join(
+                f"{package}={states[package]}" for package in sorted(states)
+            )
+        )
+
+    def disable_ota_packages(self, record_original: bool = True) -> None:
+        if record_original:
+            self.record_ota_package_states()
+        packages = self._ota_package_list()
         for package in packages:
             result = self.adb_run(
                 ["shell", "pm", "disable-user", "--user", "0", package],
@@ -6053,12 +6174,26 @@ class PortalProvisioner:
                     )
 
     def enable_ota_packages(self) -> None:
-        packages = (
-            self.target.ota_packages
-            if self.target
-            else (OTA_UI_PACKAGE, OTA_SETUP_PACKAGE)
-        )
+        packages = self._ota_package_list()
+        recorded = self.read_ota_package_record()
         for package in packages:
+            # Two-tier restore semantics: replay the recorded
+            # original state when a record exists; the factory
+            # default (all enabled) applies otherwise.
+            state = recorded.get(package, "enabled") if recorded else "enabled"
+            if state == "absent":
+                continue
+            if state == "disabled":
+                result = self.adb_run(
+                    ["shell", "pm", "disable-user", "--user", "0", package],
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    raise ProvisionError(
+                        f"failed to re-disable OTA package {package}: "
+                        f"{result.stdout}"
+                    )
+                continue
             result = self.adb_run(
                 ["shell", "pm", "enable", "--user", "0", package], timeout=10
             )
@@ -6089,11 +6224,30 @@ class PortalProvisioner:
             timeout=10,
             check=True,
         ).stdout
-        packages = (
-            self.target.ota_packages
-            if self.target
-            else (OTA_UI_PACKAGE, OTA_SETUP_PACKAGE)
-        )
+        packages = self._ota_package_list()
+        recorded = self.read_ota_package_record()
+        if recorded is not None:
+            # With a first-run record, "restored" means each package
+            # is back in its recorded state (a package that was
+            # disabled before provisioning stays disabled).
+            installed, _ = self.package_sets()
+            mismatched = []
+            for package in packages:
+                state = recorded.get(package, "enabled")
+                if state == "absent":
+                    if package in installed:
+                        mismatched.append(package)
+                elif (f"package:{package}" in disabled) != (
+                    state == "disabled"
+                ):
+                    mismatched.append(package)
+            if mismatched:
+                raise ProvisionError(
+                    "OTA packages do not match their recorded states: "
+                    + ", ".join(mismatched)
+                )
+            print("OTA_RESTORE_OK packages=recorded override=restored")
+            return
         still_disabled = [
             package
             for package in packages
@@ -6431,7 +6585,7 @@ class PortalProvisioner:
         if self.restore_audio:
             self.verify_audio_restored()
         if self.disable_updates:
-            self.disable_ota_packages()
+            self.disable_ota_packages(record_original=False)
             self.verify_ota_block(via_channel=via_channel)
         if self.enable_updates:
             self.verify_ota_restored()
@@ -6530,12 +6684,87 @@ class PortalProvisioner:
             self.verify_camera_light_disabled()
         if self.restore_camera_light:
             self.verify_camera_light_restored()
+        if self.restore_wireless_adb:
+            property_name = (
+                self.target.wireless_adb_file_property
+                if self.target and self.target.wireless_adb_file_property
+                else "persist.adb.tcp.port"
+            )
+            persistent_port = self.adb_run(
+                ["shell", "getprop", property_name],
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+            if persistent_port == "5555":
+                raise ProvisionError(
+                    "wireless ADB persistence is still set: "
+                    f"{property_name}=5555"
+                )
+            for path in (
+                WIRELESS_ADB_INSTALLED_REMOTE,
+                self.uid1000_path("wireless-adb-enabled"),
+                self.uid1000_path("adb-framework-enabled"),
+            ):
+                if self.adb_run(
+                    ["shell", "test", "-e", path], timeout=5
+                ).returncode == 0:
+                    raise ProvisionError(
+                        f"wireless ADB restore left {path} in place"
+                    )
+            print(
+                "WIRELESS_ADB_RESTORE_OK "
+                f"property={property_name} value=unset"
+            )
+        if self.restore_theme:
+            self.verify_system_theme_restored()
+            if self.adb_run(
+                [
+                    "shell", "test", "-e",
+                    self.uid1000_path("system-theme-control-enabled"),
+                ],
+                timeout=5,
+            ).returncode == 0:
+                raise ProvisionError(
+                    "UID-1000 system theme control marker remains"
+                )
+            print("SYSTEM_THEME_RESTORE_VERIFIED")
+        if self.restore_meta_authenticators:
+            disabled = self.disabled_meta_authenticators()
+            still_disabled = set(META_AUTHENTICATOR_COMPONENTS) & disabled
+            if still_disabled:
+                raise ProvisionError(
+                    "Meta authenticators remain disabled: "
+                    + ", ".join(sorted(still_disabled))
+                )
+            print("META_AUTHENTICATORS_RESTORE_OK authenticators=restored")
+        if self.restore_autoroot:
+            installed, _ = self.package_sets()
+            if AUTOROOT_HELPER_PACKAGE in installed:
+                raise ProvisionError("autoroot helper is still installed")
+            if self.adb_run(
+                ["shell", "test", "-f", f"{AUTOROOT_REMOTE_DIR}/run.sh"],
+                timeout=5,
+            ).returncode == 0:
+                raise ProvisionError("autoroot staging is still in place")
+            print("AUTOROOT_RESTORE_VERIFIED helper=absent staging=absent")
 
     def verify_camera_light_disabled(self, wait_seconds: int = 35) -> None:
         return self.presence_feature.verify_camera_light_disabled(wait_seconds)
 
     def verify_camera_light_restored(self) -> None:
         return self.presence_feature.verify_camera_light_restored()
+
+    def record_system_theme_original(self) -> None:
+        return self.presence_feature.record_system_theme_original()
+
+    def restore_system_theme(self) -> None:
+        return self.presence_feature.restore_system_theme()
+
+    def verify_system_theme_restored(self) -> None:
+        return self.presence_feature.verify_system_theme_restored()
+
+    def unstage_autoroot(self) -> None:
+        return self.payload_feature.unstage_autoroot()
 
     def verify_across_two_reboots(self, first_boot: str | None = None) -> None:
         if first_boot is None:
@@ -6697,12 +6926,16 @@ class PortalProvisioner:
                     ).stdout.strip()
                 if self.remove_shizuku:
                     self.uninstall_shizuku_payload()
+                if self.restore_autoroot:
+                    self.unstage_autoroot()
                 if self.presence_fps_action_requested():
                     self.uninstall_presence_helper()
                 if (
                     self.restore_camera_light
                     or self.restore_presence_fps
                     or self.restore_presence_profile
+                    or self.restore_theme
+                    or self.restore_wireless_adb
                 ):
                     self.restore_uid1000_package_state_if_unused()
                 self.verify_across_two_reboots(first_boot=post_attempt_boot)
@@ -6801,6 +7034,10 @@ class PortalProvisioner:
         ):
             return
         if self.system_theme_control is not None:
+            # Record the pre-change value before any apply can
+            # overwrite it (restore-completeness gap 5); first
+            # record wins, so this is a no-op on later runs.
+            self.record_system_theme_original()
             self.system_theme_control_already_configured = (
                 self.system_theme_control_preflight()
             )
@@ -6889,6 +7126,7 @@ class PortalProvisioner:
             ).stdout.strip()
         self.persist_wireless_adb = (
             not self.adb_framework_only
+            and not self.restore_wireless_adb
             and self.privileged_requested()
             and persistent_port != "5555"
         )
@@ -7422,6 +7660,10 @@ class PortalProvisioner:
             or (self.remove_meta_accounts and not already_meta_clean)
             or self.shizuku
             or self.remove_shizuku
+            or self.restore_autoroot
+            or self.restore_wireless_adb
+            or self.restore_meta_authenticators
+            or self.restore_theme_uid1000_action_requested()
             or self.disable_camera_light
             or self.restore_camera_light
             or self.custom_payload is not None
@@ -7432,6 +7674,7 @@ class PortalProvisioner:
                 "disable_adb_auth_timeout",
                 "restore_adb_auth_timeout",
                 "system_theme_control",
+                "restore_theme",
             }:
                 self.verify_requested_state()
                 self.write_state("complete")

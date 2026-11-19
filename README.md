@@ -37,7 +37,7 @@ Persistent features use focused configuration changes or small boot helpers.
 | [Firmware-update blocking](#disable-automatic-meta-firmware-updates) | Prevents an unexpected Meta update from breaking a known working setup. |
 | [Meta remote-wipe blocking](#block-metas-known-remote-wipe-receivers) | Disables Meta's known remote factory-reset entry points while retaining local recovery options. |
 | [Meta app debloat](#disable-unused-meta-applications) | Reduces background work from unused Meta apps, cloud clients and diagnostics. |
-| [Meta-account removal](#remove-local-meta-accounts) | Removes obsolete local account data while retaining services needed by the camera and Portal. |
+| [Meta-account removal](#remove-local-meta-accounts) | Removes obsolete local account data while retaining services needed by the camera and Portal. **One-way: cannot be undone** (see [What can't be undone](#what-cant-be-undone)). |
 | [Presence optimization](#reduce-aiservice-cpu-use-while-preserving-presence-detection) | Lowers AIService CPU use while preserving full-view, LED-free person detection. |
 | [Presence frame-rate cap](#optional-presence-analysis-frame-rate-cap) | Further reduces analysis work without limiting the camera's capture frame rate. |
 | [Filtering Private DNS](#configure-dns) | Sends DNS to a chosen DNS-over-TLS resolver for network-level filtering. |
@@ -54,6 +54,20 @@ Persistent features use focused configuration changes or small boot helpers.
 | [Interrupted-run recovery](#interrupted-run-recovery) | Safely resumes a validated provisioning run after a host or power interruption. |
 | [Exact-build safeguards](#supported-models) | Refuses kernel changes unless the model and full firmware fingerprint match. |
 | [Automatic retry and verification](#running-and-troubleshooting) | Retries race-sensitive attempts and accepts changes only after two verified boots. |
+
+<a id="what-cant-be-undone"></a>
+## What can't be undone
+
+Almost everything the provisioner changes can be restored with
+`--restore <name>`: a restore replays the original state the
+provisioner recorded on the device before the change, and where no
+original was recorded it returns the setting to its factory
+default. The one exception is **Meta-account removal**
+(`--remove-meta-accounts`): the accounts are deleted, and the
+backup the provisioner keeps holds only account names and types,
+never credentials, so there is nothing to restore from. Re-adding
+an account is a manual sign-in on the device. A factory reset
+remains the universal undo for everything else.
 
 ## Requirements
 
@@ -195,20 +209,27 @@ provisioner checks them again before making any kernel change.
 ### 5. Run the provisioner
 
 There is no bundled profile: you select exactly the features you want.
-A full setup combining the core system features looks like:
+A full setup combining the core system features is one flag:
+
+```sh
+python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full
+```
+
+`--full` is a preset, not a separate mode: it expands to the
+documented full-setup line plus `--autoroot`:
 
 ```sh
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" \
   --audio --disable-updates --block-remote-wipe --debloat \
   --remove-meta-accounts --optimize-presence --allow-app-updates \
-  --disable-adb-auth-timeout --dhcp-dns
+  --disable-adb-auth-timeout --dns off --autoroot
 ```
 
 Each flag is explained in the reference below; combine only the ones you
 want. Common add-ons:
 
 - `--presence-fps-cap 2` to reduce Meta's presence-analysis rate
-- `--privacy-dns HOSTNAME` to use a specific Private DNS resolver instead
+- `--dns HOSTNAME` to use a specific Private DNS resolver instead
   of the full setup's DHCP-supplied DNS
 - `--system-theme-control light|dark` to enable and set live theme control
 - `--shizuku` to install Shizuku with automatic startup
@@ -285,7 +306,7 @@ saved timeout, run:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-adb-auth-timeout
+  --serial "$PORTAL_IP:5555" --restore adb-auth-timeout
 ```
 
 </details>
@@ -340,7 +361,7 @@ firmware's AEC and NS parameter defaults with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-audio
+  --serial "$PORTAL_IP:5555" --restore audio
 ```
 
 The restore uses the original loader saved during the first installation and
@@ -376,7 +397,7 @@ therefore also pins the platform backend inside the override and, in a
 separate phase running under the system identity, sets
 `persist.sys.mobileconfigutil.usePlatformMobileConfig=true`. The
 property's original value is saved before it is changed, and
-`--enable-updates` restores it. Verification on Aloha requires the
+`--restore updates` restores it. Verification on Aloha requires the
 backend property to be set and the gate to be observed being read from
 the override; if that cannot be positively established, the run records
 the OTA block as unverified instead of reporting success.
@@ -402,7 +423,7 @@ Restore that exact override state and re-enable both OTA packages with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --enable-updates
+  --serial "$PORTAL_IP:5555" --restore updates
 ```
 
 </details>
@@ -432,7 +453,7 @@ Restore both receivers to their individually saved states with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-remote-wipe
+  --serial "$PORTAL_IP:5555" --restore remote-wipe
 ```
 
 </details>
@@ -450,7 +471,7 @@ with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-camera-light
+  --serial "$PORTAL_IP:5555" --restore camera-light
 ```
 
 </details>
@@ -511,7 +532,7 @@ on-device: they have no package or init off-switch, and the
 provisioner's root shell is not permitted to change the kernel
 firewall tables. What provisioning does block is `--disable-updates`,
 which gates the OTA daemon's update checks, and the full setup's
-`--dhcp-dns`, which turns Android Private DNS off so DNS stays on the
+`--dns off`, which turns Android Private DNS off so DNS stays on the
 LAN resolver. Blocking the daemons' own traffic requires a
 network-side rule, such as dropping egress to Meta's `57.144.0.0/14`
 range for the Portal at the router.
@@ -846,7 +867,7 @@ states with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-bloat
+  --serial "$PORTAL_IP:5555" --restore bloat
 ```
 
 Both commands verify the retained camera, AIService, launcher, and WebView
@@ -876,6 +897,9 @@ The original account type and name inventory is saved at
 log directory. Tokens and full database contents are not backed up, so this
 action has no automated restore. Repeated runs are safe: once the accounts are
 gone and the authenticators are disabled, the tool only verifies the state.
+The authenticator components alone can be re-enabled with
+`--restore meta-authenticators` (to their recorded states, or enabled
+by default); that does not bring the accounts back.
 
 Removing the final Meta owner account can make Portal firmware select its
 obsolete invalid-owner HOME screen, which can take focus until a HOME app
@@ -948,7 +972,7 @@ The original settings-file state is stored under
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-presence-profile
+  --serial "$PORTAL_IP:5555" --restore presence
 ```
 
 The installer and restore action use atomic file replacement, preserve the
@@ -985,7 +1009,7 @@ Restore the saved Android setting and verifier-package state with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-app-verifier
+  --serial "$PORTAL_IP:5555" --restore app-verifier
 ```
 
 </details>
@@ -1034,10 +1058,10 @@ Remove only the cap and helper while keeping the full-scene optimization:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-presence-fps
+  --serial "$PORTAL_IP:5555" --restore presence-fps
 ```
 
-`--restore-presence-profile` also removes the cap and helper before restoring
+`--restore presence` also removes the cap and helper before restoring
 the complete original presence configuration.
 
 </details>
@@ -1052,7 +1076,7 @@ network, run:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --dhcp-dns
+  --serial "$PORTAL_IP:5555" --dns off
 ```
 
 This disables Android's opportunistic Private DNS mode. Android then uses the
@@ -1067,7 +1091,7 @@ Alternatively, configure a specific DNS-over-TLS resolver:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --privacy-dns dns.example.net
+  --serial "$PORTAL_IP:5555" --dns dns.example.net
 ```
 
 Replace `dns.example.net` with the DNS-over-TLS hostname of a resolver you
@@ -1081,7 +1105,7 @@ The first DNS action saves both original Android settings. Restore them with:
 
 ```sh
 python3 tools/provision_portal.py \
-  --serial "$PORTAL_IP:5555" --restore-privacy-dns
+  --serial "$PORTAL_IP:5555" --restore dns
 ```
 
 </details>
@@ -1120,6 +1144,11 @@ night mode persists normally. The root-owned enable marker and UID-1000 helper
 survive reboots. `--status` reports the effective mode, any current runtime
 request, whether the UID-1000 controller is installed, and whether its helper
 is running.
+
+The first theme action records the original `ui_night_mode` value.
+`--restore theme` returns the device to that value (or removes the
+setting entirely when the original state had none, the factory
+default) and removes the controller's enable marker and helper.
 
 </details>
 
@@ -1301,6 +1330,15 @@ without anyone watching: a failed attempt reboots the Portal, and an
 attempt can occasionally leave it unresponsive until it is power-cycled.
 This mode is validated end-to-end on the Portal+ (`aloha`) build
 `1041515800015050`; other supported models have not been validated for it.
+
+`--restore autoroot` undoes the staging: it uninstalls the autoroot
+helper, removes the staged runner and its saved ADB key material,
+removes the helper's authorized ADB key, and deletes any staged
+custom-payload daemon files. Shizuku and the exploit sentinel stay
+installed; use `--remove-shizuku` for Shizuku itself. A device with
+persistent wireless ADB enabled can likewise return to stock with
+`--restore wireless-adb`, which clears the persisted port and the
+boot-enforcement markers.
 
 </details>
 

@@ -38,6 +38,63 @@ class CliConfig:
     banner: str
 
 
+#: Names accepted by --restore <name>. Each maps onto the provisioner's
+#: existing restore attributes (see RESTORE_FLAG_MAP); the four names
+#: marked Phase D close restore-completeness gaps the audit found
+#: (autoroot, wireless-adb, theme, meta-authenticators).
+RESTORE_NAMES = (
+    "audio",
+    "bloat",
+    "remote-wipe",
+    "updates",
+    "dns",
+    "presence",
+    "presence-fps",
+    "adb-auth-timeout",
+    "app-verifier",
+    "camera-light",
+    "autoroot",
+    "wireless-adb",
+    "theme",
+    "meta-authenticators",
+)
+
+#: --restore name -> provisioner attribute it sets.
+RESTORE_FLAG_MAP = {
+    "audio": "restore_audio",
+    "bloat": "restore_bloat",
+    "remote-wipe": "restore_remote_wipe",
+    "updates": "enable_updates",
+    "dns": "restore_privacy_dns",
+    "presence": "restore_presence_profile",
+    "presence-fps": "restore_presence_fps",
+    "adb-auth-timeout": "restore_adb_auth_timeout",
+    "app-verifier": "restore_app_verifier",
+    "camera-light": "restore_camera_light",
+    "autoroot": "restore_autoroot",
+    "wireless-adb": "restore_wireless_adb",
+    "theme": "restore_theme",
+    "meta-authenticators": "restore_meta_authenticators",
+}
+
+#: The documented full-setup line, as --full expands it: attribute ->
+#: value. --full is a preset only; it sets exactly these flags and
+#: nothing else (the taste opt-ins --presence-fps-cap and
+#: --system-theme-control stay out by design).
+FULL_PRESET = {
+    "audio": True,
+    "disable_updates": True,
+    "block_remote_wipe": True,
+    "debloat": True,
+    "remove_meta_accounts": True,
+    "optimize_presence": True,
+    "allow_app_updates": True,
+    "disable_adb_auth_timeout": True,
+    "dhcp_dns": True,
+    "autoroot": True,
+}
+
+
 def parse_args(config: CliConfig) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -60,6 +117,31 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     )
     parser.add_argument("--attempts", type=int, default=12)
     parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "apply the full documented setup in one run: audio, "
+            "disable-updates, block-remote-wipe, debloat, "
+            "remove-meta-accounts, optimize-presence, allow-app-updates, "
+            "disable-adb-auth-timeout, DHCP DNS (Private DNS off), and "
+            "autoroot. Exactly the long flag line it replaces; the "
+            "granular flags below remain for partial setups"
+        ),
+    )
+    parser.add_argument(
+        "--restore",
+        action="append",
+        choices=RESTORE_NAMES,
+        default=[],
+        metavar="NAME",
+        help=(
+            "restore one previously applied change to its recorded "
+            "original state, or to the factory default when no original "
+            "was recorded; repeat for several restores. Names: "
+            + ", ".join(RESTORE_NAMES)
+        ),
+    )
+    parser.add_argument(
         "--persistent-wireless-adb",
         action="store_true",
         help=(
@@ -67,8 +149,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "applying any other provisioning feature"
         ),
     )
-    adb_auth_group = parser.add_mutually_exclusive_group()
-    adb_auth_group.add_argument(
+    parser.add_argument(
         "--disable-adb-auth-timeout",
         action="store_true",
         help=(
@@ -76,27 +157,13 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "this does not disable ADB authentication"
         ),
     )
-    adb_auth_group.add_argument(
-        "--restore-adb-auth-timeout",
-        action="store_true",
-        help=(
-            "restore the ADB authorization timeout saved by the first "
-            "--disable-adb-auth-timeout run"
-        ),
-    )
-    audio_group = parser.add_mutually_exclusive_group()
-    audio_group.add_argument(
+    parser.add_argument(
         "--audio",
         action="store_true",
         help=(
             "install the persistent hardware AEC/NS watchdog; this remains "
             "the default action when no provisioning action is specified"
         ),
-    )
-    audio_group.add_argument(
-        "--restore-audio",
-        action="store_true",
-        help="restore AIService's original native loader and remove the audio watchdog",
     )
     parser.add_argument(
         "--skip-build", action="store_true", help="use existing build outputs"
@@ -193,8 +260,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "install or reuse the constrained UID-1000 theme controller"
         ),
     )
-    app_update_group = parser.add_mutually_exclusive_group()
-    app_update_group.add_argument(
+    parser.add_argument(
         "--allow-app-updates",
         action="store_true",
         help=(
@@ -202,16 +268,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "third-party and other non-Meta apps can update"
         ),
     )
-    app_update_group.add_argument(
-        "--restore-app-verifier",
-        action="store_true",
-        help=(
-            "restore package_verifier_enable and Meta's verifier package to "
-            "the states saved by the first --allow-app-updates run"
-        ),
-    )
-    update_group = parser.add_mutually_exclusive_group()
-    update_group.add_argument(
+    parser.add_argument(
         "--disable-updates",
         action="store_true",
         help=(
@@ -219,13 +276,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "MobileConfig override for the native OTA daemon"
         ),
     )
-    update_group.add_argument(
-        "--enable-updates",
-        action="store_true",
-        help="restore the original MobileConfig override and re-enable OTA packages",
-    )
-    remote_wipe_group = parser.add_mutually_exclusive_group()
-    remote_wipe_group.add_argument(
+    parser.add_argument(
         "--block-remote-wipe",
         action="store_true",
         help=(
@@ -233,16 +284,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "without disabling the rest of the device-admin package"
         ),
     )
-    remote_wipe_group.add_argument(
-        "--restore-remote-wipe",
-        action="store_true",
-        help=(
-            "restore the two Meta remote-wipe receivers to the component states "
-            "saved by the first --block-remote-wipe run"
-        ),
-    )
-    camera_light_group = parser.add_mutually_exclusive_group()
-    camera_light_group.add_argument(
+    parser.add_argument(
         "--disable-camera-light",
         action="store_true",
         help=(
@@ -250,27 +292,13 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "while its green indicator is cleared"
         ),
     )
-    camera_light_group.add_argument(
-        "--restore-camera-light",
-        action="store_true",
-        help=(
-            "remove the camera-light watchdog and boot hook, then restore "
-            "the UID-1000 host app's original ART cache"
-        ),
-    )
-    debloat_group = parser.add_mutually_exclusive_group()
-    debloat_group.add_argument(
+    parser.add_argument(
         "--debloat",
         action="store_true",
         help=(
             "persistently disable the conservative Meta app/telemetry "
             "profile and save each package's original state"
         ),
-    )
-    debloat_group.add_argument(
-        "--restore-bloat",
-        action="store_true",
-        help="restore package states saved by the first --debloat run",
     )
     parser.add_argument(
         "--remove-meta-accounts",
@@ -280,8 +308,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "disable only their authenticator service components"
         ),
     )
-    presence_group = parser.add_mutually_exclusive_group()
-    presence_group.add_argument(
+    parser.add_argument(
         "--optimize-presence",
         action="store_true",
         help=(
@@ -299,29 +326,14 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "camera capture keeps its configured frame rate"
         ),
     )
-    privacy_group = parser.add_mutually_exclusive_group()
-    privacy_group.add_argument(
-        "--privacy-dns",
-        metavar="HOSTNAME",
+    parser.add_argument(
+        "--dns",
+        metavar="off|HOSTNAME",
         help=(
-            "persistently use the specified DNS-over-TLS filtering resolver; "
-            "the resolver controls the actual domain block list"
-        ),
-    )
-    privacy_group.add_argument(
-        "--dhcp-dns",
-        action="store_true",
-        help=(
-            "disable Android Private DNS and use the DNS servers supplied "
-            "by the connected network"
-        ),
-    )
-    privacy_group.add_argument(
-        "--restore-privacy-dns",
-        action="store_true",
-        help=(
-            "restore the Android DNS settings saved by the first "
-            "--privacy-dns or --dhcp-dns run"
+            "set Android Private DNS: 'off' uses the DNS servers supplied "
+            "by the connected network (DHCP); any other value is a "
+            "DNS-over-TLS resolver hostname, and that resolver controls "
+            "the actual domain block list"
         ),
     )
     mode_group = parser.add_mutually_exclusive_group()
@@ -354,22 +366,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         metavar="PATH",
         help="create a timestamped diagnostic and configuration backup archive",
     )
-    presence_group.add_argument(
-        "--restore-presence-profile",
-        action="store_true",
-        help=(
-            "restore the AIService settings file saved by the first "
-            "--optimize-presence run"
-        ),
-    )
-    presence_group.add_argument(
-        "--restore-presence-fps",
-        action="store_true",
-        help=(
-            "remove only the optional analysis FPS cap while keeping the "
-            "wide presence optimization"
-        ),
-    )
     parser.add_argument(
         "--log-dir",
         type=pathlib.Path,
@@ -378,6 +374,82 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     args = parser.parse_args()
     if not 1 <= args.attempts <= 100:
         parser.error("--attempts must be between 1 and 100")
+    # --restore <name> maps onto the restore attributes the rest of
+    # the shell (and the provisioner) already use; initialize them
+    # all, then set the requested ones.
+    for attribute in RESTORE_FLAG_MAP.values():
+        setattr(args, attribute, False)
+    for name in args.restore:
+        setattr(args, RESTORE_FLAG_MAP[name], True)
+    # --dns replaces --dhcp-dns / --privacy-dns: "off" is the DHCP
+    # mode, anything else is the resolver hostname.
+    args.privacy_dns = None
+    args.dhcp_dns = False
+    if args.dns is not None:
+        if args.dns.lower() == "off":
+            args.dhcp_dns = True
+        elif args.dns.strip():
+            args.privacy_dns = args.dns
+        else:
+            parser.error("--dns needs 'off' or a resolver hostname")
+    # --full expands to exactly the documented full-setup line.
+    if args.full:
+        for attribute, value in FULL_PRESET.items():
+            setattr(args, attribute, value)
+    # Apply/restore pairs for one feature stay mutually exclusive,
+    # as they were when each pair had its own flag group.
+    for apply_attribute, restore_name, apply_label in (
+        ("audio", "audio", "--audio"),
+        ("disable_updates", "updates", "--disable-updates"),
+        ("block_remote_wipe", "remote-wipe", "--block-remote-wipe"),
+        ("debloat", "bloat", "--debloat"),
+        ("optimize_presence", "presence", "--optimize-presence"),
+        ("allow_app_updates", "app-verifier", "--allow-app-updates"),
+        (
+            "disable_adb_auth_timeout",
+            "adb-auth-timeout",
+            "--disable-adb-auth-timeout",
+        ),
+        ("disable_camera_light", "camera-light", "--disable-camera-light"),
+    ):
+        if getattr(args, apply_attribute) and restore_name in args.restore:
+            parser.error(
+                f"{apply_label} cannot be combined with "
+                f"--restore {restore_name}"
+            )
+    if args.optimize_presence and "presence-fps" in args.restore:
+        parser.error(
+            "--optimize-presence cannot be combined with "
+            "--restore presence-fps"
+        )
+    if "presence" in args.restore and "presence-fps" in args.restore:
+        parser.error(
+            "--restore presence cannot be combined with "
+            "--restore presence-fps"
+        )
+    if (args.privacy_dns or args.dhcp_dns) and "dns" in args.restore:
+        parser.error("--dns cannot be combined with --restore dns")
+    if args.persistent_wireless_adb and "wireless-adb" in args.restore:
+        parser.error(
+            "--persistent-wireless-adb cannot be combined with "
+            "--restore wireless-adb"
+        )
+    if args.autoroot and "autoroot" in args.restore:
+        parser.error("--autoroot cannot be combined with --restore autoroot")
+    if args.shizuku and "autoroot" in args.restore:
+        parser.error(
+            "--shizuku cannot be combined with --restore autoroot "
+            "(the restore removes the shared helper key)"
+        )
+    if args.remove_meta_accounts and "meta-authenticators" in args.restore:
+        parser.error(
+            "--remove-meta-accounts cannot be combined with "
+            "--restore meta-authenticators"
+        )
+    if args.system_theme_control is not None and "theme" in args.restore:
+        parser.error(
+            "--system-theme-control cannot be combined with --restore theme"
+        )
     if args.presence_fps_cap is not None and not 1 <= args.presence_fps_cap <= 10:
         parser.error("--presence-fps-cap must be between 1 and 10")
     if args.presence_fps_cap is not None and (
@@ -394,7 +466,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         if args.restore_adb_auth_timeout:
             parser.error(
                 "--persistent-wireless-adb cannot be combined with "
-                "--restore-adb-auth-timeout"
+                "--restore adb-auth-timeout"
             )
         args.disable_adb_auth_timeout = True
     if args.autoroot:
@@ -437,6 +509,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             args.remove_shizuku,
             args.disable_camera_light,
             args.restore_camera_light,
+            args.restore_autoroot,
+            args.restore_wireless_adb,
+            args.restore_theme,
+            args.restore_meta_authenticators,
             args.system_theme_control is not None,
         )
     )
@@ -445,7 +521,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     if args.disable_camera_light:
         parser.error(
             "--disable-camera-light has been retired because it breaks camera "
-            "capture. Run --restore-camera-light on previously provisioned "
+            "capture. Run --restore camera-light on previously provisioned "
             "devices."
         )
     if args.recover and selected:
@@ -538,6 +614,10 @@ def main(
             persistent_wireless_adb=args.persistent_wireless_adb,
             disable_adb_auth_timeout=args.disable_adb_auth_timeout,
             restore_adb_auth_timeout=args.restore_adb_auth_timeout,
+            restore_autoroot=args.restore_autoroot,
+            restore_wireless_adb=args.restore_wireless_adb,
+            restore_theme=args.restore_theme,
+            restore_meta_authenticators=args.restore_meta_authenticators,
         ).provision()
     except (ProvisionError, OSError, zipfile.BadZipFile) as exc:
         print(f"PROVISION_ERROR: {exc}", file=sys.stderr)
