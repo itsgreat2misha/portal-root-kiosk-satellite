@@ -660,8 +660,10 @@ class ChannelManifestMergeTest(unittest.TestCase):
             )
 
     def test_unmerged_completion_write_replaces_as_before(self) -> None:
-        # The merge is scoped to the channel completion write; the
-        # stages path's writes keep their replace semantics.
+        # The merge is opt-in per call site (the channel completion
+        # write and the subset completion exits pass merge_prior);
+        # a write_state call without the flag keeps the historical
+        # replace semantics pinned here.
         with tempfile.TemporaryDirectory() as temporary:
             prior = self._prior_record(temporary)
             delta = make_provisioner(
@@ -677,6 +679,249 @@ class ChannelManifestMergeTest(unittest.TestCase):
                 "prior/only-artifact.bin", captured["artifact_sha256"]
             )
 
+
+
+class SubsetStagesManifestMergeTest(unittest.TestCase):
+    """The stages path's single-action early-complete exits are
+    subset completions too: like the channel path's completion
+    write, they must merge into the recorded manifest instead of
+    replacing it with the subset's own record (a presence-only or
+    theme-only run does not un-apply everything else). Driven
+    through the presence-only exit, whose completion write fires
+    unconditionally once presence reads already-configured; the
+    other subset exits share the same write_state call shape."""
+
+    def _prior_record(self, temporary: str, status: str = "complete") -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        actions = dict(full.requested_actions())
+        hashes = dict(full.selected_artifact_hashes())
+        hashes["prior/only-artifact.bin"] = "prior-only-digest"
+        return {
+            "schema": 1,
+            "status": status,
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": actions,
+            "artifact_sha256": hashes,
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-a",
+            },
+        }
+
+    def _drive_presence_exit(self, temporary: str, prior: dict):
+        provisioner = make_provisioner(
+            temporary, optimize_presence=True, skip_build=True
+        )
+        writes: list = []
+
+        def fake_run_state_write(status, **kwargs):
+            writes.append((status, kwargs))
+
+        def fake_adb_run(arguments, timeout=None, check=False):
+            del timeout, check
+            command = " ".join(str(argument) for argument in arguments)
+            if "getprop ro.build.fingerprint" in command:
+                return completed(arguments, ALOHA.fingerprint + "\n")
+            if "getprop persist.adb.tcp.port" in command:
+                return completed(arguments, "5555\n")
+            return completed(arguments, "", 1)
+
+        provisioner.adb_run = fake_adb_run
+        provisioner.read_state = lambda: prior
+        provisioner.verify_target = lambda *args, **kwargs: None
+        provisioner._observe_start_package_state = lambda: None
+        provisioner.adb_framework_boot_preflight = lambda: False
+        provisioner._run_fast_path = lambda: False
+        provisioner.sync_ota_nodemon_autoroot_conf = lambda: None
+        provisioner.sync_drift_conf_keys = lambda: None
+        provisioner.presence_preflight = lambda: True
+        stdout = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_run_state_write
+            ),
+            redirect_stdout(stdout),
+        ):
+            provisioner._provision_stages()
+        return provisioner, writes, stdout.getvalue()
+
+    def test_presence_only_completion_merges_into_prior_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            provisioner, writes, output = self._drive_presence_exit(
+                temporary, prior
+            )
+            self.assertIn(
+                "PROVISION_ALREADY_COMPLETE actions=optimize_presence",
+                output,
+            )
+            self.assertIn("STATE_MANIFEST_MERGED", output)
+            self.assertEqual(
+                [status for status, _kwargs in writes],
+                ["pending", "complete"],
+            )
+            captured = writes[-1][1]
+            # Every prior action survives; the run's own action is
+            # added, and the hashes merge per key the same way.
+            actions = captured["actions"]
+            for name, value in prior["actions"].items():
+                self.assertEqual(actions[name], value, name)
+            self.assertEqual(actions["optimize_presence"], True)
+            self.assertEqual(len(actions), len(prior["actions"]) + 1)
+            hashes = captured["artifact_sha256"]
+            self.assertEqual(
+                hashes["prior/only-artifact.bin"], "prior-only-digest"
+            )
+            for name, digest in provisioner.selected_artifact_hashes().items():
+                self.assertEqual(hashes[name], digest, name)
+            # The recorded key hash, desired state and verification
+            # boots carry over; the revision follows this run.
+            self.assertEqual(
+                captured["autoroot_key_sha256"], "prior-key-hash"
+            )
+            self.assertEqual(
+                captured["desired_state"],
+                {"alohausers_package": "disabled"},
+            )
+            self.assertEqual(captured["first_boot"], "boot-a")
+            self.assertEqual(captured["second_boot"], "boot-a")
+            self.assertEqual(
+                captured["tool_revision"], provisioner.tool_revision()
+            )
+
+    def test_presence_only_completion_replaces_noncomplete_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary, status="pending")
+            _provisioner, writes, output = self._drive_presence_exit(
+                temporary, prior
+            )
+            self.assertNotIn("STATE_MANIFEST_MERGED", output)
+            captured = writes[-1][1]
+            self.assertEqual(
+                captured["actions"], {"optimize_presence": True}
+            )
+            self.assertIsNone(captured["autoroot_key_sha256"])
+            self.assertNotIn(
+                "prior/only-artifact.bin", captured["artifact_sha256"]
+            )
+
+
+class PayloadTerminalManifestMergeTest(unittest.TestCase):
+    """The custom-payload phase's terminal write ends a
+    payload-only invocation: it must merge into the recorded
+    manifest like the other subset completions instead of
+    shrinking it to the payload action alone."""
+
+    def _prior_record(self, temporary: str, status: str = "complete") -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        actions = dict(full.requested_actions())
+        hashes = dict(full.selected_artifact_hashes())
+        hashes["prior/only-artifact.bin"] = "prior-only-digest"
+        return {
+            "schema": 1,
+            "status": status,
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": actions,
+            "artifact_sha256": hashes,
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-a",
+            },
+        }
+
+    def _drive_payload(self, temporary: str, prior: dict):
+        payload = pathlib.Path(temporary) / "payload.bin"
+        payload.write_bytes(b"payload")
+        provisioner = make_provisioner(
+            temporary, custom_payload=payload, skip_build=True
+        )
+        provisioner._start_state = prior
+        writes: list = []
+
+        def fake_run_state_write(status, **kwargs):
+            writes.append((status, kwargs))
+
+        def fake_adb_run(arguments, timeout=None, check=False):
+            del timeout, check
+            command = " ".join(str(argument) for argument in arguments)
+            if "getprop ro.build.fingerprint" in command:
+                return completed(arguments, ALOHA.fingerprint + "\n")
+            return completed(arguments, "", 1)
+
+        provisioner.adb_run = fake_adb_run
+        provisioner.stage = lambda: None
+        provisioner.reboot = lambda: ("boot-0", "boot-1")
+        provisioner.kaslr_base = lambda attempt: 0x1000
+        provisioner.memstart = lambda attempt: 0x2000
+        provisioner.wait_for_race_boot_window = lambda attempt: None
+        provisioner.exploit = lambda *args, **kwargs: True
+        provisioner.verify_custom_payload = lambda *args, **kwargs: None
+        provisioner._apply_recorded_posture = lambda: None
+        provisioner.apply_post_payload_root_steps = lambda: None
+        stdout = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_run_state_write
+            ),
+            redirect_stdout(stdout),
+        ):
+            provisioner.apply_custom_payload()
+        return provisioner, payload, writes, stdout.getvalue()
+
+    def test_payload_terminal_write_merges_into_prior_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            _provisioner, payload, writes, output = self._drive_payload(
+                temporary, prior
+            )
+            self.assertIn("CUSTOM_PAYLOAD_OK", output)
+            self.assertIn("STATE_MANIFEST_MERGED", output)
+            self.assertEqual(
+                [status for status, _kwargs in writes], ["complete"]
+            )
+            captured = writes[-1][1]
+            # Every prior action survives; the run's own payload
+            # action wins over the recorded one.
+            actions = captured["actions"]
+            for name, value in prior["actions"].items():
+                if name == "custom_payload":
+                    continue
+                self.assertEqual(actions[name], value, name)
+            self.assertEqual(actions["custom_payload"], str(payload))
+            self.assertEqual(len(actions), len(prior["actions"]))
+            hashes = captured["artifact_sha256"]
+            self.assertEqual(
+                hashes["prior/only-artifact.bin"], "prior-only-digest"
+            )
+            self.assertEqual(
+                captured["autoroot_key_sha256"], "prior-key-hash"
+            )
+            self.assertEqual(captured["first_boot"], "boot-a")
+            self.assertEqual(captured["second_boot"], "boot-a")
+
+    def test_payload_terminal_write_replaces_noncomplete_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary, status="pending")
+            _provisioner, payload, writes, output = self._drive_payload(
+                temporary, prior
+            )
+            self.assertNotIn("STATE_MANIFEST_MERGED", output)
+            captured = writes[-1][1]
+            self.assertEqual(
+                captured["actions"], {"custom_payload": str(payload)}
+            )
+            self.assertIsNone(captured["autoroot_key_sha256"])
+            self.assertNotIn(
+                "prior/only-artifact.bin", captured["artifact_sha256"]
+            )
 
 class VerifyRequestedStateAudioTest(unittest.TestCase):
     """The channel apply's final verification runs on the device's
