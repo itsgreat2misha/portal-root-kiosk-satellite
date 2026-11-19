@@ -36,6 +36,16 @@ the fork diverged from upstream:
   with no reboot after it, and later boots keep it. Live
   validation of the alohausers leg is deferred until the aloha
   test unit returns to the network.
+- Failed exploit attempts now capture the on-device watch result
+  before the runner reboots the device: a `WATCH_RESULT_EVIDENCE`
+  line records whether
+  `/data/local/tmp/ghostlock-watch-result.txt` was readable, its
+  `STEP` value, and the current boot id. This preserves the
+  evidence that separates a kernel panic from a whole-process
+  death when a won attempt's stream dies before the stage returns
+  (the discarded-win shape diagnosed Nov 18, 2026). The read is
+  best-effort and never affects the run. Live validation is
+  deferred until a test unit returns to the network.
 - On-device autoroot: after a one-time provisioning, the device
   re-roots itself after every reboot with no host attached (Shizuku
   started as root by the autoroot helper).

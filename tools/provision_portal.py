@@ -5350,6 +5350,55 @@ class PortalProvisioner:
         environment.update(self.target.exploit_env)
         return environment
 
+    def _log_watch_result_evidence(self, attempt: int) -> None:
+        """Best-effort capture of the on-device watch result after a
+        failed attempt, read before the runner reboots the device.
+
+        The watch thread writes
+        /data/local/tmp/ghostlock-watch-result.txt after every stage
+        return, win or fail. When a won attempt's stream dies before
+        the stage returns (the discarded-win shape diagnosed on
+        Nov 18, 2026), this file plus the current boot id are the
+        evidence that separates a kernel panic (the boot id has
+        already changed) from a whole-process death (same boot id),
+        and the unconditional reboot after a failed attempt erases
+        the boot-id half of it. The reads are short and bounded; any
+        failure is logged as unknown and never affects the run.
+        """
+        present = 0
+        step = "none"
+        boot_id = "unknown"
+        try:
+            watch_result = self.adb_run(
+                [
+                    "shell",
+                    "cat",
+                    "/data/local/tmp/ghostlock-watch-result.txt",
+                ],
+                timeout=5,
+            ).stdout.strip()
+            if watch_result:
+                present = 1
+                match = re.search(r"\bSTEP=(\d+)", watch_result)
+                if match:
+                    step = match.group(1)
+        except Exception:
+            pass
+        try:
+            current_boot = self.adb_run(
+                ["shell", "cat", "/proc/sys/kernel/random/boot_id"],
+                timeout=5,
+            ).stdout.strip()
+            if current_boot:
+                boot_id = current_boot
+        except Exception:
+            pass
+        print(
+            f"WATCH_RESULT_EVIDENCE attempt={attempt} "
+            f"present={present} step={step} boot_id={boot_id}",
+            flush=True,
+        )
+
     def exploit(
         self, base: int, memstart: int, attempt: int, *,
         skip_final_reboot: bool = False,
@@ -5764,6 +5813,8 @@ class PortalProvisioner:
                 f"INSTALL_ATTEMPT_RESULT attempt={attempt} "
                 f"success={int(success)} early_failure={int(failed)}"
             )
+            if not success:
+                self._log_watch_result_evidence(attempt)
             if not skip_final_reboot or not success:
                 try:
                     self.adb_run(["reboot"], timeout=8)
