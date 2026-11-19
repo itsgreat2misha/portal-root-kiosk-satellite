@@ -119,8 +119,8 @@ def _run_guard(device: _GuardDevice, clock: _FakeClock) -> str:
 
 
 class RaceBootWindowGuardTest(unittest.TestCase):
-    def test_min_age_is_120_seconds(self) -> None:
-        self.assertEqual(RACE_BOOT_MIN_AGE_SECONDS, 120)
+    def test_min_age_is_60_seconds(self) -> None:
+        self.assertEqual(RACE_BOOT_MIN_AGE_SECONDS, 60)
 
     def test_old_boot_proceeds_without_waiting_and_syncs(self) -> None:
         clock = _FakeClock()
@@ -137,24 +137,24 @@ class RaceBootWindowGuardTest(unittest.TestCase):
 
     def test_boot_exactly_at_minimum_age_proceeds(self) -> None:
         clock = _FakeClock()
-        device = _GuardDevice(uptime=lambda: 120.0)
+        device = _GuardDevice(uptime=lambda: 60.0)
         output = _run_guard(device, clock)
         self.assertEqual(clock.sleeps, [])
         self.assertEqual(device.count(["shell", "sync"]), 1)
-        self.assertIn("boot_age_seconds=120 synced=1", output)
+        self.assertIn("boot_age_seconds=60 synced=1", output)
 
     def test_young_boot_waits_the_shortfall_then_syncs(self) -> None:
         clock = _FakeClock()
         device = _GuardDevice(uptime=lambda: 30.0 + clock.now)
         output = _run_guard(device, clock)
-        self.assertEqual(sum(clock.sleeps), 90.0)
+        self.assertEqual(sum(clock.sleeps), 30.0)
         self.assertIn(
             "WIFI_FLUSH_GUARD_WAIT attempt=3 boot_age_seconds=30 "
-            "required=120",
+            "required=60",
             output,
         )
         self.assertIn(
-            "WIFI_FLUSH_GUARD attempt=3 boot_age_seconds=120 synced=1",
+            "WIFI_FLUSH_GUARD attempt=3 boot_age_seconds=60 synced=1",
             output,
         )
         # The sync is issued only after the boot has aged out.
@@ -168,7 +168,7 @@ class RaceBootWindowGuardTest(unittest.TestCase):
         clock = _FakeClock()
         device = _GuardDevice(uptime=lambda: None)
         output = _run_guard(device, clock)
-        self.assertEqual(sum(clock.sleeps), 120.0)
+        self.assertEqual(sum(clock.sleeps), 60.0)
         self.assertIn("boot_age_seconds=unknown", output)
         self.assertEqual(device.count(["shell", "sync"]), 1)
         self.assertIn(
@@ -183,10 +183,10 @@ class RaceBootWindowGuardTest(unittest.TestCase):
         clock = _FakeClock()
         device = _GuardDevice(
             uptime=lambda: None,
-            boot_id=lambda: OLD_BOOT if clock.now < 60 else NEW_BOOT,
+            boot_id=lambda: OLD_BOOT if clock.now < 30 else NEW_BOOT,
         )
         _run_guard(device, clock)
-        self.assertEqual(sum(clock.sleeps), 180.0)
+        self.assertEqual(sum(clock.sleeps), 90.0)
         self.assertEqual(device.count(["shell", "sync"]), 1)
 
 

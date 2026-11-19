@@ -26,6 +26,13 @@ package dev.portal.autoroothelper;
  * flips) do not empty the store; only the connect-time write needs
  * the protection.
  *
+ * The floor started at 120 s and is 60 s since the 2026-11-19
+ * timing measurement (wifi-guard-timing-measurement-2026-11-19):
+ * the store's deferred flush is a fixed 10.0 s alarm in the device
+ * framework (BUFFERED_WRITE_ALARM_INTERVAL_MS = 10,000 ms), live
+ * change-to-write-complete measured 10.1-11.5 s, and the modeled
+ * heavy-load worst case lands the flush by ~52 s.
+ *
  * Pure policy, like AttemptWatchdog: the service supplies the boot
  * age from SystemClock.elapsedRealtime() and performs the wait and
  * the sync itself. An unknown age (a negative reading) fails toward
@@ -33,7 +40,7 @@ package dev.portal.autoroothelper;
  */
 final class BootFlushGuard {
 
-    static final long MIN_BOOT_AGE_MS = 120_000L;
+    static final long MIN_BOOT_AGE_MS = 60_000L;
 
     private BootFlushGuard() {
     }

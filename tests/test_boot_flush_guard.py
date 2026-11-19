@@ -50,29 +50,29 @@ public final class BootFlushGuardHarness {
     }
 
     public static void main(String[] args) {
-        check(BootFlushGuard.MIN_BOOT_AGE_MS == 120_000L,
-                "minimum boot age is not 120 s");
+        check(BootFlushGuard.MIN_BOOT_AGE_MS == 60_000L,
+                "minimum boot age is not 60 s");
         // Unknown age fails toward waiting the full window.
-        check(BootFlushGuard.remainingWaitMs(-1L) == 120_000L,
+        check(BootFlushGuard.remainingWaitMs(-1L) == 60_000L,
                 "unknown age does not wait the full window");
         check(!BootFlushGuard.attemptMayStart(-1L),
                 "attempt may start at unknown age");
         // The wait is the shortfall to the minimum age, floored at 0.
-        check(BootFlushGuard.remainingWaitMs(0L) == 120_000L,
+        check(BootFlushGuard.remainingWaitMs(0L) == 60_000L,
                 "wait at boot instant");
-        check(BootFlushGuard.remainingWaitMs(60_000L) == 60_000L,
+        check(BootFlushGuard.remainingWaitMs(30_000L) == 30_000L,
                 "wait at half the minimum age");
-        check(BootFlushGuard.remainingWaitMs(119_999L) == 1L,
+        check(BootFlushGuard.remainingWaitMs(59_999L) == 1L,
                 "wait just before the minimum age");
-        check(BootFlushGuard.remainingWaitMs(120_000L) == 0L,
+        check(BootFlushGuard.remainingWaitMs(60_000L) == 0L,
                 "wait at the minimum age");
         check(BootFlushGuard.remainingWaitMs(3_600_000L) == 0L,
                 "wait on an old boot");
         check(!BootFlushGuard.attemptMayStart(0L),
                 "attempt may start at the boot instant");
-        check(!BootFlushGuard.attemptMayStart(119_999L),
+        check(!BootFlushGuard.attemptMayStart(59_999L),
                 "attempt may start just before the minimum age");
-        check(BootFlushGuard.attemptMayStart(120_000L),
+        check(BootFlushGuard.attemptMayStart(60_000L),
                 "attempt may not start at the minimum age");
         check(BootFlushGuard.attemptMayStart(600_000L),
                 "attempt may not start on an old boot");
@@ -132,7 +132,7 @@ class BootFlushGuardWiringTest(unittest.TestCase):
         self.watchdog = WATCHDOG_JAVA.read_text(encoding="utf-8")
 
     def test_policy_shape(self) -> None:
-        self.assertIn("MIN_BOOT_AGE_MS = 120_000L", self.guard)
+        self.assertIn("MIN_BOOT_AGE_MS = 60_000L", self.guard)
         self.assertIn("bootAgeMs < 0L", self.guard)
         self.assertIn("Math.max(0L, MIN_BOOT_AGE_MS - bootAgeMs)", self.guard)
         self.assertIn("bootAgeMs >= MIN_BOOT_AGE_MS", self.guard)
