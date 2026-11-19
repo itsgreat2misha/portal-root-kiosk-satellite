@@ -130,6 +130,100 @@ class DnsMergeTest(unittest.TestCase):
                 self.assertIn("unrecognized arguments", parse_error(argv))
 
 
+class FakeDnsStore:
+    """adb fake modelling the Private DNS settings store (the
+    on-device backup file starts absent, so each apply backs up
+    the live values first)."""
+
+    def __init__(self, mode="off", specifier="null"):
+        self.mode = mode
+        self.specifier = specifier
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        if "portal-private-dns-before-v1.json" in command and "cat" in command:
+            return completed("", 1)
+        if "settings get global private_dns_mode" in command:
+            return completed(self.mode + "\n")
+        if "settings get global private_dns_specifier" in command:
+            return completed(self.specifier + "\n")
+        if "settings put global private_dns_mode" in command:
+            self.mode = arguments[-1]
+            return completed()
+        if "settings put global private_dns_specifier" in command:
+            self.specifier = arguments[-1]
+            return completed()
+        if "settings delete global private_dns_mode" in command:
+            self.mode = "null"
+            return completed()
+        if "settings delete global private_dns_specifier" in command:
+            self.specifier = "null"
+            return completed()
+        return completed()
+
+
+class FullDnsOverrideTest(unittest.TestCase):
+    """An explicit --dns replaces the --full preset's DNS
+    component: the composed config carries exactly one DNS
+    intent, and the shared apply + verify sequence (the DNS
+    block of the shell-level apply, then the end-of-run verify)
+    completes against a fake store. Before the fix, --full
+    --dns HOSTNAME composed dhcp_dns=True AND privacy_dns=HOST:
+    the hostname apply persisted, then the dhcp-first verify
+    expectation failed the run (Defect A)."""
+
+    def compose_and_run(self, argv, store):
+        arguments = parse(argv)
+        intents = [
+            arguments.dhcp_dns,
+            arguments.privacy_dns is not None,
+            arguments.restore_privacy_dns,
+        ]
+        self.assertEqual(sum(bool(intent) for intent in intents), 1, argv)
+        config = SettingsConfig(
+            privacy_dns=arguments.privacy_dns,
+            dhcp_dns=arguments.dhcp_dns,
+            restore_privacy_dns=arguments.restore_privacy_dns,
+        )
+        feature = make_settings_feature(config, adb_run=store.adb_run)
+        with contextlib.redirect_stdout(io.StringIO()):
+            if config.privacy_dns:
+                feature.apply_privacy_dns()
+            if config.dhcp_dns:
+                feature.apply_dhcp_dns()
+            if config.restore_privacy_dns:
+                feature.restore_private_dns()
+            feature.verify_privacy_dns()
+        return arguments
+
+    def test_full_dns_hostname_yields_the_hostname_intent(self) -> None:
+        store = FakeDnsStore(mode="off", specifier="null")
+        arguments = self.compose_and_run(
+            ["--full", "--dns", "one.one.one.one"], store
+        )
+        self.assertEqual(arguments.privacy_dns, "one.one.one.one")
+        self.assertFalse(arguments.dhcp_dns)
+        self.assertEqual(store.mode, "hostname")
+        self.assertEqual(store.specifier, "one.one.one.one")
+
+    def test_full_dns_off_yields_the_dhcp_intent(self) -> None:
+        store = FakeDnsStore(mode="hostname", specifier="one.one.one.one")
+        arguments = self.compose_and_run(["--full", "--dns", "off"], store)
+        self.assertTrue(arguments.dhcp_dns)
+        self.assertIsNone(arguments.privacy_dns)
+        self.assertEqual(store.mode, "off")
+        self.assertEqual(store.specifier, "null")
+
+    def test_full_alone_keeps_the_preset_dns_intent(self) -> None:
+        store = FakeDnsStore(mode="hostname", specifier="one.one.one.one")
+        arguments = self.compose_and_run(["--full"], store)
+        self.assertTrue(arguments.dhcp_dns)
+        self.assertIsNone(arguments.privacy_dns)
+        self.assertEqual(store.mode, "off")
+        self.assertEqual(store.specifier, "null")
+
+
 class RestoreSurfaceTest(unittest.TestCase):
     def test_every_restore_name_maps_to_its_attribute(self) -> None:
         for name, attribute in cli_module.RESTORE_FLAG_MAP.items():

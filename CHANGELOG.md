@@ -167,6 +167,19 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- `--full --dns <hostname>` could never complete through the
+  channel: the preset expansion ran after the `--dns` translation
+  and set `dhcp_dns` on top of it, so the composed config carried
+  both DNS intents. The hostname apply persisted, then the
+  dhcp-first verify expectation failed the run
+  (`PROVISION_CHANNEL_FALLBACK reason=Private DNS did not
+  persist: mode='hostname'/'off'`). An explicit `--dns` now
+  replaces the preset's DNS component at CLI composition, so a
+  composed config holds exactly one DNS intent and the apply,
+  verify, manifest recording and recorded-state readers all see
+  the same one. `--full` alone keeps the preset's DHCP intent
+  and `--full --dns off` matches it. Live validation is deferred
+  to the gate completion session.
 - `--dns <hostname>` crashed every run after the live Private DNS
   settings had already been changed: the apply normalized the
   hostname and wrote it back into the frozen SettingsConfig,
