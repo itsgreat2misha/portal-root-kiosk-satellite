@@ -178,6 +178,8 @@ ACCOUNT_CTL_LOCAL = ROOT / "exploit/build/portal-account-ctl.jar"
 ACCOUNT_CTL_REMOTE = "/data/local/tmp/portal-account-ctl.jar"
 COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
 COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
+RISH_SCRIPT_REMOTE = "/data/local/tmp/rish"
+RISH_DEX_REMOTE = "/data/local/tmp/rish_shizuku.dex"
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
 APP_VERIFIER_PACKAGE = "com.facebook.appverifier"
 ADB_ENABLED_SETTING = "adb_enabled"
@@ -1712,6 +1714,162 @@ class PortalProvisioner:
         if self.needs_component_ctl():
             self.prepare_component_actions()
 
+    def _component_ctl_presence_action(self) -> str:
+        """The PortalComponentCtl presence argument for a channel
+        execution, mirroring the payload env rule: native-pref
+        targets never carry it in the jar, and targets with a
+        dedicated presence/FPS phase keep it with that phase; where
+        the jar is the only carrier it takes the run's request."""
+        if self.target is None or self.uses_native_presence_prefs():
+            return "none"
+        if (
+            self.target.uid1000_installer_credentials
+            or self.target.presence_installer_credentials
+        ):
+            return "none"
+        if self.presence_fps_action_requested():
+            return f"set:{self.presence_fps_cap}"
+        if self.restore_presence_fps or self.restore_presence_profile:
+            return "restore"
+        return "none"
+
+    def execute_component_actions(self) -> None:
+        """Execute the staged PortalComponentCtl actions on the
+        channel path.
+
+        _apply_shell_level_state stages the actions file
+        (prepare_component_actions) on both paths, but the jar's
+        only other executor is the payload's post-win sequence
+        (fops.c run_portal_component_ctl): a channel run that must
+        actually change component state therefore verified against
+        state nothing had applied and fell back to the race path
+        (Defect G, closure session 8 leg 2b). Here the same jar
+        runs with the same arguments through Shizuku's own shell
+        client (rish, extracted from the pinned Shizuku APK): the
+        server spawns it, so it runs as uid 0, the identity class
+        the jar already runs under post-win. Loopback-ADB shell
+        cannot substitute — PackageManager's binder caller check
+        excludes uid 2000.
+
+        Without Shizuku root (the --skip-shizuku-root opt-out, or
+        the server not answering as uid 0) the step does not run
+        and claims nothing: verification decides, and a state that
+        still needs changing falls back to the race path exactly
+        as before."""
+        if self.skip_shizuku_root:
+            print(
+                "COMPONENT_CTL_EXECUTE_SKIPPED reason=skip-shizuku-root",
+                flush=True,
+            )
+            return
+        if not self._shizuku_root_ok():
+            print(
+                "COMPONENT_CTL_EXECUTE_SKIPPED "
+                "reason=shizuku-root-unavailable",
+                flush=True,
+            )
+            return
+        if COMPONENT_CTL_LOCAL.is_file():
+            self.adb_run(
+                ["push", str(COMPONENT_CTL_LOCAL), COMPONENT_CTL_REMOTE],
+                timeout=30,
+                check=True,
+            )
+            self.adb_run(
+                ["shell", "chmod", "0755", COMPONENT_CTL_REMOTE],
+                timeout=5,
+                check=True,
+            )
+        elif (
+            self.adb_run(
+                ["shell", "test", "-f", COMPONENT_CTL_REMOTE], timeout=5
+            ).returncode
+            != 0
+        ):
+            raise ProvisionError(
+                "component ctl jar is neither built nor staged"
+            )
+        self._stage_rish_client()
+        presence_action = self._component_ctl_presence_action()
+        result = self._run_component_ctl_via_rish(
+            "/system/bin/app_process64", presence_action
+        )
+        if result.returncode == 127:
+            # fops.c's fallback: app_process64 may be absent, in
+            # which case the payload retries with app_process.
+            result = self._run_component_ctl_via_rish(
+                "/system/bin/app_process", presence_action
+            )
+        ok_line = next(
+            (
+                line.strip()
+                for line in result.stdout.splitlines()
+                if "PORTAL_COMPONENT_CTL_OK" in line
+            ),
+            "",
+        )
+        if result.returncode != 0 or not ok_line:
+            raise ProvisionError(
+                "component ctl execution failed on the channel path: "
+                f"exit={result.returncode} "
+                f"output={result.stdout.strip()[-300:]!r}"
+            )
+        print(
+            f"COMPONENT_CTL_EXECUTED transport=shizuku-root {ok_line}",
+            flush=True,
+        )
+        # The payload settles after a successful jar run before its
+        # state is read back (fops.c settle_package_manager_state:
+        # PackageManager's restrictions write is asynchronous);
+        # the channel path's verification is that read-back.
+        self.settle_package_state(before_reboot=True)
+
+    def _run_component_ctl_via_rish(
+        self, app_process: str, presence_action: str
+    ) -> subprocess.CompletedProcess[str]:
+        # Mirror fops.c's invocation exactly: CLASSPATH points at
+        # the jar, app_process loads PortalComponentCtl with the
+        # staged actions file and the presence action as arguments.
+        inner = (
+            f"CLASSPATH={COMPONENT_CTL_REMOTE} "
+            f"{app_process} /system/bin PortalComponentCtl "
+            f"{DEBLOAT_COMPONENT_ACTIONS_REMOTE} {presence_action}"
+        )
+        return self.adb_run(
+            ["shell", f"sh {RISH_SCRIPT_REMOTE} -c {shlex.quote(inner)}"],
+            timeout=120,
+        )
+
+    def _stage_rish_client(self) -> None:
+        """Push Shizuku's rish shell client (script + dex) from the
+        pinned Shizuku APK: the pair is versioned with the server
+        it talks to, so it comes from the same hash-verified
+        artifact the install path uses."""
+        apk = self.resolve_shizuku_apk()
+        assets = {
+            "assets/rish": (RISH_SCRIPT_REMOTE, "0755"),
+            "assets/rish_shizuku.dex": (RISH_DEX_REMOTE, "0644"),
+        }
+        try:
+            with zipfile.ZipFile(apk) as archive:
+                payloads = {asset: archive.read(asset) for asset in assets}
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            raise ProvisionError(
+                f"could not extract the rish client from {apk}: {exc}"
+            ) from exc
+        with tempfile.TemporaryDirectory(prefix="portal-rish-") as tmp:
+            for asset, (remote, mode) in assets.items():
+                local = pathlib.Path(tmp) / pathlib.Path(asset).name
+                local.write_bytes(payloads[asset])
+                self.adb_run(
+                    ["push", str(local), remote], timeout=30, check=True
+                )
+                self.adb_run(
+                    ["shell", "chmod", mode, remote],
+                    timeout=5,
+                    check=True,
+                )
+
     def _apply_via_channel(self, reason: str) -> bool:
         """Apply the drifted delta through the device's existing root
         setup: the same shell-level applies, package installs, and
@@ -1823,6 +1981,8 @@ class PortalProvisioner:
                 self.prepare_exploit_sentinel()
             if self.autoroot:
                 self.stage_autoroot_payload()
+            if self.needs_component_ctl():
+                self.execute_component_actions()
             self.verify_requested_state(via_channel=True)
             if not self._shizuku_root_ok():
                 raise ProvisionError(
@@ -6942,7 +7102,10 @@ class PortalProvisioner:
         # intervening host work (key reads, staging, exploit discovery)
         # always exceeds the settle window, so the fixed sleep is pure
         # latency there. Pass before_reboot=True at any future call site
-        # whose next step actually is a reboot.
+        # whose next step actually is a reboot, or whose verification
+        # must observe the settled state: the channel component
+        # execution settles there because the payload settles after
+        # the same jar run before its state is read back.
         if not before_reboot:
             print(
                 "PACKAGE_STATE_SETTLE_SKIPPED reason=no-immediate-reboot",

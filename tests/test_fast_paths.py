@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+import zipfile
 from contextlib import redirect_stdout
 
 sys.path.insert(
@@ -445,6 +446,7 @@ class ChannelApplyTest(unittest.TestCase):
             "apply_dhcp_dns",
             "allow_third_party_app_updates",
             "prepare_component_actions",
+            "execute_component_actions",
             "install_shizuku_payload",
             "prepare_exploit_sentinel",
             "stage_autoroot_payload",
@@ -484,6 +486,14 @@ class ChannelApplyTest(unittest.TestCase):
             self.assertIn("apply_dhcp_dns", calls)
             self.assertIn("stage_autoroot_payload", calls)
             self.assertIn("verify_requested_state", calls)
+            self.assertLess(
+                calls.index("prepare_component_actions"),
+                calls.index("execute_component_actions"),
+            )
+            self.assertLess(
+                calls.index("execute_component_actions"),
+                calls.index("verify_requested_state"),
+            )
             self.assertEqual(self._verify_kwargs, [{"via_channel": True}])
             self.assertEqual(self._states, ["pending", "complete"])
 
@@ -502,6 +512,267 @@ class ChannelApplyTest(unittest.TestCase):
             self.assertFalse(handled)
             self.assertIn("PROVISION_CHANNEL_FALLBACK", stdout.getvalue())
             self.assertEqual(self._states, ["pending"])
+
+
+class ComponentDevice:
+    """adb fake for the channel component executor: root-mode
+    Shizuku answering, the component jar staged remotely, and a
+    rish run whose result the test controls."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.shizuku_uid = "0"
+        self.shizuku_running = True
+        self.jar_remote = True
+        self.rish_results: list = []
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        self.commands.append(command)
+        if "pidof shizuku_server" in command:
+            return completed(
+                arguments, "4242\n" if self.shizuku_running else ""
+            )
+        if "/proc/4242/status" in command:
+            return completed(
+                arguments,
+                f"Name:\tshizuku_server\nUid:\t{self.shizuku_uid}\t0\t0\t0\n",
+            )
+        if "test -f /data/local/tmp/portal-component-ctl.jar" in command:
+            return completed(arguments, "", 0 if self.jar_remote else 1)
+        if "PortalComponentCtl" in command:
+            if self.rish_results:
+                stdout, returncode = self.rish_results.pop(0)
+                return completed(arguments, stdout, returncode)
+            return completed(
+                arguments, "PORTAL_COMPONENT_CTL_OK changed=3\n", 0
+            )
+        return completed(arguments, "", 0)
+
+
+class ChannelComponentExecutionTest(unittest.TestCase):
+    """Defect G: the channel path staged the PortalComponentCtl
+    actions file but never executed the jar, so a channel run that
+    had to change component state failed its own verification and
+    fell back to the race path. The executor runs the jar through
+    Shizuku's rish client (server-spawned, uid 0) with the
+    payload's arguments, settles like the payload does, and only
+    then does verification read the state back. Without Shizuku
+    root the step claims nothing and the verify-and-fallback
+    behaviour is unchanged."""
+
+    def _executor_provisioner(self, temporary: str, device, **kwargs):
+        import provision_portal as pp_module
+
+        provisioner = make_provisioner(
+            temporary, restore_meta_authenticators=True, **kwargs
+        )
+        provisioner.adb_run = device.adb_run
+        jar = pathlib.Path(temporary) / "portal-component-ctl.jar"
+        jar.write_bytes(b"jar")
+        apk = pathlib.Path(temporary) / "shizuku.apk"
+        with zipfile.ZipFile(apk, "w") as archive:
+            archive.writestr("assets/rish", "#!/system/bin/sh\n")
+            archive.writestr("assets/rish_shizuku.dex", b"dex")
+        provisioner.resolve_shizuku_apk = lambda: apk
+        patched = unittest.mock.patch.object(
+            pp_module, "COMPONENT_CTL_LOCAL", jar
+        )
+        patched.start()
+        self.addCleanup(patched.stop)
+        return provisioner
+
+    def test_channel_execution_runs_jar_and_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            provisioner = self._executor_provisioner(temporary, device)
+            sleeps: list = []
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: sleeps.append(seconds)
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            output = stdout.getvalue()
+            self.assertIn(
+                "COMPONENT_CTL_EXECUTED transport=shizuku-root "
+                "PORTAL_COMPONENT_CTL_OK changed=3",
+                output,
+            )
+            self.assertIn("PACKAGE_STATE_SETTLE seconds=15", output)
+            self.assertEqual(sleeps, [15])
+            jar_push = next(
+                index
+                for index, command in enumerate(device.commands)
+                if command.startswith("push")
+                and "portal-component-ctl.jar" in command
+            )
+            rish_push = next(
+                index
+                for index, command in enumerate(device.commands)
+                if command.startswith("push") and "rish_shizuku.dex" in command
+            )
+            run = next(
+                index
+                for index, command in enumerate(device.commands)
+                if "PortalComponentCtl" in command
+            )
+            sync = device.commands.index("shell sync")
+            self.assertLess(jar_push, run)
+            self.assertLess(rish_push, run)
+            self.assertLess(run, sync)
+            run_command = device.commands[run]
+            self.assertIn("sh /data/local/tmp/rish -c", run_command)
+            self.assertIn(
+                "CLASSPATH=/data/local/tmp/portal-component-ctl.jar",
+                run_command,
+            )
+            self.assertIn(
+                "/system/bin/app_process64 /system/bin PortalComponentCtl "
+                "/data/local/tmp/portal-debloat-components-actions-v1.tsv "
+                "none",
+                run_command,
+            )
+
+    def test_execution_failure_raises_without_settling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.rish_results = [("PORTAL_COMPONENT_CTL_ERROR\n", 1)]
+            provisioner = self._executor_provisioner(temporary, device)
+            with self.assertRaises(ProvisionError):
+                provisioner.execute_component_actions()
+            self.assertNotIn("shell sync", device.commands)
+
+    def test_app_process64_absence_falls_back_like_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.rish_results = [
+                ("", 127),
+                ("PORTAL_COMPONENT_CTL_OK changed=1\n", 0),
+            ]
+            provisioner = self._executor_provisioner(temporary, device)
+            with unittest.mock.patch("time.sleep", lambda seconds: None):
+                provisioner.execute_component_actions()
+            runs = [
+                command
+                for command in device.commands
+                if "PortalComponentCtl" in command
+            ]
+            self.assertEqual(len(runs), 2)
+            self.assertIn("app_process64", runs[0])
+            self.assertIn("/system/bin/app_process /system/bin", runs[1])
+            self.assertNotIn("app_process64", runs[1])
+
+    def test_no_shizuku_root_no_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            provisioner = self._executor_provisioner(
+                temporary, device, skip_shizuku_root=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            self.assertIn(
+                "COMPONENT_CTL_EXECUTE_SKIPPED reason=skip-shizuku-root",
+                stdout.getvalue(),
+            )
+            self.assertEqual(device.commands, [])
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.shizuku_uid = "2000"
+            provisioner = self._executor_provisioner(temporary, device)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            self.assertIn(
+                "COMPONENT_CTL_EXECUTE_SKIPPED "
+                "reason=shizuku-root-unavailable",
+                stdout.getvalue(),
+            )
+            self.assertFalse(
+                any(
+                    "PortalComponentCtl" in command
+                    for command in device.commands
+                )
+            )
+
+    def test_skipped_execution_keeps_channel_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, _device = eligible_provisioner(
+                temporary, skip_shizuku_root=True
+            )
+            instrument = ChannelApplyTest(
+                "test_channel_apply_rewrites_manifest_complete"
+            )
+            calls = instrument._instrument(provisioner)
+            # The instrument stubs the executor; this test needs the
+            # real one so the skip gate is what runs.
+            del provisioner.__dict__["execute_component_actions"]
+
+            def failing_verify(**kwargs):
+                calls.append("verify_requested_state")
+                raise ProvisionError("Meta authenticators remain disabled")
+
+            provisioner.verify_requested_state = failing_verify
+            stdout = io.StringIO()
+            try:
+                with redirect_stdout(stdout):
+                    handled = provisioner._apply_via_channel(
+                        "actions-restore_meta_authenticators"
+                    )
+            finally:
+                import provision_portal as pp_module
+
+                (
+                    pp_module.android_build_environment,
+                    pp_module.build,
+                ) = instrument._patched
+            self.assertFalse(handled)
+            output = stdout.getvalue()
+            self.assertIn(
+                "COMPONENT_CTL_EXECUTE_SKIPPED reason=skip-shizuku-root",
+                output,
+            )
+            self.assertIn("PROVISION_CHANNEL_FALLBACK", output)
+
+    def test_presence_action_mapping(self) -> None:
+        import dataclasses
+
+        with tempfile.TemporaryDirectory() as temporary:
+            # The fleet target carries installer credentials: the
+            # dedicated phases own the presence action, the jar
+            # argument stays "none".
+            provisioner = make_provisioner(
+                temporary, presence_fps_cap=5
+            )
+            self.assertEqual(
+                provisioner._component_ctl_presence_action(), "none"
+            )
+            bare = dataclasses.replace(
+                ALOHA,
+                uid1000_embedded_helper=False,
+                uid1000_installer_credentials=False,
+                presence_installer_credentials=False,
+            )
+            provisioner = make_provisioner(
+                temporary, presence_fps_cap=5
+            )
+            provisioner.target = bare
+            self.assertEqual(
+                provisioner._component_ctl_presence_action(), "set:5"
+            )
+            provisioner = make_provisioner(
+                temporary, restore_presence_fps=True
+            )
+            provisioner.target = bare
+            self.assertEqual(
+                provisioner._component_ctl_presence_action(), "restore"
+            )
+            provisioner = make_provisioner(temporary)
+            provisioner.target = bare
+            self.assertEqual(
+                provisioner._component_ctl_presence_action(), "none"
+            )
 
 
 class ChannelManifestMergeTest(unittest.TestCase):
