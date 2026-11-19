@@ -4930,6 +4930,43 @@ class PortalProvisioner:
         ).provision()
         return True
 
+    def _read_staged_autoroot_conf(self) -> str | None:
+        """The staged autoroot.conf content, or None when there is
+        no readable staged config to sync.
+
+        A failed cat is not an empty config: the command runner
+        merges stderr into stdout, so a config removed with the
+        staging directory (--restore autoroot removes the whole
+        directory) surfaces as cat's error text, which the conf
+        syncs once treated as config lines and rewrote (Defect I,
+        2026-11-19)."""
+        result = self.adb_run(["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return result.stdout
+
+    def _write_staged_autoroot_conf(self, contents: str) -> None:
+        """Rewrite the staged autoroot.conf in place, creating the
+        staging directory first.
+
+        The directory is created by autoroot staging and removed
+        by --restore autoroot, so a write into it cannot assume it
+        exists: adb push cannot create it (its secure_mkdirs is
+        refused on these devices), which killed the first
+        re-provision after an autoroot restore (Defect I,
+        2026-11-19)."""
+        self.adb_run(
+            ["shell", "mkdir", "-p", AUTOROOT_REMOTE_DIR],
+            timeout=5,
+            check=True,
+        )
+        self.push_text_atomic(contents, AUTOROOT_CONF_REMOTE)
+        self.adb_run(
+            ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
+            timeout=5,
+            check=True,
+        )
+
     def sync_ota_nodemon_autoroot_conf(self) -> None:
         """Keep the staged autoroot config's OTA_NODEMON key in step
         with this run's updates request.
@@ -4950,10 +4987,8 @@ class PortalProvisioner:
             return
         if not self.autoroot_staged():
             return
-        existing = self.adb_run(
-            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
-        ).stdout
-        if not existing.strip():
+        existing = self._read_staged_autoroot_conf()
+        if existing is None:
             return
         lines = [
             line
@@ -4965,12 +5000,7 @@ class PortalProvisioner:
         updated = "".join(f"{line}\n" for line in lines)
         if updated == existing:
             return
-        self.push_text_atomic(updated, AUTOROOT_CONF_REMOTE)
-        self.adb_run(
-            ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
-            timeout=5,
-            check=True,
-        )
+        self._write_staged_autoroot_conf(updated)
         print(
             "OTA_NODEMON_CONF_SYNC "
             f"value={'1' if self.disable_updates else '0'}",
@@ -5000,10 +5030,8 @@ class PortalProvisioner:
             return
         if not self.autoroot_staged():
             return
-        existing = self.adb_run(
-            ["shell", "cat", AUTOROOT_CONF_REMOTE], timeout=5
-        ).stdout
-        if not existing.strip():
+        existing = self._read_staged_autoroot_conf()
+        if existing is None:
             return
         lines = existing.splitlines()
         if dns_requested:
@@ -5039,12 +5067,7 @@ class PortalProvisioner:
         updated = "".join(f"{line}\n" for line in lines)
         if updated == existing:
             return
-        self.push_text_atomic(updated, AUTOROOT_CONF_REMOTE)
-        self.adb_run(
-            ["shell", "chmod", "0644", AUTOROOT_CONF_REMOTE],
-            timeout=5,
-            check=True,
-        )
+        self._write_staged_autoroot_conf(updated)
 
     def debloat_preflight(self) -> bool:
         return self.settings_feature.debloat_preflight()

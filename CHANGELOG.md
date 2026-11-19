@@ -167,6 +167,25 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A re-provision after `--restore autoroot` died before any race
+  (Defect I, Phase D closure session 12, Nov 19, 2026). The
+  restore removes the whole staging directory, but the early
+  autoroot.conf syncs (OTA_NODEMON and the drift keys) wrote
+  into it assuming it existed — only autoroot staging creates
+  it, later in the run — and adb push cannot create it (its
+  secure_mkdirs is refused on these devices). The syncs also
+  read the staged config without checking the read's return
+  code, so the removed config's cat error text (the command
+  runner merges stderr into stdout) was treated as config
+  lines and "synced". Both syncs now share one read/write
+  pair: a failed or empty read means no staged config to sync,
+  and the write creates the staging directory first. A sweep
+  of every other host push site found no other instance: the
+  remaining subdirectory writers (presence, camera-light and
+  audio backup markers) already create their directory at the
+  write site, the app-private key copies create theirs via
+  run-as, and every other push target is a flat file in
+  /data/local/tmp, which no restore removes.
 - The two audio preflights disagreed about the same boot, and a
   repair demanded mid-run had no channel route (Defect H, Phase D
   closure session 9.5, Nov 19, 2026). The channel gate read the

@@ -39,6 +39,15 @@ Five surfaces are pinned:
   recorded posture, the staged conf's OTA_NODEMON, the package
   actually disabled); the end-of-run judgment itself is
   unchanged and still fails the same device.
+- The conf syncs after an autoroot restore (Defect I, Phase D
+  closure session 12, 2026-11-19): the restore removes the whole
+  staging directory, the syncs' unchecked cat read surfaced its
+  error text as config lines, and the rewrite pushed into the
+  removed directory, where adb push cannot create directories.
+  The syncs now share a read that treats a failed read as no
+  staged config and a write that creates the directory first;
+  the pins run both syncs and the restore-then-reprovision
+  sequence against a fake device filesystem.
 """
 
 from __future__ import annotations
@@ -498,6 +507,177 @@ class DriftConfSyncTest(unittest.TestCase):
             )
         self.assertEqual(pushes, {})
         self.assertEqual(output, "")
+
+
+STAGING_DIR = "/data/local/tmp/portal-autoroot"
+
+
+class FakeStagingDevice:
+    """A minimal device filesystem for the staged autoroot dir.
+
+    Models the three behaviors Defect I (2026-11-19) turned on:
+    cat of a missing file fails with its error text on stdout
+    (the command runner merges stderr there), adb push cannot
+    create a missing parent directory (secure_mkdirs is refused
+    on these devices), and the autoroot restore removes the
+    staging directory wholesale (rm -rf in payload.py)."""
+
+    def __init__(self, staged_conf: str | None = BASE_CONF) -> None:
+        self.dirs = {"/data/local/tmp"}
+        self.files: dict[str, str] = {}
+        self.calls: list[list[str]] = []
+        if staged_conf is not None:
+            self.dirs.add(STAGING_DIR)
+            self.files[RUN_SH_REMOTE] = "#!/bin/sh\n"
+            self.files[CONF_REMOTE] = staged_conf
+
+    def adb_run(self, args, timeout=None, check=False):
+        self.calls.append(list(args))
+        result = self._dispatch(args)
+        if check and result.returncode != 0:
+            raise ProvisionError(
+                f"command failed ({result.returncode}): {args}\n{result.stdout}"
+            )
+        return result
+
+    def _dispatch(self, args):
+        if args[:3] == ["shell", "test", "-f"]:
+            return completed(args, returncode=0 if args[3] in self.files else 1)
+        if args[:2] == ["shell", "cat"]:
+            path = args[2]
+            if path in self.files:
+                return completed(args, self.files[path])
+            return completed(
+                args,
+                f"cat: {path}: No such file or directory\n",
+                returncode=1,
+            )
+        if args[:3] == ["shell", "mkdir", "-p"]:
+            self.dirs.add(args[3])
+            return completed(args)
+        if args[:3] == ["shell", "rm", "-rf"]:
+            target = args[3]
+            self.dirs.discard(target)
+            for path in [
+                p for p in self.files if p.startswith(target + "/")
+            ]:
+                del self.files[path]
+            return completed(args)
+        if args and args[0] == "push":
+            local_path, remote = pathlib.Path(args[1]), args[2]
+            if remote.rsplit("/", 1)[0] not in self.dirs:
+                return completed(
+                    args,
+                    "adb: error: failed to copy: remote secure_mkdirs "
+                    "failed: Operation not permitted\n",
+                    returncode=1,
+                )
+            self.files[remote] = (
+                local_path.read_text(encoding="utf-8")
+                if local_path.is_file()
+                else ""
+            )
+            return completed(args)
+        if args[0] == "shell" and isinstance(args[1], str) and "mv " in args[1]:
+            tokens = args[1].replace("&&", " ").split()
+            index = tokens.index("mv")
+            self.files[tokens[index + 2]] = self.files.pop(tokens[index + 1])
+            return completed(args)
+        return completed(args)
+
+
+class DriftConfSyncMissingDirTest(unittest.TestCase):
+    """Defect I: the conf syncs write into a directory only
+    staging creates and the autoroot restore removes."""
+
+    def run_on_device(self, provisioner, device, call) -> None:
+        with (
+            mock.patch.object(provisioner, "adb_run", side_effect=device.adb_run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            call(provisioner)
+
+    def test_drift_sync_write_creates_a_missing_staging_directory(self) -> None:
+        device = FakeStagingDevice()
+        device.dirs.discard(STAGING_DIR)
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, autoroot=True, dhcp_dns=True
+            )
+            self.run_on_device(
+                provisioner, device, lambda p: p.sync_drift_conf_keys()
+            )
+        self.assertIn(STAGING_DIR, device.dirs)
+        self.assertEqual(
+            device.files[CONF_REMOTE],
+            BASE_CONF + "DNS_MODE=off\nDNS_SPECIFIER=null\n",
+        )
+        mkdir_at = next(
+            i
+            for i, call in enumerate(device.calls)
+            if call[:3] == ["shell", "mkdir", "-p"] and call[3] == STAGING_DIR
+        )
+        push_at = next(
+            i for i, call in enumerate(device.calls) if call[0] == "push"
+        )
+        self.assertLess(mkdir_at, push_at)
+
+    def test_nodemon_sync_write_creates_a_missing_staging_directory(
+        self,
+    ) -> None:
+        device = FakeStagingDevice()
+        device.dirs.discard(STAGING_DIR)
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, autoroot=True, disable_updates=True
+            )
+            self.run_on_device(
+                provisioner,
+                device,
+                lambda p: p.sync_ota_nodemon_autoroot_conf(),
+            )
+        self.assertIn(STAGING_DIR, device.dirs)
+        self.assertEqual(
+            device.files[CONF_REMOTE], BASE_CONF + "OTA_NODEMON=1\n"
+        )
+
+    def test_restore_then_reprovision_sequence(self) -> None:
+        device = FakeStagingDevice()
+        # The autoroot restore's own removal (payload.py's rm -rf).
+        device.adb_run(["shell", "rm", "-rf", STAGING_DIR])
+        self.assertNotIn(CONF_REMOTE, device.files)
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary,
+                autoroot=True,
+                dhcp_dns=True,
+                disable_updates=True,
+            )
+            # The early conf syncs of the re-provision run: nothing
+            # staged, so nothing to sync, and no write may be
+            # attempted into the removed directory (pre-fix the
+            # nodemon sync rewrote cat's error text and the push
+            # died on the missing directory).
+            self.run_on_device(
+                provisioner,
+                device,
+                lambda p: p.sync_ota_nodemon_autoroot_conf(),
+            )
+            self.run_on_device(
+                provisioner, device, lambda p: p.sync_drift_conf_keys()
+            )
+            self.assertNotIn(CONF_REMOTE, device.files)
+            # The staging write the run performs later succeeds.
+            device.adb_run(["shell", "mkdir", "-p", STAGING_DIR])
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=device.adb_run
+            ):
+                provisioner.push_text_atomic(
+                    BASE_CONF + "OTA_NODEMON=1\n", CONF_REMOTE
+                )
+        self.assertEqual(
+            device.files[CONF_REMOTE], BASE_CONF + "OTA_NODEMON=1\n"
+        )
 
 
 class PostureTrustTest(unittest.TestCase):
