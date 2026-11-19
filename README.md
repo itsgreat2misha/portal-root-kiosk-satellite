@@ -88,7 +88,7 @@ The provisioner uses only the Python standard library.
 - ADB enabled in the Portal's Debug menu and the host authorized over USB
 - Wireless ADB enabled for the current boot with `adb -d tcpip 5555`
 - Stable network, a stable IP address and external power for several reboots
-- The physical camera cover open and camera/microphone privacy control off for presence features
+- The physical camera cover open and camera/microphone privacy control off for presence features (a closed cover no longer fails the run: the durable presence state is verified and the live verification defers to a later run with the cover open)
 
 Presence verification checks the live camera pipeline automatically. Nobody
 needs to remain in view during the reboot sequence.
@@ -951,7 +951,9 @@ of view without running the background-detector worker.
 Open the Portal's physical camera cover and make sure its camera/microphone
 privacy control is off before running this action. Meta intentionally stops
 the AIService camera client while either hardware privacy control disables the
-camera, so presence verification cannot pass in that state.
+camera. If the lens cover is closed, the provisioner instead verifies the
+durable presence state and defers the live verification (recorded as
+deferred, never as verified) to a later run with the cover open.
 
 The provisioner requires an active AIService camera client, an allowed CAMERA
 AppOp, live analysis and region-of-interest frame delivery, a loaded frame

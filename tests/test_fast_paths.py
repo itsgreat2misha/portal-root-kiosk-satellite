@@ -1593,5 +1593,347 @@ class VerifyPresenceChannelTest(unittest.TestCase):
             self.assertEqual(calls[1], "race")
 
 
+class ShutterPresenceDevice:
+    """adb fake for the shutter-aware presence verification: the
+    lens cover state, aiservice process, CAMERA appop, durable
+    profile evidence (installed marker / config-load logcat lines)
+    and the FPS cap marker are each independently switchable. The
+    streaming evidence is modelled as present, so with the cover
+    open the live check passes on its first sample."""
+
+    PROFILE_KEYS = (
+        "enable_cv_background_detector_v2",
+        "enable_hardware_cropping",
+        "enable_liveness_metric",
+        "enable_color_based_reid",
+        "enable_face_rec_based_reid_v3",
+    )
+
+    def __init__(self) -> None:
+        self.shutter: str | None = "1"
+        self.pid = "2703"
+        self.appop_allow = True
+        self.marker = False
+        self.profile_lines = True
+        self.fps_marker = "5"
+
+    def _logs(self) -> str:
+        lines = []
+        if self.profile_lines:
+            lines += [
+                f"settings_config.xml {key} false"
+                for key in self.PROFILE_KEYS
+            ]
+        lines += [
+            "Disabled hardware cropping",
+            "Frame available for analysis stream",
+            "Frame available for roi stream",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def adb_run(self, arguments, timeout=None, check=False):
+        del timeout, check
+        command = " ".join(str(argument) for argument in arguments)
+        if "dumpsys platform_state_service" in command:
+            if self.shutter is None:
+                return completed(arguments, "platform state unavailable\n")
+            return completed(arguments, f"shutter_state={self.shutter}\n")
+        if (
+            "test -f /data/local/tmp/portal-presence-backup/installed-v1"
+            in command
+        ):
+            return completed(arguments, "", 0 if self.marker else 1)
+        if "fps-cap-v1" in command or "presence-fps" in command:
+            return completed(arguments, self.fps_marker + "\n")
+        if "pidof com.facebook.portal.aiservice" in command:
+            if not self.pid:
+                return completed(arguments, "", 1)
+            return completed(arguments, self.pid + "\n")
+        if "dumpsys media.camera" in command:
+            return completed(
+                arguments,
+                "Active Camera Clients:\n"
+                "Client Package Name: com.facebook.portal.aiservice\n"
+                "com.facebook.alohasdk.dewarp_crop_rect.x_start:\n"
+                "[0.0]\n"
+                "com.facebook.alohasdk.dewarp_crop_rect.y_start:\n"
+                "[0.0]\n"
+                "com.facebook.alohasdk.dewarp_crop_rect.width:\n"
+                "[4032.0]\n",
+            )
+        if "cmd appops get" in command:
+            return completed(
+                arguments,
+                "CAMERA: allow\n" if self.appop_allow else "CAMERA: deny\n",
+            )
+        if "logcat" in command:
+            return completed(arguments, self._logs())
+        if "dumpsys activity service" in command:
+            return completed(
+                arguments,
+                "[ PoseEstimatorManagerMetrics ]\n"
+                "10 ms - 20 ms: 3\n"
+                "[ AlohaFrameProcessor ]\nloaded\n"
+                "[ AiCameramanController ]\n",
+            )
+        if "ps -T" in command:
+            return completed(arguments, "main\n")
+        return completed(arguments, "", 0)
+
+
+class ShutterAwarePresenceTest(unittest.TestCase):
+    """With the camera lens cover closed the presence pipeline is
+    off by design (it configures, starts, and pauses without ever
+    opening the camera), so the streaming verification can never
+    pass. The verification reads the shutter state first: covered
+    units verify their durable end state and return a distinct
+    deferred outcome; durable failures still fail; open units run
+    the live check unchanged. A deferred verification is recorded
+    in the manifest as "deferred" (the OTA "unverified" pattern),
+    so the no-op gate refuses to treat it as verified and a later
+    run with the cover open re-attempts the streaming check."""
+
+    def _provisioner(self, temporary: str, device: ShutterPresenceDevice, **kwargs):
+        provisioner = make_provisioner(temporary, **kwargs)
+        provisioner.adb_run = device.adb_run
+        return provisioner
+
+    def test_closed_shutter_durable_good_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                outcome = provisioner.verify_presence_runtime(
+                    require_profile=True, wait_seconds=5
+                )
+            self.assertEqual(outcome, "deferred")
+            self.assertTrue(provisioner.presence_deferred)
+            self.assertIn(
+                "PRESENCE_VERIFY_DEFERRED reason=shutter_closed",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("PRESENCE_RUNTIME_OK", stdout.getvalue())
+
+    def test_closed_shutter_profile_evidenced_by_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.profile_lines = False
+            device.marker = True
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                outcome = provisioner.verify_presence_runtime(
+                    require_profile=True, wait_seconds=5
+                )
+            self.assertEqual(outcome, "deferred")
+
+    def test_closed_shutter_appop_denied_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.appop_allow = False
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.verify_presence_runtime(
+                        require_profile=True, wait_seconds=5
+                    )
+            self.assertIn("camera-appop-not-allow", str(raised.exception))
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_closed_shutter_aiservice_down_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.pid = ""
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.verify_presence_runtime(
+                        require_profile=True, wait_seconds=5
+                    )
+            self.assertIn("aiservice-not-running", str(raised.exception))
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_closed_shutter_profile_not_evidenced_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.profile_lines = False
+            device.marker = False
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.verify_presence_runtime(
+                        require_profile=True, wait_seconds=5
+                    )
+            self.assertIn("profile-not-evidenced", str(raised.exception))
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_closed_shutter_fps_cap_durable_good_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            provisioner = self._provisioner(
+                temporary, device, presence_fps_cap=5
+            )
+            with redirect_stdout(io.StringIO()):
+                outcome = provisioner.verify_presence_runtime(
+                    require_profile=True,
+                    expected_analysis_fps=5,
+                    wait_seconds=5,
+                )
+            self.assertEqual(outcome, "deferred")
+            self.assertTrue(provisioner.presence_deferred)
+
+    def test_closed_shutter_fps_cap_marker_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.fps_marker = "3"
+            provisioner = self._provisioner(
+                temporary, device, presence_fps_cap=5
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.verify_presence_runtime(
+                        require_profile=True,
+                        expected_analysis_fps=5,
+                        wait_seconds=5,
+                    )
+            self.assertIn(
+                "fps-cap-marker-mismatch", str(raised.exception)
+            )
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_open_shutter_live_verification_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.shutter = "0"
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                outcome = provisioner.verify_presence_runtime(
+                    require_profile=True, wait_seconds=5
+                )
+            self.assertEqual(outcome, "verified")
+            self.assertIn("PRESENCE_RUNTIME_OK", stdout.getvalue())
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_shutter_unreadable_falls_back_to_live(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.shutter = None
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                outcome = provisioner.verify_presence_runtime(
+                    require_profile=True, wait_seconds=5
+                )
+            self.assertEqual(outcome, "verified")
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_channel_closed_shutter_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.marker = True
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                outcome = provisioner.verify_presence_runtime_channel()
+            self.assertEqual(outcome, "deferred")
+            self.assertTrue(provisioner.presence_deferred)
+            self.assertIn(
+                "PRESENCE_VERIFY_DEFERRED reason=shutter_closed "
+                "path=channel",
+                stdout.getvalue(),
+            )
+
+    def test_channel_closed_shutter_service_down_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            device.marker = True
+            device.pid = ""
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.verify_presence_runtime_channel()
+            self.assertIn("aiservice-not-running", str(raised.exception))
+            self.assertFalse(provisioner.presence_deferred)
+
+    def test_preflight_closed_shutter_skips_as_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ShutterPresenceDevice()
+            provisioner = self._provisioner(
+                temporary, device, optimize_presence=True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                configured = provisioner.presence_preflight()
+            self.assertTrue(configured)
+            self.assertIn(
+                "PRESENCE_PREFLIGHT action=skip profile=durable "
+                "deferred=shutter_closed",
+                stdout.getvalue(),
+            )
+            self.assertTrue(provisioner.presence_deferred)
+
+    def _recorded_actions(self, temporary: str, deferred: bool) -> dict:
+        provisioner = make_provisioner(temporary, optimize_presence=True)
+        provisioner.adb_run = (
+            lambda arguments, timeout=None, check=False: completed(
+                arguments, ALOHA.fingerprint + "\n"
+            )
+        )
+        provisioner.presence_deferred = deferred
+        writes: list = []
+        with unittest.mock.patch.object(
+            provisioner.run_state,
+            "write_state",
+            lambda status, **kwargs: writes.append((status, kwargs)),
+        ):
+            provisioner.write_state("complete")
+        return writes[-1][1]["actions"]
+
+    def test_deferred_verification_records_deferred_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            actions = self._recorded_actions(temporary, deferred=True)
+            self.assertEqual(actions["optimize_presence"], "deferred")
+            actions = self._recorded_actions(temporary, deferred=False)
+            self.assertEqual(actions["optimize_presence"], True)
+
+    def test_deferred_record_blocks_noop_until_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, optimize_presence=True
+            )
+            state = {
+                "status": "complete",
+                "tool_revision": provisioner.tool_revision(),
+                "target": ALOHA.key,
+                "fingerprint": ALOHA.fingerprint,
+                "actions": {"optimize_presence": "deferred"},
+                "artifact_sha256": {},
+            }
+            self.assertEqual(
+                provisioner._noop_blocker(state),
+                "actions-optimize_presence",
+            )
+            state["actions"] = {"optimize_presence": True}
+            self.assertIsNone(provisioner._noop_blocker(state))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -389,6 +389,15 @@ class PortalProvisioner:
         self.ota_already_configured = False
         self.ota_backend_value = ota_backend_value
         self.ota_unverified = False
+        # Set when a presence runtime verification deferred because
+        # the camera lens cover is closed: the durable presence
+        # state was verified, but the pipeline was never observed
+        # streaming. write_state records the presence actions as
+        # "deferred" (the ota_unverified pattern above) so no later
+        # run treats the streaming verification as done, and
+        # report_deferred_failures() surfaces it in the final
+        # report without failing the run.
+        self.presence_deferred = False
         # Set when any win in this run (a nested bootstrap run's win
         # included, propagated by the phase that ran it) set
         # otad.nodemon and read it back true. The posture judgment
@@ -2254,6 +2263,16 @@ class PortalProvisioner:
             # judgment that ends the run (and may raise) happens in
             # the final report after that phase.
             return
+        if self.presence_deferred:
+            # Not a failure: the run's presence verification
+            # deferred (lens cover closed) and the manifest records
+            # it as "deferred". Surface it in the final report so a
+            # completed run never reads as fully verified.
+            print(
+                "PRESENCE_VERIFY_DEFERRED reason=shutter_closed "
+                "report=final",
+                flush=True,
+            )
         if self.deferred_phase_failures:
             raise ProvisionError(
                 "bootstrap phases failed: "
@@ -2575,6 +2594,18 @@ class PortalProvisioner:
             # not be positively established; record it as unverified
             # so a later run never treats it as a completed no-op.
             actions["disable_updates"] = "unverified"
+        if self.presence_deferred:
+            # The presence runtime verification deferred (camera
+            # lens cover closed): the durable state was verified
+            # but the pipeline was never observed streaming. Record
+            # the presence actions as "deferred" so the no-op
+            # gate's exact-match comparison refuses a later no-op
+            # claim and a later run re-attempts the streaming
+            # verification (the "unverified" pattern above).
+            if "optimize_presence" in actions:
+                actions["optimize_presence"] = "deferred"
+            if "presence_fps_cap" in actions:
+                actions["presence_fps_cap"] = "deferred"
         artifact_sha256 = self.selected_artifact_hashes()
         autoroot_key_sha256 = self.staged_autoroot_key_sha256
         if merge_prior:
@@ -4668,10 +4699,16 @@ class PortalProvisioner:
         return complete
 
     def presence_preflight(self) -> bool:
-        return self.presence_feature.presence_preflight()
+        configured = self.presence_feature.presence_preflight()
+        if configured and self.presence_feature.presence_verify_deferred:
+            self.presence_deferred = True
+        return configured
 
     def presence_fps_preflight(self) -> bool:
-        return self.presence_feature.presence_fps_preflight()
+        configured = self.presence_feature.presence_fps_preflight()
+        if configured and self.presence_feature.presence_verify_deferred:
+            self.presence_deferred = True
+        return configured
 
     def simpleperf_push_needed(
         self, local: pathlib.Path, remote: str
@@ -6786,18 +6823,26 @@ class PortalProvisioner:
         require_profile: bool,
         expected_analysis_fps: int | None = None,
         wait_seconds: int = 90,
-    ) -> None:
-        return self.presence_feature.verify_presence_runtime(require_profile, expected_analysis_fps, wait_seconds)
+    ) -> str:
+        outcome = self.presence_feature.verify_presence_runtime(
+            require_profile, expected_analysis_fps, wait_seconds
+        )
+        if outcome == "deferred":
+            self.presence_deferred = True
+        return outcome
 
     def verify_presence_runtime_channel(
         self,
         expected_analysis_fps: int | None = None,
         require_marker: bool = True,
         wait_seconds: int = 90,
-    ) -> None:
-        return self.presence_feature.verify_presence_runtime_channel(
+    ) -> str:
+        outcome = self.presence_feature.verify_presence_runtime_channel(
             expected_analysis_fps, require_marker, wait_seconds
         )
+        if outcome == "deferred":
+            self.presence_deferred = True
+        return outcome
 
     def verify_meta_accounts_removed(self) -> None:
         return self.settings_feature.verify_meta_accounts_removed()
