@@ -167,6 +167,36 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- An explicit `--dns` request could silently no-op against a
+  contradicting live state (Defect D, Phase D closure session 3,
+  Nov 19, 2026). A manifest recorded by a pre-#64 run can carry
+  both DNS intents (`dhcp_dns` plus `privacy_dns`); the manifest
+  merges preserve prior actions per key, so the pair survived
+  every later run, and the recorded-expectation readers resolve
+  the pair dhcp-first. A bare `--dns HOSTNAME` run whose record
+  held that hostname therefore compared the live state against
+  "off", matched a live-off device, and reported
+  already-provisioned with its request unapplied — and had the
+  device been live on the requested hostname, the same verdict
+  would have "repaired" it to off. Two fixes. Gate semantics:
+  when a run carries a DNS intent of its own, the fast path's
+  drift evaluation judges the live state against the requested
+  intent (`_requested_dns_expectation`, resolved from the run's
+  requested actions with the recorded expectation's rules); runs
+  carrying no intent keep the recorded pair's dhcp-first
+  resolution exactly as before, and `--full` with no explicit
+  `--dns` is unchanged (the preset's dhcp intent and the pair's
+  dhcp-first resolution coincide). Record hygiene: a completion
+  write whose run established exactly one DNS intent now drops
+  the family's other keys from the merged record, so a
+  dual-intent record converges on its next DNS run instead of
+  shadowing it forever. The drop lives in the one `write_state`
+  every completion path funnels through (channel, stages subset
+  exits, payload terminal write, recovery exits, the full run's
+  completion write, the OTA correction re-writes), so no call
+  site needed its own copy; a run carrying no DNS intent leaves
+  the recorded DNS actions untouched. Live validation is
+  deferred to the next device session.
 - The WiFi flush guard's boot-age floor is 60 s on both sides
   (host `RACE_BOOT_MIN_AGE_SECONDS` and the autoroot helper's
   `BootFlushGuard.MIN_BOOT_AGE_MS`, helper 1.14, versionCode

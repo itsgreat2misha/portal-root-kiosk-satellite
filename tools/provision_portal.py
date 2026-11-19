@@ -181,6 +181,12 @@ COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
 APP_VERIFIER_PACKAGE = "com.facebook.appverifier"
 ADB_ENABLED_SETTING = "adb_enabled"
+#: The manifest action keys that record a Private DNS end state.
+#: A completed record must carry at most one of them: the readers
+#: resolve the family in this order (dhcp first), so a record
+#: holding two — a pre-#64 pair the manifest merges preserved —
+#: shadows the intent the later one established (Defect D).
+DNS_ACTION_KEYS = ("dhcp_dns", "privacy_dns", "restore_privacy_dns")
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
 ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
@@ -1798,13 +1804,26 @@ class PortalProvisioner:
                 # drift: the manifest records the desired end
                 # state, so live drift routes to the channel path,
                 # whose final verification performs the repair.
-                drift = self._dns_drift(state)
+                # When this run carries a DNS intent of its own,
+                # the verdict judges live state against the
+                # REQUESTED intent, not the record: a recorded
+                # pre-#64 pair resolves dhcp-first, so a bare
+                # --dns HOSTNAME run over a live-off device whose
+                # record held that hostname matched "off" and
+                # no-oped with its request unapplied (Defect D,
+                # closure session 3). Runs carrying no intent keep
+                # the recorded expectation exactly as before.
+                requested_dns = self._requested_dns_expectation()
+                drift = self._dns_drift(state, requested_dns)
                 if drift is not None:
                     live = self._dns_drift_live
+                    source = (
+                        "requested" if requested_dns is not None else "recorded"
+                    )
                     print(
                         "PRIVACY_DNS_DRIFT "
-                        f"recorded_mode={drift[0]} "
-                        f"recorded_hostname={drift[1]} "
+                        f"{source}_mode={drift[0]} "
+                        f"{source}_hostname={drift[1]} "
                         f"live_mode={live[0] if live else 'unreadable'} "
                         f"live_hostname={live[1] if live else 'unreadable'}",
                         flush=True,
@@ -2095,6 +2114,18 @@ class PortalProvisioner:
             flush=True,
         )
 
+    def _requested_dns_expectation(self) -> tuple[str, str] | None:
+        """The Private DNS end state THIS run requests, resolved
+        from its own requested actions with the same rules the
+        recorded expectation uses; None when the run carries no
+        DNS intent, or the intent's end state cannot be determined
+        (a restore whose on-device backup is unreadable), in which
+        case the caller falls back to the recorded expectation."""
+        actions = self.requested_actions()
+        if not any(actions.get(name) for name in DNS_ACTION_KEYS):
+            return None
+        return self._recorded_dns_expectation({"actions": actions})
+
     def _recorded_dns_expectation(
         self, state: dict[str, object] | None
     ) -> tuple[str, str] | None:
@@ -2128,11 +2159,17 @@ class PortalProvisioner:
         return None
 
     def _dns_drift(
-        self, state: dict[str, object] | None
+        self,
+        state: dict[str, object] | None,
+        expectation: tuple[str, str] | None = None,
     ) -> tuple[str, str] | None:
-        """The recorded DNS expectation when the live state has
-        drifted from it; None when it matches or nothing is
-        recorded. A single mismatching sample is confirmed with
+        """The DNS expectation when the live state has drifted
+        from it; None when it matches or nothing is expected. The
+        expectation defaults to the manifest-recorded one; the
+        fast path passes this run's requested intent instead when
+        the run carries one (Defect D: a recorded pair resolves
+        dhcp-first, which can contradict the very intent the run
+        was asked to establish). A single mismatching sample is confirmed with
         one re-read after a short delay before it counts as drift:
         the C3-B run-8 no-op refusal (2026-11-18) was a lone
         disagreeing read on a device whose DNS had been verified
@@ -2145,7 +2182,8 @@ class PortalProvisioner:
         surfaces a real I/O failure if there is one. The live
         values behind the verdict are kept on
         self._dns_drift_live for the caller's log line."""
-        expectation = self._recorded_dns_expectation(state)
+        if expectation is None:
+            expectation = self._recorded_dns_expectation(state)
         if expectation is None:
             return None
         self._dns_drift_live = None
@@ -2614,6 +2652,17 @@ class PortalProvisioner:
                 actions["presence_fps_cap"] = "deferred"
         artifact_sha256 = self.selected_artifact_hashes()
         autoroot_key_sha256 = self.staged_autoroot_key_sha256
+        # The DNS intent THIS run's own action set establishes
+        # (Defect D record hygiene, applied after the merge
+        # below): a run that completes a DNS apply must record
+        # only that intent, so a prior record's sibling key has
+        # to be actively dropped — the merge preserves prior
+        # actions per key, and the expectation readers resolve
+        # the DNS family dhcp-first, so a surviving sibling
+        # shadows the intent the run just established.
+        own_dns_keys = [
+            name for name in DNS_ACTION_KEYS if actions.get(name)
+        ]
         if merge_prior:
             # Merge into the manifest this run started from instead
             # of replacing it: the recorded manifest is the device's
@@ -2651,6 +2700,20 @@ class PortalProvisioner:
                         verification.get("second_boot"), str
                     ):
                         second_boot = verification["second_boot"]
+                if len(own_dns_keys) == 1:
+                    # Defect D hygiene, before the count below is
+                    # logged: the merged record carries only the
+                    # DNS intent this run established. (On a
+                    # replace write this could never fire — the
+                    # run's own set holds no sibling — so the drop
+                    # lives here with the merge it corrects. A run
+                    # carrying no DNS intent leaves the recorded
+                    # DNS actions untouched; a run carrying two, a
+                    # composed config the CLI no longer produces,
+                    # keeps today's record.)
+                    for name in DNS_ACTION_KEYS:
+                        if name != own_dns_keys[0]:
+                            actions.pop(name, None)
                 print(
                     "STATE_MANIFEST_MERGED "
                     f"actions={len(actions)} "
@@ -4643,9 +4706,7 @@ class PortalProvisioner:
             return
         lines = existing.splitlines()
         if dns_requested:
-            resolved = self._recorded_dns_expectation(
-                {"actions": self.requested_actions()}
-            )
+            resolved = self._requested_dns_expectation()
             if resolved is not None:
                 lines = [
                     line
