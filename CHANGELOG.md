@@ -137,6 +137,18 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- Autoroot staging through the channel path rendered the frozen
+  on-device exploit environments outside the custom-payload
+  phase, so the staged env files silently lacked the payload
+  block (`GHOSTLOCK_CUSTOM_PAYLOAD`, `GHOSTLOCK_LOCK_REPAIR`,
+  and companions): on-device wins then skipped the custom
+  payload and the lock repair while still reporting success
+  (found in the guest Mini's post-C3-A boots). Staging now
+  renders in the payload-phase context regardless of the
+  caller's phase, and refuses to stage a rendered environment
+  that is missing the payload keys when a custom payload is
+  configured. Live validation is deferred until the Mini is
+  restaged.
 - Re-runs on a device in the recorded alohausers-disabled
   posture refused themselves: the no-op and channel gates
   re-derived the OTA block from the live MobileConfig dump,

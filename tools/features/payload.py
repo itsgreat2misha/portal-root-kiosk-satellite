@@ -74,6 +74,7 @@ class PayloadConfig:
     privacy_dns: str | None = None
     dhcp_dns: bool = False
     restore_privacy_dns: bool = False
+    custom_payload: bool = False
 
 
 class PayloadFeature:
@@ -777,6 +778,29 @@ class PayloadFeature:
                         "identity (pid/uid resolved live), which cannot "
                         "be frozen into the on-device runner"
                     )
+                if self._config.custom_payload:
+                    # Fail loud rather than freeze a bad set: without
+                    # these keys the native payload silently skips the
+                    # custom payload and the lock repair on every
+                    # on-device win (channel-staging regression,
+                    # 2026-11-18).
+                    missing = [
+                        key
+                        for key in (
+                            "GHOSTLOCK_CUSTOM_PAYLOAD",
+                            "GHOSTLOCK_LOCK_REPAIR",
+                        )
+                        if key not in environment
+                    ]
+                    if missing:
+                        raise ProvisionError(
+                            "autoroot cannot stage this run: the "
+                            "rendered exploit environment is missing "
+                            "the custom payload keys "
+                            f"({', '.join(missing)}), which the "
+                            "on-device runner needs to run the payload "
+                            "and the lock repair"
+                        )
                 rendered = "".join(
                     f"export {key}={shlex.quote(value)}\n"
                     for key, value in sorted(environment.items())

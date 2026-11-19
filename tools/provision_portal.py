@@ -483,6 +483,7 @@ class PortalProvisioner:
                 privacy_dns=self.privacy_dns,
                 dhcp_dns=self.dhcp_dns,
                 restore_privacy_dns=self.restore_privacy_dns,
+                custom_payload=self.custom_payload is not None,
             ),
             adb_run=lambda *a, **k: self.adb_run(*a, **k),
             target=lambda: self.target,
@@ -5937,7 +5938,20 @@ class PortalProvisioner:
         return self.shizuku_feature.start_shizuku_as_root()
 
     def stage_autoroot_payload(self) -> None:
-        result = self.payload_feature.stage_autoroot_payload()
+        # Staging renders the frozen on-device exploit environments
+        # through build_exploit_environment(), whose custom-payload
+        # block is gated on the payload phase. Race-path staging
+        # already runs inside that phase; channel-path staging
+        # (_apply_via_channel) does not, and its env files silently
+        # lacked the block, so on-device wins skipped the custom
+        # payload and the lock repair. Render in the payload-phase
+        # context regardless of the caller's phase.
+        previous_phase = self._in_custom_payload_phase
+        self._in_custom_payload_phase = True
+        try:
+            result = self.payload_feature.stage_autoroot_payload()
+        finally:
+            self._in_custom_payload_phase = previous_phase
         self.staged_autoroot_key_sha256 = (
             self.payload_feature.staged_autoroot_key_sha256
         )
