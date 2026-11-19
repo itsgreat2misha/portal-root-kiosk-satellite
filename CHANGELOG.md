@@ -167,6 +167,27 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The root-channel apply path staged the PortalComponentCtl
+  actions file but never executed the jar, so any channel run
+  that had to actually change component state failed its own
+  verification and fell back to the race path (Defect G,
+  Phase D closure session 8, Nov 19, 2026). The jar's only
+  executor was the payload's post-win sequence; loopback-ADB
+  shell cannot substitute (PackageManager's binder caller
+  check excludes uid 2000). The channel path now executes
+  the jar after staging, through Shizuku's own shell client
+  (rish, extracted from the pinned, hash-verified Shizuku
+  APK): the root-mode server spawns it, so it runs as uid 0
+  with the same arguments the payload passes, and the
+  payload's package-state settle (15 s + sync) runs before
+  verification reads the state back. Without Shizuku root
+  (--skip-shizuku-root, or the server not answering as
+  uid 0) the step does not run and claims nothing, so the
+  verify-and-fallback behaviour is unchanged. This covers
+  every channel run carrying component actions: debloat,
+  bloat restore, remote-wipe block/restore, the Meta
+  authenticator restore, and the presence FPS/profile jar
+  action on targets where the jar is its only carrier.
 - The system-theme restore left the ui_night_mode key and
   UiModeManager diverged on shell-uimode targets (Defect F,
   Phase D closure session 7, Nov 19, 2026). The restore set
