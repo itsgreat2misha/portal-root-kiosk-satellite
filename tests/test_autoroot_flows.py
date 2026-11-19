@@ -578,6 +578,54 @@ class AutorootStagingTest(unittest.TestCase):
         self.assertIn("SHIZUKU_HELPER_REMOVED", output)
         self.assertIn("AUTOROOT_STAGED_OK", output)
 
+    def test_staging_from_channel_context_renders_payload_block(
+        self,
+    ) -> None:
+        # Regression (2026-11-18): channel-path staging runs outside
+        # the custom-payload phase, and the environment builder gates
+        # the payload block on that phase, so channel-staged env files
+        # silently lacked it and on-device wins skipped the custom
+        # payload and the lock repair. Staging must render in the
+        # payload-phase context regardless of the caller's phase.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            self.assertFalse(provisioner._in_custom_payload_phase)
+            pushes, output = self.run_staging(
+                provisioner, ({SHIZUKU_HELPER_PACKAGE}, set())
+            )
+            # The caller's phase is restored, not left flipped.
+            self.assertFalse(provisioner._in_custom_payload_phase)
+        self.assertIn("AUTOROOT_STAGED_OK", output)
+        for name in ("env-odd.sh", "env-even.sh"):
+            rendered = pushes[f"/data/local/tmp/portal-autoroot/{name}"]
+            self.assertIn("export GHOSTLOCK_CUSTOM_PAYLOAD=1", rendered)
+            self.assertIn("GHOSTLOCK_CUSTOM_PAYLOAD_SRC", rendered)
+            self.assertIn("GHOSTLOCK_CUSTOM_PAYLOAD_DST", rendered)
+            self.assertIn("GHOSTLOCK_LOCK_REPAIR", rendered)
+            self.assertIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", rendered)
+            # The authorize-key action belongs to the install phase;
+            # it must stay out of the staged env (its presence is the
+            # fingerprint of a non-payload-phase rendering).
+            self.assertNotIn("GHOSTLOCK_SHIZUKU_AUTHORIZE_KEY", rendered)
+
+    def test_staging_fails_loud_when_payload_keys_missing(self) -> None:
+        # The staging assertion: a rendered environment without the
+        # payload keys must raise instead of freezing a runner whose
+        # wins would silently skip the payload and the lock repair.
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.build_provisioner(temporary)
+            with mock.patch.object(
+                provisioner,
+                "build_exploit_environment",
+                return_value={"GHOSTLOCK_KGSL_RECLAIM": "8192"},
+            ):
+                with self.assertRaisesRegex(
+                    ProvisionError, "missing the custom payload keys"
+                ):
+                    self.run_staging(
+                        provisioner, ({SHIZUKU_HELPER_PACKAGE}, set())
+                    )
+
     def test_staging_force_run_retries_stale_signed_helper(self) -> None:
         # Regression (Nov 17, 2026): in a --force run the staging
         # install of the autoroot helper hard-failed with
