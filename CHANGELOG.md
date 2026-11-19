@@ -167,6 +167,26 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- Race-heavy runs could cost a unit its saved WiFi network: every
+  boot auto-connects within seconds, which makes system_server
+  update the saved-network record and schedule an asynchronous
+  WifiConfigStore write, and attempt boots die young and uncleanly
+  (race panics, watchdog cuts, the runner's own reboots) inside
+  that write's flush window — four episodes on the library unit,
+  each ending with the store loading empty and the password
+  needing re-entry (investigation 2026-11-19). The run mechanism
+  now guards the window on both sides: the host attempt loops
+  wait until the boot is at least 120 s old and sync before a
+  race attempt starts (failing toward waiting when the boot-age
+  read does not answer), the host runner syncs before every
+  reboot it issues, and the autoroot helper (1.13, versionCode
+  14) applies the same age-and-sync guard before an on-device
+  attempt and syncs before its clean-attempt reboot. The README's
+  troubleshooting section also records the operator rule: no
+  smart-plug power cut into a failed-boot state until the unit
+  has had one clean boot or the pre-revival capture
+  (`dumpsys wifi` + logcat) is taken. Live validation is
+  deferred to the Phase D gate re-run.
 - The channel gate refused every device in the recorded
   alohausers-disabled posture that requested Meta account
   removal: the meta-accounts preflight's already-clean requires

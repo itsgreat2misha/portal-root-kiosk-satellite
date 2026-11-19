@@ -1461,6 +1461,17 @@ through the device's existing root setup without re-running the exploit
 races. Use `--force` to bypass both shortcuts and redo the full
 race-based provisioning, re-installing everything.
 
+One caution about power cuts: do not cut power (including with a smart
+plug) to a Portal that is stuck in a failed-boot state until it has
+either completed one clean boot or you have captured its state first
+(`adb shell dumpsys wifi` and `adb shell logcat -d`, saved off-device
+before any re-entry or reboot). A hard power cut lands without any
+filesystem sync, and a boot that connected to WiFi but never got a
+clean shutdown can lose the saved network record — the Portal then
+comes up with no WiFi configured and the password has to be re-entered
+by hand. Where a cut is genuinely unavoidable, treat WiFi re-entry
+afterwards as an expected follow-up, not a surprise.
+
 Use `--skip-build` only when the required outputs have already been built and
 have not changed. Every root-backed action requires both the selected exploit
 library and `exploit-sentinel/build/portal-exploit-sentinel.apk`. The

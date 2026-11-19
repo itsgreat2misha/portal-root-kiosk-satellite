@@ -186,6 +186,17 @@ ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
 )
 PACKAGE_STATE_SETTLE_SECONDS = 15
+# Flush-and-age guard for race boots (2026-11-19): a race attempt may
+# not start until its boot is at least this old, and the runner syncs
+# before the attempt and before every reboot it issues. Every boot
+# auto-connects WiFi within seconds; the connection makes
+# system_server update the saved-network record and schedule an
+# asynchronous WifiConfigStore write, and race boots die young and
+# uncleanly (attempt panics, watchdog cuts, runner reboots) inside
+# that write's flush window — repeated episodes lost a unit's saved
+# network outright. See PortalProvisioner.wait_for_race_boot_window.
+RACE_BOOT_MIN_AGE_SECONDS = 120
+RACE_BOOT_GUARD_POLL_SECONDS = 5
 OTA_UI_PACKAGE = "com.facebook.aloha.otaui"
 OTA_SETUP_PACKAGE = "com.facebook.aloha.alohaotasetup"
 OTA_BACKEND_PROPERTY = "persist.sys.mobileconfigutil.usePlatformMobileConfig"
@@ -5494,6 +5505,94 @@ class PortalProvisioner:
             flush=True,
         )
 
+    def _boot_uptime_seconds(self) -> float | None:
+        """Seconds since the current boot started, or None when the
+        device does not answer the read."""
+        try:
+            result = self.adb_run(
+                ["shell", "cat", "/proc/uptime"], timeout=5
+            )
+            if result.returncode != 0:
+                return None
+            fields = result.stdout.split()
+            return float(fields[0]) if fields else None
+        except Exception:
+            return None
+
+    def _current_boot_id(self) -> str | None:
+        try:
+            result = self.adb_run(
+                ["shell", "cat", "/proc/sys/kernel/random/boot_id"],
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            boot_id = result.stdout.strip()
+            return boot_id or None
+        except Exception:
+            return None
+
+    def wait_for_race_boot_window(self, attempt: int) -> None:
+        """Flush-and-age guard: no race attempt starts on a young boot.
+
+        Every boot auto-connects WiFi within seconds, and the
+        connection makes system_server update the saved-network
+        record and schedule an asynchronous WifiConfigStore write.
+        Race boots then die young and uncleanly (attempt panics,
+        watchdog cuts, the runner's own reboot), inside that write's
+        flush window; repeated episodes lost the library unit's
+        saved network outright (investigation 2026-11-19). So before
+        an attempt starts, its boot must be at least
+        RACE_BOOT_MIN_AGE_SECONDS old — by then the connect-time
+        write has long been scheduled — and a sync pushes it to
+        durable storage, so the boot may die without taking the
+        store with it. When the uptime read does not answer, the
+        guard fails toward waiting, never toward skipping: it counts
+        its own observation time on the same boot id as a lower bound
+        on the boot's age and waits the full window out.
+        """
+        observed_since = time.monotonic()
+        observed_boot = self._current_boot_id()
+        announced = False
+        final_age = "unknown"
+        while True:
+            age = self._boot_uptime_seconds()
+            if age is not None:
+                if age >= RACE_BOOT_MIN_AGE_SECONDS:
+                    final_age = f"{age:.0f}"
+                    break
+                remaining = RACE_BOOT_MIN_AGE_SECONDS - age
+                shown_age = f"{age:.0f}"
+            else:
+                current_boot = self._current_boot_id()
+                if (
+                    observed_boot is not None
+                    and current_boot is not None
+                    and current_boot != observed_boot
+                ):
+                    observed_boot = current_boot
+                    observed_since = time.monotonic()
+                observed = time.monotonic() - observed_since
+                if observed >= RACE_BOOT_MIN_AGE_SECONDS:
+                    break
+                remaining = RACE_BOOT_MIN_AGE_SECONDS - observed
+                shown_age = "unknown"
+            if not announced:
+                print(
+                    "WIFI_FLUSH_GUARD_WAIT "
+                    f"attempt={attempt} boot_age_seconds={shown_age} "
+                    f"required={RACE_BOOT_MIN_AGE_SECONDS}",
+                    flush=True,
+                )
+                announced = True
+            time.sleep(min(remaining, RACE_BOOT_GUARD_POLL_SECONDS))
+        self.adb_run(["shell", "sync"], timeout=60, check=True)
+        print(
+            "WIFI_FLUSH_GUARD "
+            f"attempt={attempt} boot_age_seconds={final_age} synced=1",
+            flush=True,
+        )
+
     def exploit(
         self, base: int, memstart: int, attempt: int, *,
         skip_final_reboot: bool = False,
@@ -5925,6 +6024,16 @@ class PortalProvisioner:
             if not success:
                 self._log_watch_result_evidence(attempt)
             if not skip_final_reboot or not success:
+                # Flush before the reboot this runner issues (F1,
+                # 2026-11-19): the boot's asynchronous writes — the
+                # WiFi config store's connect-time write above all —
+                # must be durable before the boot ends. Best-effort,
+                # exactly like the reboot itself: a device the attempt
+                # panicked cannot answer either call.
+                try:
+                    self.adb_run(["shell", "sync"], timeout=60)
+                except ProvisionError:
+                    pass
                 try:
                     self.adb_run(["reboot"], timeout=8)
                 except ProvisionError:
@@ -6000,6 +6109,7 @@ class PortalProvisioner:
                     f"kaslr={base:#x} memstart={memstart:#x}",
                     flush=True,
                 )
+                self.wait_for_race_boot_window(attempt)
                 if not self.exploit(
                     base, memstart, attempt, skip_final_reboot=True
                 ):
@@ -6917,6 +7027,7 @@ class PortalProvisioner:
                     f"kaslr={base:#x} memstart={memstart:#x}",
                     flush=True,
                 )
+                self.wait_for_race_boot_window(attempt)
                 exploit_ok = self.exploit(base, memstart, attempt)
                 post_attempt_boot = self.connect_after_reboot(boot_id)
                 if not exploit_ok:

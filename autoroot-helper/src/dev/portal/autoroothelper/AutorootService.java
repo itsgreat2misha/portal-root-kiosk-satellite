@@ -14,6 +14,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -299,6 +300,16 @@ public final class AutorootService extends Service {
             logFile("capped attempts=" + attempts);
             publishStatus("CAPPED", attempts, maxAttempts,
                     "attempt cap reached");
+            return;
+        }
+        // Flush-and-age guard (F1, 2026-11-19): the attempt may not
+        // start until this boot is old enough for its connect-time
+        // WiFi store write to be flushed. Runs before the attempt is
+        // counted and before the failure budget's in-progress mark
+        // is written, so a stop during the wait leaves both
+        // untouched.
+        if (!waitForBootFlushWindow()) {
+            logFile("stopped by user during wifi flush guard");
             return;
         }
         attempts++;
@@ -876,12 +887,67 @@ public final class AutorootService extends Service {
         }
     }
 
+    // ---- wifi flush guard ----------------------------------------------
+
+    /**
+     * Waits until this boot reaches BootFlushGuard.MIN_BOOT_AGE_MS,
+     * then issues a sync so the boot's connect-time WifiConfigStore
+     * write is durable before the attempt is allowed to end the boot
+     * (see BootFlushGuard for the mechanism). Returns false when a
+     * stop was requested during the wait; the caller then returns
+     * before the attempt is counted and before the failure budget's
+     * in-progress mark is written, so neither is disturbed.
+     */
+    private boolean waitForBootFlushWindow() {
+        long remaining = BootFlushGuard.remainingWaitMs(
+                SystemClock.elapsedRealtime());
+        if (remaining > 0) {
+            logFile("wifi flush guard waiting ms=" + remaining);
+            while (remaining > 0) {
+                if (stopRequested) {
+                    return false;
+                }
+                try {
+                    Thread.sleep(Math.min(remaining, 5000L));
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+                remaining = BootFlushGuard.remainingWaitMs(
+                        SystemClock.elapsedRealtime());
+            }
+        }
+        if (stopRequested) {
+            return false;
+        }
+        try {
+            shell("sync");
+        } catch (Exception error) {
+            // Best-effort, like the sync before the clean-attempt
+            // reboot: a failed flush is logged, but the aged boot is
+            // still the safest state this guard can offer.
+            logFile("wifi flush guard sync failed: " + error);
+        }
+        logFile("wifi flush guard ok boot_age_ms="
+                + SystemClock.elapsedRealtime());
+        return true;
+    }
+
     private void rebootForCleanAttempt(int attempts, int maxAttempts) {
         if (attempts >= maxAttempts) {
             return;
         }
         try {
             logFile("rebooting for clean attempt " + (attempts + 1));
+            // Flush before rebooting (F1, 2026-11-19): the boot's
+            // asynchronous writes — the WiFi config store's
+            // connect-time write above all — must be durable before
+            // the boot ends. Best-effort, exactly like the reboot
+            // itself, whose result the teardown may not let us see.
+            try {
+                shell("sync");
+            } catch (Exception ignored) {
+            }
             shell("reboot");
         } catch (Exception ignored) {
             // The reboot itself tears the connection down; failure to

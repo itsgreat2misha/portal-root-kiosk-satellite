@@ -876,6 +876,7 @@ class SentinelRetentionOnFailureTest(unittest.TestCase):
             mock.patch.object(
                 provisioner, "reboot", return_value=("", "boot-1")
             ),
+            mock.patch.object(provisioner, "wait_for_race_boot_window"),
             mock.patch.object(provisioner, "kaslr_base", return_value=0x1000),
             mock.patch.object(provisioner, "memstart", return_value=0x2000),
             mock.patch.object(provisioner, "exploit", return_value=False),
@@ -992,6 +993,9 @@ class SentinelRetentionOnFailureTest(unittest.TestCase):
                 mock.patch.object(provisioner, "stage"),
                 mock.patch.object(
                     provisioner, "reboot", return_value=("", "boot-1")
+                ),
+                mock.patch.object(
+                    provisioner, "wait_for_race_boot_window"
                 ),
                 mock.patch.object(
                     provisioner, "kaslr_base", return_value=0x1000
