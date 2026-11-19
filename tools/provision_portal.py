@@ -1627,7 +1627,10 @@ class PortalProvisioner:
         recorded authorized key. No reboots. Any failure logs
         the fallback and returns False so the caller continues into
         the normal race run; every apply here is idempotent, so
-        re-applying there is safe."""
+        re-applying there is safe. The completion write merges
+        into the recorded manifest (write_state's merge_prior):
+        this path applies a delta, and the record must keep the
+        actions and hashes earlier runs established."""
         print(f"PROVISION_CHANNEL_ENGAGED reason={reason}", flush=True)
         try:
             if self.privileged_requested() and not self.skip_build:
@@ -1730,7 +1733,7 @@ class PortalProvisioner:
                 f"PROVISION_CHANNEL_FALLBACK reason={exc}", flush=True
             )
             return False
-        self.write_state("complete")
+        self.write_state("complete", merge_prior=True)
         print(
             "PROVISION_CHANNEL_OK reboots=0 "
             f"logs={self.log_dir}",
@@ -2492,6 +2495,8 @@ class PortalProvisioner:
         state_status: str,
         first_boot: str | None = None,
         second_boot: str | None = None,
+        *,
+        merge_prior: bool = False,
     ) -> None:
         fingerprint = self.adb_run(
             ["shell", "getprop", "ro.build.fingerprint"], timeout=5, check=True
@@ -2502,16 +2507,61 @@ class PortalProvisioner:
             # not be positively established; record it as unverified
             # so a later run never treats it as a completed no-op.
             actions["disable_updates"] = "unverified"
+        artifact_sha256 = self.selected_artifact_hashes()
+        autoroot_key_sha256 = self.staged_autoroot_key_sha256
+        if merge_prior:
+            # Merge into the manifest this run started from instead
+            # of replacing it: the recorded manifest is the device's
+            # accumulated state, and a delta run (the channel path)
+            # does not un-apply the actions it did not request, so
+            # dropping them would falsify the record the fast-path
+            # gates, the OTA posture trust and --status all read.
+            # This run's applied actions and artifact hashes win
+            # per key; the recorded autoroot key hash survives
+            # unless this run restaged autoroot (then the staged
+            # hash above is the new one); the recorded verification
+            # boots carry over where this write supplies none (the
+            # manifest-correction re-writes preserve them the same
+            # way). Tool revision and desired state follow the
+            # completing run, as in every other write.
+            prior = self._start_state
+            if isinstance(prior, dict) and prior.get("status") == "complete":
+                prior_actions = prior.get("actions")
+                if isinstance(prior_actions, dict):
+                    actions = {**prior_actions, **actions}
+                prior_hashes = prior.get("artifact_sha256")
+                if isinstance(prior_hashes, dict):
+                    artifact_sha256 = {**prior_hashes, **artifact_sha256}
+                if autoroot_key_sha256 is None:
+                    recorded_key = prior.get("autoroot_key_sha256")
+                    if isinstance(recorded_key, str):
+                        autoroot_key_sha256 = recorded_key
+                verification = prior.get("verification")
+                if isinstance(verification, dict):
+                    if first_boot is None and isinstance(
+                        verification.get("first_boot"), str
+                    ):
+                        first_boot = verification["first_boot"]
+                    if second_boot is None and isinstance(
+                        verification.get("second_boot"), str
+                    ):
+                        second_boot = verification["second_boot"]
+                print(
+                    "STATE_MANIFEST_MERGED "
+                    f"actions={len(actions)} "
+                    f"artifacts={len(artifact_sha256)}",
+                    flush=True,
+                )
         self.run_state.write_state(
             state_status,
             fingerprint=fingerprint,
             target_key=self.target.key if self.target else None,
             tool_revision=self.tool_revision(),
-            artifact_sha256=self.selected_artifact_hashes(),
+            artifact_sha256=artifact_sha256,
             actions=actions,
             first_boot=first_boot,
             second_boot=second_boot,
-            autoroot_key_sha256=self.staged_autoroot_key_sha256,
+            autoroot_key_sha256=autoroot_key_sha256,
             desired_state=self._desired_state() or None,
         )
 

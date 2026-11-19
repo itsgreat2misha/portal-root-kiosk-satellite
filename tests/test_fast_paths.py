@@ -504,6 +504,180 @@ class ChannelApplyTest(unittest.TestCase):
             self.assertEqual(self._states, ["pending"])
 
 
+class ChannelManifestMergeTest(unittest.TestCase):
+    """The channel path applies a delta; its completion write must
+    merge into the recorded manifest, not replace it with the
+    delta's own record. Gate session, Nov 19, 2026: a bare
+    --dns channel run shrank a full record (11 actions, the
+    autoroot key hash) to the DNS action alone, and the next
+    --full run lost the OTA posture trust that reads
+    disable_updates from the record and had to race."""
+
+    def _prior_record(self, temporary: str) -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        actions = dict(full.requested_actions())
+        hashes = dict(full.selected_artifact_hashes())
+        hashes["prior/only-artifact.bin"] = "prior-only-digest"
+        return {
+            "schema": 1,
+            "status": "complete",
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": actions,
+            "artifact_sha256": hashes,
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-a",
+            },
+        }
+
+    def _write(self, provisioner: PortalProvisioner, **kwargs) -> dict:
+        captured: dict = {}
+
+        def fake_write_state(status, **state_kwargs):
+            captured["status"] = status
+            captured.update(state_kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                provisioner,
+                "adb_run",
+                return_value=completed([], ALOHA.fingerprint + "\n"),
+            ),
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_write_state
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            provisioner.write_state("complete", **kwargs)
+        return captured
+
+    def _manifest(self, captured: dict) -> dict:
+        manifest = {
+            "schema": 1,
+            "status": captured["status"],
+            "target": captured["target_key"],
+            "fingerprint": captured["fingerprint"],
+            "tool_revision": captured["tool_revision"],
+            "artifact_sha256": captured["artifact_sha256"],
+            "actions": captured["actions"],
+            "verification": {
+                "first_boot": captured["first_boot"],
+                "second_boot": captured["second_boot"],
+            },
+        }
+        if captured["autoroot_key_sha256"] is not None:
+            manifest["autoroot_key_sha256"] = captured[
+                "autoroot_key_sha256"
+            ]
+        if captured["desired_state"]:
+            manifest["desired_state"] = captured["desired_state"]
+        return manifest
+
+    def test_delta_completion_merges_into_prior_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            delta._start_state = prior
+            run_hashes = delta.selected_artifact_hashes()
+            captured = self._write(delta, merge_prior=True)
+            actions = captured["actions"]
+            # Every prior action survives; the delta's action wins.
+            for name, value in prior["actions"].items():
+                if name == "privacy_dns":
+                    continue
+                self.assertEqual(actions[name], value, name)
+            self.assertEqual(actions["privacy_dns"], "one.one.one.one")
+            self.assertEqual(len(actions), len(prior["actions"]))
+            # Hashes merge per key the same way.
+            hashes = captured["artifact_sha256"]
+            self.assertEqual(
+                hashes["prior/only-artifact.bin"], "prior-only-digest"
+            )
+            for name, digest in run_hashes.items():
+                self.assertEqual(hashes[name], digest, name)
+            # The recorded key hash survives a run that staged
+            # nothing; desired state and the verification boots
+            # carry over; the revision follows the completing run.
+            self.assertEqual(
+                captured["autoroot_key_sha256"], "prior-key-hash"
+            )
+            self.assertEqual(
+                captured["desired_state"],
+                {"alohausers_package": "disabled"},
+            )
+            self.assertEqual(captured["first_boot"], "boot-a")
+            self.assertEqual(captured["second_boot"], "boot-a")
+            self.assertEqual(
+                captured["tool_revision"], delta.tool_revision()
+            )
+            self.assertNotEqual(captured["tool_revision"], "prior-revision")
+
+    def test_merged_record_keeps_full_run_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            delta._start_state = prior
+            merged = self._manifest(self._write(delta, merge_prior=True))
+            shrunken = self._manifest(self._write(delta))
+            full, _device = eligible_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            # Force the OTA clause onto the recorded-posture trust:
+            # the live preflight reads unconfigured in the posture
+            # by design, so only the record can satisfy it.
+            full.ota_preflight = lambda: False
+            self.assertIsNone(full._noop_blocker(merged))
+            self.assertIsNone(full._channel_blocker(merged))
+            # The pre-fix record shape fails both gates exactly as
+            # observed live: the no-op gate misses recorded actions
+            # and the channel gate loses the OTA posture trust.
+            self.assertTrue(
+                full._noop_blocker(shrunken).startswith("actions-")
+            )
+            self.assertEqual(
+                full._channel_blocker(shrunken), "ota-not-configured"
+            )
+
+    def test_restaged_autoroot_records_the_new_key_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            delta._start_state = prior
+            delta.staged_autoroot_key_sha256 = "new-key-hash"
+            captured = self._write(delta, merge_prior=True)
+            self.assertEqual(
+                captured["autoroot_key_sha256"], "new-key-hash"
+            )
+
+    def test_unmerged_completion_write_replaces_as_before(self) -> None:
+        # The merge is scoped to the channel completion write; the
+        # stages path's writes keep their replace semantics.
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            delta._start_state = prior
+            captured = self._write(delta)
+            self.assertEqual(
+                captured["actions"], {"privacy_dns": "one.one.one.one"}
+            )
+            self.assertIsNone(captured["autoroot_key_sha256"])
+            self.assertNotIn(
+                "prior/only-artifact.bin", captured["artifact_sha256"]
+            )
+
+
 class VerifyRequestedStateAudioTest(unittest.TestCase):
     """The channel apply's final verification runs on the device's
     current boot, however old, so its audio check must use the
