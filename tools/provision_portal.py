@@ -1487,7 +1487,16 @@ class PortalProvisioner:
             # fails there rather than passing on the record alone.
             return "ota-not-configured"
         if self.remove_meta_accounts and not self.meta_accounts_preflight():
-            return "meta-accounts-not-clean"
+            # In the recorded alohausers-disabled posture the
+            # preflight's already_clean is unreachable by design:
+            # it requires the package NOT disabled, while the
+            # posture disables it. The recorded posture satisfies
+            # that one clause when the preflight's live reads
+            # (accounts absent, authenticators disabled) still
+            # hold; the stages path's enable-then-remove flow
+            # keeps using the preflight unchanged.
+            if not self._recorded_posture_meta_trusted(state):
+                return "meta-accounts-not-clean"
         if self.optimize_presence and not self.presence_preflight():
             return "presence-not-configured"
         if (
@@ -1879,6 +1888,39 @@ class PortalProvisioner:
         return (
             isinstance(desired, dict)
             and desired.get("alohausers_package") == "disabled"
+        )
+
+    def _recorded_posture_meta_trusted(
+        self, state: dict[str, object] | None
+    ) -> bool:
+        """Whether the channel gate may treat the meta-accounts
+        removal as already applied on a device in the recorded
+        alohausers-disabled posture. The preflight's already_clean
+        requires the package NOT disabled, so it is unreachable
+        in the posture even though the removal's substantive end
+        state holds. The record overrides only that one clause:
+        the package must actually be disabled (the posture), and
+        the preflight's live reads from the call just made -
+        accounts absent, authenticators disabled - must still
+        hold. Scoped to the channel gate; the stages path keeps
+        judging by the preflight alone."""
+        if not isinstance(state, dict):
+            return False
+        desired = state.get("desired_state")
+        if not (
+            isinstance(desired, dict)
+            and desired.get("alohausers_package") == "disabled"
+        ):
+            return False
+        if not self.meta_accounts_package_disabled:
+            return False
+        if not self.meta_accounts_absent:
+            return False
+        disabled = self.disabled_meta_authenticators()
+        hardware_class = META_HARDWARE_AUTHENTICATOR.split("/", 1)[1]
+        return (
+            set(META_AUTHENTICATOR_COMPONENTS) <= disabled
+            and hardware_class not in disabled
         )
 
     def _posture_drift(

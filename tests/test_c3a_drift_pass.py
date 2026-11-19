@@ -573,6 +573,92 @@ class PostureTrustTest(unittest.TestCase):
                 provisioner.verify_ota_block(wait_seconds=1)
 
 
+class MetaPostureTrustTest(unittest.TestCase):
+    """The channel gate's meta-accounts clause trusts the recorded
+    posture the way the OTA clause does: the preflight's
+    already_clean requires the alohausers package NOT disabled, so
+    it is unreachable on a posture device even when the removal's
+    end state holds. The record overrides only the package clause;
+    the preflight's live reads must still hold."""
+
+    def channel_provisioner(
+        self,
+        temporary: str,
+        *,
+        accounts_absent: bool,
+        package_disabled: bool,
+        authenticators_disabled: bool,
+    ) -> PortalProvisioner:
+        provisioner = make_provisioner(temporary, remove_meta_accounts=True)
+        provisioner.adb_run = lambda *a, **k: completed(a, "5555\n")
+        provisioner.adb_framework_boot_configured = True
+        provisioner._root_setup_blocker = lambda: None
+
+        def preflight() -> bool:
+            provisioner.meta_accounts_absent = accounts_absent
+            provisioner.meta_accounts_package_disabled = package_disabled
+            return False
+
+        provisioner.meta_accounts_preflight = preflight
+        provisioner.disabled_meta_authenticators = lambda: (
+            set(META_AUTHENTICATOR_COMPONENTS)
+            if authenticators_disabled
+            else set()
+        )
+        return provisioner
+
+    def test_posture_record_satisfies_the_meta_clause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.channel_provisioner(
+                temporary,
+                accounts_absent=True,
+                package_disabled=True,
+                authenticators_disabled=True,
+            )
+            self.assertIsNone(provisioner._channel_blocker(POSTURE_STATE))
+
+    def test_same_live_reads_without_the_record_still_refuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.channel_provisioner(
+                temporary,
+                accounts_absent=True,
+                package_disabled=True,
+                authenticators_disabled=True,
+            )
+            state = {"status": "complete", "actions": {}}
+            self.assertEqual(
+                provisioner._channel_blocker(state), "meta-accounts-not-clean"
+            )
+
+    def test_posture_record_with_accounts_present_still_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.channel_provisioner(
+                temporary,
+                accounts_absent=False,
+                package_disabled=True,
+                authenticators_disabled=True,
+            )
+            self.assertEqual(
+                provisioner._channel_blocker(POSTURE_STATE),
+                "meta-accounts-not-clean",
+            )
+
+    def test_posture_record_with_authenticators_live_still_refuses(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.channel_provisioner(
+                temporary,
+                accounts_absent=True,
+                package_disabled=True,
+                authenticators_disabled=False,
+            )
+            self.assertEqual(
+                provisioner._channel_blocker(POSTURE_STATE),
+                "meta-accounts-not-clean",
+            )
+
+
 class DnsGateConfirmReadTest(unittest.TestCase):
     """The run-8 shape: one disagreeing sample is not drift."""
 
