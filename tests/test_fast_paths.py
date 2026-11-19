@@ -588,12 +588,17 @@ class ChannelManifestMergeTest(unittest.TestCase):
             captured = self._write(delta, merge_prior=True)
             actions = captured["actions"]
             # Every prior action survives; the delta's action wins.
+            # One exception by design (Defect D record hygiene): the
+            # prior record carries the pre-#64 DNS pair, and the
+            # delta's hostname completion drops the dhcp sibling so
+            # the record carries only the intent it established.
             for name, value in prior["actions"].items():
-                if name == "privacy_dns":
+                if name in ("privacy_dns", "dhcp_dns"):
                     continue
                 self.assertEqual(actions[name], value, name)
             self.assertEqual(actions["privacy_dns"], "one.one.one.one")
-            self.assertEqual(len(actions), len(prior["actions"]))
+            self.assertNotIn("dhcp_dns", actions)
+            self.assertEqual(len(actions), len(prior["actions"]) - 1)
             # Hashes merge per key the same way.
             hashes = captured["artifact_sha256"]
             self.assertEqual(
@@ -627,8 +632,12 @@ class ChannelManifestMergeTest(unittest.TestCase):
             delta._start_state = prior
             merged = self._manifest(self._write(delta, merge_prior=True))
             shrunken = self._manifest(self._write(delta))
+            # The later full run carries the delta's intent as its
+            # only DNS intent (the post-#64 composition shape): the
+            # merged record, which dropped the dhcp sibling under
+            # the Defect D hygiene, satisfies it.
             full, _device = eligible_provisioner(
-                temporary, privacy_dns="one.one.one.one"
+                temporary, privacy_dns="one.one.one.one", dhcp_dns=False
             )
             # Force the OTA clause onto the recorded-posture trust:
             # the live preflight reads unconfigured in the posture
@@ -1192,6 +1201,253 @@ class RecordedDnsInvariantTest(unittest.TestCase):
             self.assertIn("PRIVACY_DNS_DRIFT", output)
             self.assertIn("PROVISION_NOOP_SKIP reason=dns-drift", output)
             self.assertNotIn("PROVISION_NOOP reason=", output)
+
+
+class RequestedDnsIntentGateTest(unittest.TestCase):
+    """Defect D (closure session 3, Nov 19, 2026): a recorded
+    manifest carrying BOTH DNS intents — a pre-PR #64 pair the
+    PR #65/#66 merges preserve — resolves dhcp-first in the
+    recorded-expectation readers, so a bare --dns HOSTNAME run
+    whose record happened to hold that same hostname compared
+    live state against "off", matched the live-off device, and
+    no-oped: an explicit request silently ignored. When a run
+    carries a DNS intent of its own, the fast path's drift
+    evaluation must judge live state against the REQUESTED
+    intent; runs carrying no intent keep the recorded pair's
+    dhcp-first resolution exactly as before."""
+
+    def _stale_pair_state(self, provisioner) -> dict:
+        state = good_state(provisioner)
+        # The pre-#64 pair: both intents in one record.
+        state["actions"]["dhcp_dns"] = True
+        state["actions"]["privacy_dns"] = "one.one.one.one"
+        return state
+
+    def test_explicit_hostname_request_detects_drift_over_stale_pair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(
+                temporary, privacy_dns="one.one.one.one", dhcp_dns=False
+            )
+            device.dns_mode = "off"
+            device.dns_specifier = "null"
+            provisioner.read_state = lambda: self._stale_pair_state(
+                provisioner
+            )
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, ["dns-drift"])
+            self.assertEqual(
+                provisioner._dns_repair_expectation,
+                ("hostname", "one.one.one.one"),
+            )
+            output = stdout.getvalue()
+            self.assertIn("PRIVACY_DNS_DRIFT", output)
+            self.assertIn("requested_mode=hostname", output)
+            self.assertIn("PROVISION_NOOP_SKIP reason=dns-drift", output)
+            self.assertNotIn("PROVISION_NOOP reason=", output)
+
+    def test_explicit_hostname_request_noops_when_live_matches_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(
+                temporary, privacy_dns="one.one.one.one", dhcp_dns=False
+            )
+            device.dns_mode = "hostname"
+            device.dns_specifier = "one.one.one.one"
+            provisioner.read_state = lambda: self._stale_pair_state(
+                provisioner
+            )
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, [])
+            self.assertIn("PROVISION_NOOP reason=", stdout.getvalue())
+
+    def test_explicit_off_request_noop_stands_over_stale_pair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(
+                temporary, privacy_dns=None, dhcp_dns=True
+            )
+            device.dns_mode = "off"
+            device.dns_specifier = "null"
+            provisioner.read_state = lambda: self._stale_pair_state(
+                provisioner
+            )
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, [])
+            self.assertIn("PROVISION_NOOP reason=", stdout.getvalue())
+
+    def test_full_preset_shape_against_stale_pair_behaves_as_today(
+        self,
+    ) -> None:
+        # --full with no explicit --dns composes to the preset's
+        # dhcp intent alone; against the stale pair its verdicts
+        # are the recorded pair's dhcp-first verdicts: live off
+        # no-ops, live on the recorded hostname is drift toward
+        # off (the preset's intent and the pair's dhcp-first
+        # resolution coincide, so nothing changes).
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(
+                temporary, privacy_dns=None, dhcp_dns=True
+            )
+            provisioner.read_state = lambda: self._stale_pair_state(
+                provisioner
+            )
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, [])
+            self.assertIn("PROVISION_NOOP reason=", stdout.getvalue())
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, device = eligible_provisioner(
+                temporary, privacy_dns=None, dhcp_dns=True
+            )
+            device.dns_mode = "hostname"
+            device.dns_specifier = "one.one.one.one"
+            provisioner.read_state = lambda: self._stale_pair_state(
+                provisioner
+            )
+            applied = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, ["dns-drift"])
+            self.assertEqual(
+                provisioner._dns_repair_expectation, ("off", "null")
+            )
+
+
+class DnsRecordHygieneTest(unittest.TestCase):
+    """Defect D, record side: a completion write that establishes
+    a DNS intent must record ONLY that intent. The PR #65/#66
+    merges preserve prior actions per key, so without an active
+    drop the pre-#64 pair (dhcp_dns + privacy_dns in one record)
+    survives every later DNS run forever, and the dhcp-first
+    readers keep shadowing the intent the last run established.
+    With the drop, a dual-intent record converges on its next
+    DNS completion."""
+
+    def _prior_record(self, temporary: str) -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        actions = dict(full.requested_actions())
+        # DOCUMENTED composes both intents: the stale pair.
+        assert actions.get("dhcp_dns") is True
+        assert isinstance(actions.get("privacy_dns"), str)
+        return {
+            "schema": 1,
+            "status": "complete",
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": actions,
+            "artifact_sha256": dict(full.selected_artifact_hashes()),
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-a",
+            },
+        }
+
+    def _write(self, provisioner: PortalProvisioner, **kwargs) -> dict:
+        captured: dict = {}
+
+        def fake_write_state(status, **state_kwargs):
+            captured["status"] = status
+            captured.update(state_kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                provisioner,
+                "adb_run",
+                return_value=completed([], ALOHA.fingerprint + "\n"),
+            ),
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_write_state
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            provisioner.write_state("complete", **kwargs)
+        return captured
+
+    def test_hostname_completion_drops_the_dhcp_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(
+                temporary, privacy_dns="one.one.one.one"
+            )
+            delta._start_state = prior
+            captured = self._write(delta, merge_prior=True)
+            actions = captured["actions"]
+            self.assertEqual(actions["privacy_dns"], "one.one.one.one")
+            self.assertNotIn("dhcp_dns", actions)
+            self.assertNotIn("restore_privacy_dns", actions)
+            # Unrelated prior actions still merge through.
+            for name, value in prior["actions"].items():
+                if name in ("dhcp_dns", "privacy_dns"):
+                    continue
+                self.assertEqual(actions[name], value, name)
+            self.assertEqual(
+                captured["autoroot_key_sha256"], "prior-key-hash"
+            )
+
+    def test_off_completion_drops_the_privacy_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(temporary, dhcp_dns=True)
+            delta._start_state = prior
+            captured = self._write(delta, merge_prior=True)
+            actions = captured["actions"]
+            self.assertEqual(actions["dhcp_dns"], True)
+            self.assertNotIn("privacy_dns", actions)
+            self.assertNotIn("restore_privacy_dns", actions)
+            for name, value in prior["actions"].items():
+                if name in ("dhcp_dns", "privacy_dns"):
+                    continue
+                self.assertEqual(actions[name], value, name)
+
+    def test_non_dns_completion_keeps_the_recorded_pair(self) -> None:
+        # A delta that establishes no DNS intent must not touch
+        # the recorded DNS actions: the merge preserves them, and
+        # convergence is the next DNS run's job, not this one's.
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior_record(temporary)
+            delta = make_provisioner(temporary, audio=True)
+            delta._start_state = prior
+            captured = self._write(delta, merge_prior=True)
+            actions = captured["actions"]
+            self.assertEqual(actions["dhcp_dns"], True)
+            self.assertEqual(
+                actions["privacy_dns"],
+                prior["actions"]["privacy_dns"],
+            )
 
 
 class SharedApplySequenceTest(unittest.TestCase):
