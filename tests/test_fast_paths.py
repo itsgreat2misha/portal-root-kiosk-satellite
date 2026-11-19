@@ -1450,6 +1450,283 @@ class DnsRecordHygieneTest(unittest.TestCase):
             )
 
 
+class RestoreGateTest(unittest.TestCase):
+    """Defect E, gate side: a restore records an operation, not a
+    state. Closure session 6, Nov 19, 2026: --restore theme
+    completed and its merged write recorded restore_theme; a
+    channel --system-theme-control dark apply then set the live
+    ui_night_mode to 2; a second --restore theme returned
+    PROVISION_NOOP by record alone and never executed, leaving
+    the live value at 2. A requested operation must always
+    execute and verify its live end state, so the no-op gate
+    never satisfies one from the record. The Shizuku removal is
+    the same operation-not-state shape and is pinned with the
+    restores."""
+
+    # Constructor kwarg -> the action key it records: every
+    # restore the CLI exposes, plus the Shizuku removal.
+    OPERATIONS = {
+        "restore_adb_auth_timeout": "restore_adb_auth_timeout",
+        "restore_audio": "restore_audio",
+        "enable_updates": "enable_updates",
+        "restore_bloat": "restore_bloat",
+        "restore_remote_wipe": "restore_remote_wipe",
+        "restore_presence_profile": "restore_presence_profile",
+        "restore_presence_fps": "restore_presence_fps",
+        "restore_privacy_dns": "restore_privacy_dns",
+        "restore_app_verifier": "restore_app_verifier",
+        "restore_camera_light": "restore_camera_light",
+        "restore_autoroot": "restore_autoroot",
+        "restore_wireless_adb": "restore_wireless_adb",
+        "restore_theme": "restore_theme",
+        "restore_meta_authenticators": "restore_meta_authenticators",
+        "remove_shizuku": "remove_shizuku",
+    }
+
+    def test_recorded_operation_never_satisfies_the_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            for kwarg, action in self.OPERATIONS.items():
+                with self.subTest(action=action):
+                    provisioner = make_provisioner(
+                        temporary, **{kwarg: True}
+                    )
+                    state = good_state(provisioner)
+                    self.assertEqual(
+                        state["actions"].get(action), True
+                    )
+                    self.assertEqual(
+                        provisioner._noop_blocker(state),
+                        f"actions-{action}",
+                    )
+
+    def test_repeat_restore_theme_executes_instead_of_nooping(
+        self,
+    ) -> None:
+        """The live failure shape at the fast path: the record
+        carries restore_theme from the first restore, so the
+        repeat request must route onward to execute (here, the
+        channel) instead of printing PROVISION_NOOP."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, restore_theme=True
+            )
+            device = FakeDevice()
+            provisioner.adb_run = device.adb_run
+            provisioner.read_state = lambda: good_state(provisioner)
+            applied: list = []
+            provisioner._apply_via_channel = (
+                lambda reason: applied.append(reason) or True
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertTrue(provisioner._run_fast_path())
+            self.assertEqual(applied, ["actions-restore_theme"])
+            self.assertIn(
+                "PROVISION_NOOP_SKIP reason=actions-restore_theme",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "PROVISION_NOOP reason", stdout.getvalue()
+            )
+
+    def test_apply_only_record_satisfaction_unchanged(self) -> None:
+        """Control: requests carrying no operation keep the
+        record-only satisfaction exactly as before."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, **DOCUMENTED)
+            self.assertIsNone(
+                provisioner._noop_blocker(good_state(provisioner))
+            )
+
+
+class RestoreRecordHygieneTest(unittest.TestCase):
+    """Defect E, record side: mirroring the Defect D DNS family
+    drop, a completion that records one side of an apply/restore
+    pair drops the other side from the merged record, so the
+    record never carries the contradictory pair (closure session
+    6 left system_theme_control: "dark" beside restore_theme:
+    true). The DNS pair is the family's own mechanism and stays
+    pinned by DnsRecordHygieneTest; autoroot's apply side is the
+    staging flag rather than an action key and is pinned
+    separately below."""
+
+    # (apply kwargs, apply action, restore kwargs, restore action)
+    PAIRS = (
+        ({"audio": True}, "audio",
+         {"restore_audio": True}, "restore_audio"),
+        ({"disable_updates": True}, "disable_updates",
+         {"enable_updates": True}, "enable_updates"),
+        ({"debloat": True}, "debloat",
+         {"restore_bloat": True}, "restore_bloat"),
+        ({"block_remote_wipe": True}, "block_remote_wipe",
+         {"restore_remote_wipe": True}, "restore_remote_wipe"),
+        ({"remove_meta_accounts": True}, "remove_meta_accounts",
+         {"restore_meta_authenticators": True},
+         "restore_meta_authenticators"),
+        ({"optimize_presence": True}, "optimize_presence",
+         {"restore_presence_profile": True},
+         "restore_presence_profile"),
+        ({"presence_fps_cap": 5}, "presence_fps_cap",
+         {"restore_presence_fps": True}, "restore_presence_fps"),
+        ({"allow_app_updates": True}, "allow_app_updates",
+         {"restore_app_verifier": True}, "restore_app_verifier"),
+        ({"disable_adb_auth_timeout": True},
+         "disable_adb_auth_timeout",
+         {"restore_adb_auth_timeout": True},
+         "restore_adb_auth_timeout"),
+        ({"disable_camera_light": True}, "disable_camera_light",
+         {"restore_camera_light": True}, "restore_camera_light"),
+        ({"persistent_wireless_adb": True},
+         "persistent_wireless_adb",
+         {"restore_wireless_adb": True}, "restore_wireless_adb"),
+        ({"system_theme_control": "dark"}, "system_theme_control",
+         {"restore_theme": True}, "restore_theme"),
+        ({"shizuku": True}, "shizuku",
+         {"remove_shizuku": True}, "remove_shizuku"),
+    )
+
+    def _prior(self, actions: dict) -> dict:
+        return {
+            "schema": 1,
+            "status": "complete",
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": dict(actions),
+            "artifact_sha256": {},
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-a",
+            },
+        }
+
+    def _write(self, provisioner: PortalProvisioner, **kwargs) -> dict:
+        captured: dict = {}
+
+        def fake_write_state(status, **state_kwargs):
+            captured["status"] = status
+            captured.update(state_kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                provisioner,
+                "adb_run",
+                return_value=completed([], ALOHA.fingerprint + "\n"),
+            ),
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_write_state
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            provisioner.write_state("complete", **kwargs)
+        return captured
+
+    @staticmethod
+    def _unrelated(pair_actions: tuple) -> str:
+        for candidate in ("audio", "debloat", "shizuku"):
+            if candidate not in pair_actions:
+                return candidate
+        raise AssertionError("no unrelated candidate left")
+
+    def test_apply_completion_drops_the_recorded_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            for apply_kwargs, apply_action, _, restore_action in (
+                self.PAIRS
+            ):
+                with self.subTest(pair=apply_action):
+                    unrelated = self._unrelated(
+                        (apply_action, restore_action)
+                    )
+                    prior = self._prior(
+                        {restore_action: True, unrelated: True}
+                    )
+                    delta = make_provisioner(
+                        temporary, **apply_kwargs
+                    )
+                    delta._start_state = prior
+                    actions = self._write(delta, merge_prior=True)[
+                        "actions"
+                    ]
+                    self.assertIn(apply_action, actions)
+                    self.assertNotIn(restore_action, actions)
+                    self.assertEqual(actions[unrelated], True)
+
+    def test_restore_completion_drops_the_recorded_apply(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            for (
+                _,
+                apply_action,
+                restore_kwargs,
+                restore_action,
+            ) in self.PAIRS:
+                with self.subTest(pair=restore_action):
+                    apply_value = (
+                        "dark"
+                        if apply_action == "system_theme_control"
+                        else 5
+                        if apply_action == "presence_fps_cap"
+                        else True
+                    )
+                    unrelated = self._unrelated(
+                        (apply_action, restore_action)
+                    )
+                    prior = self._prior(
+                        {apply_action: apply_value, unrelated: True}
+                    )
+                    delta = make_provisioner(
+                        temporary, **restore_kwargs
+                    )
+                    delta._start_state = prior
+                    actions = self._write(delta, merge_prior=True)[
+                        "actions"
+                    ]
+                    self.assertEqual(actions[restore_action], True)
+                    self.assertNotIn(apply_action, actions)
+                    self.assertEqual(actions[unrelated], True)
+
+    def test_autoroot_completion_drops_the_recorded_restore(
+        self,
+    ) -> None:
+        """Autoroot's apply side is the staging request itself,
+        not an action key: a completion from a run that staged
+        autoroot drops a recorded restore_autoroot the same way."""
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior(
+                {"restore_autoroot": True, "audio": True}
+            )
+            delta = make_provisioner(temporary, autoroot=True)
+            delta._start_state = prior
+            actions = self._write(delta, merge_prior=True)["actions"]
+            self.assertNotIn("restore_autoroot", actions)
+            self.assertEqual(actions["audio"], True)
+
+    def test_unrelated_completion_keeps_the_recorded_pair(
+        self,
+    ) -> None:
+        # A delta that establishes neither side of a pair must
+        # not touch the recorded pair: the merge preserves it,
+        # and convergence is that pair's next run's job (the
+        # DnsRecordHygieneTest non-DNS pin, generalized).
+        with tempfile.TemporaryDirectory() as temporary:
+            prior = self._prior(
+                {
+                    "system_theme_control": "dark",
+                    "restore_theme": True,
+                }
+            )
+            delta = make_provisioner(temporary, audio=True)
+            delta._start_state = prior
+            actions = self._write(delta, merge_prior=True)["actions"]
+            self.assertEqual(actions["system_theme_control"], "dark")
+            self.assertEqual(actions["restore_theme"], True)
+
+
 class SharedApplySequenceTest(unittest.TestCase):
     """Phase C2 item 1: the stages path and the channel path run
     one shared shell-level apply sequence. These tests pin the

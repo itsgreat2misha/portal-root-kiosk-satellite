@@ -501,6 +501,66 @@ class SystemThemeRecordTest(unittest.TestCase):
         )
 
 
+class SystemThemePreflightRecordOrderTest(unittest.TestCase):
+    """Defect E side finding: the theme preflight APPLIES the
+    theme as its already-configured probe, and the channel gate
+    calls it before the stages path's own record step — so on
+    the channel route the recorded-original tier could never
+    engage, and a first channel apply overwrote the original
+    before anyone recorded it. The preflight records the
+    original at the apply point, before applying, so every
+    route is covered."""
+
+    def test_preflight_records_the_original_before_applying(
+        self,
+    ) -> None:
+        events: list[str] = []
+        pushed: dict[str, str] = {}
+        live = {"night_mode": "1"}
+
+        def fake_adb(args, timeout=None, check=False):
+            del timeout, check
+            if "test" in args:
+                # Backup absent until the record pushes it.
+                return completed("", returncode=0 if pushed else 1)
+            if "uimode" in args:
+                events.append("apply")
+                live["night_mode"] = "2" if args[-1] == "yes" else "1"
+                return completed()
+            if "settings" in args and "get" in args:
+                return completed(live["night_mode"])
+            return completed()
+
+        def push(contents, remote):
+            events.append("record")
+            pushed[remote] = contents
+
+        feature = PresenceFeature(
+            config=lambda: PresenceConfig(
+                system_theme_control="dark", presence_fps_cap=None
+            ),
+            adb_run=fake_adb,
+            run=lambda *a, **k: completed(),
+            target=lambda: None,
+            log_dir=lambda: pathlib.Path("/tmp"),
+            uid1000_path=lambda name: f"/data/portal-uid1000/{name}",
+            install_apk_preserving_verifier=lambda *a, **k: None,
+            verify_package_verifier_state=lambda *a, **k: None,
+            settle_package_state=lambda *a, **k: None,
+            push_text_atomic=push,
+            package_sets=lambda: (set(), set()),
+            logcat_watermark=lambda *a, **k: None,
+            logcat_poll=lambda *a, **k: "",
+            adb_framework_boot_installed_remote="/tmp/adb-framework",
+        )
+        self.assertTrue(feature.system_theme_control_preflight())
+        self.assertEqual(events, ["record", "apply"])
+        self.assertEqual(
+            json.loads(pushed[SYSTEM_THEME_BACKUP_REMOTE]),
+            {"ui_night_mode": "1"},
+        )
+
+
 def make_settings_feature(config: SettingsConfig, **overrides) -> SettingsFeature:
     callbacks = dict(
         adb_run=lambda *a, **k: completed(),
