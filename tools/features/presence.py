@@ -16,6 +16,7 @@ which only this cluster reads or writes.
 from __future__ import annotations
 
 import dataclasses
+import json
 import pathlib
 import re
 import subprocess
@@ -71,6 +72,7 @@ CAMERA_LIGHT_RESTORED_REMOTE = (
 SYSTEM_THEME_PROPERTY = "debug.portal.system_theme"
 SYSTEM_THEME_SETTING = "ui_night_mode"
 SYSTEM_THEME_CONTROL_MARKER = "system-theme-control-enabled"
+SYSTEM_THEME_BACKUP_REMOTE = "/data/local/tmp/portal-system-theme-before-v1.json"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -308,6 +310,85 @@ class PresenceFeature:
             f"mode={self._config.system_theme_control} capability=ready"
         )
         return True
+
+    def _read_system_theme_setting(self) -> str | None:
+        value = self._adb_run(
+            ["shell", "settings", "get", "secure", SYSTEM_THEME_SETTING],
+            timeout=5,
+        ).stdout.strip()
+        return None if value in ("", "null") else value
+
+    def record_system_theme_original(self) -> None:
+        """First-run backup of ui_night_mode before the theme
+        control overwrites it (restore-completeness gap 5). First
+        record wins, like the DNS and ADB-timeout backups: a later
+        apply must not overwrite the pre-provision value."""
+        if self._adb_run(
+            ["shell", "test", "-f", SYSTEM_THEME_BACKUP_REMOTE], timeout=5
+        ).returncode == 0:
+            print("SYSTEM_THEME_BACKUP_OK existing=1")
+            return
+        current = self._read_system_theme_setting()
+        self._push_text_atomic(
+            json.dumps({"ui_night_mode": current}) + "\n",
+            SYSTEM_THEME_BACKUP_REMOTE,
+        )
+        print(
+            "SYSTEM_THEME_BACKUP_OK existing=0 "
+            f"value={current if current is not None else 'absent'}"
+        )
+
+    def _recorded_system_theme(self) -> tuple[bool, str | None]:
+        """(record_exists, recorded value or None for absent)."""
+        result = self._adb_run(
+            ["shell", "cat", SYSTEM_THEME_BACKUP_REMOTE], timeout=5
+        )
+        if result.returncode != 0:
+            return (False, None)
+        try:
+            parsed = json.loads(result.stdout)
+            value = parsed["ui_night_mode"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ProvisionError(
+                f"unrecognized system theme backup: {exc}"
+            ) from exc
+        return (True, value if isinstance(value, str) else None)
+
+    def restore_system_theme(self) -> None:
+        """Two-tier restore: replay the recorded ui_night_mode; with
+        no record, return to the factory default — the key ABSENT
+        (verified fleet-wide on stock devices), so delete it."""
+        recorded, value = self._recorded_system_theme()
+        if value is not None:
+            self._adb_run(
+                [
+                    "shell", "settings", "put", "secure",
+                    SYSTEM_THEME_SETTING, value,
+                ],
+                timeout=5,
+                check=True,
+            )
+            source = "recorded"
+        else:
+            self._adb_run(
+                ["shell", "settings", "delete", "secure", SYSTEM_THEME_SETTING],
+                timeout=5,
+                check=True,
+            )
+            source = "recorded" if recorded else "factory-default"
+        print(
+            f"SYSTEM_THEME_RESTORE_OK source={source} "
+            f"value={value if value is not None else 'absent'}"
+        )
+
+    def verify_system_theme_restored(self) -> None:
+        _, value = self._recorded_system_theme()
+        observed = self._read_system_theme_setting()
+        if observed != value:
+            raise ProvisionError(
+                "system theme was not restored: "
+                f"expected={value!r} observed={observed!r}"
+            )
 
     def presence_preflight(self) -> bool:
         marker_present = self._adb_run(

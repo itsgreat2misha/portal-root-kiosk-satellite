@@ -106,6 +106,7 @@ class SettingsConfig:
     restore_bloat: bool = False
     block_remote_wipe: bool = False
     restore_remote_wipe: bool = False
+    restore_meta_authenticators: bool = False
     privacy_dns: str | None = None
     dhcp_dns: bool = False
     restore_privacy_dns: bool = False
@@ -874,6 +875,23 @@ class SettingsFeature:
                     if self._config.block_remote_wipe
                     else "remote-wipe-restore"
                 )
+            if self._config.restore_meta_authenticators:
+                # Two-tier restore semantics: replay the state the
+                # component backup recorded for each authenticator;
+                # with no record, the factory default is enabled.
+                # (The accounts themselves are not restored — only
+                # the components --remove-meta-accounts disabled.)
+                recorded = self._read_component_backup(required=False)
+                for component in META_AUTHENTICATOR_COMPONENTS:
+                    state = "enabled"
+                    if recorded is not None and component in recorded:
+                        _, state = recorded[component]
+                    if state == "absent":
+                        continue
+                    actions.append(
+                        f"{restore_component_action(state)}\t{component}\n"
+                    )
+                modes.append("meta-authenticators-restore")
             self._push_text_atomic(
                 "# portal-debloat-component-actions-v1\n" + "".join(actions),
                 DEBLOAT_COMPONENT_ACTIONS_REMOTE,

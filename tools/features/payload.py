@@ -32,7 +32,11 @@ import time
 from typing import Callable
 
 from device_session import ProvisionError
-from features.shizuku import SHIZUKU_HELPER_PACKAGE
+from features.shizuku import (
+    SHIZUKU_HELPER_PACKAGE,
+    SHIZUKU_KEY_REMOTE,
+    SHIZUKU_SAVED_KEY_REMOTE,
+)
 from portal_targets import PortalTarget
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -897,6 +901,60 @@ class PayloadFeature:
             f"AUTOROOT_STAGED_OK dir={AUTOROOT_REMOTE_DIR} "
             f"helper={AUTOROOT_HELPER_PACKAGE} "
             f"max_attempts={AUTOROOT_MAX_ATTEMPTS}",
+            flush=True,
+        )
+
+    def unstage_autoroot(self) -> None:
+        """Remove everything stage_autoroot_payload installed
+        (restore-completeness gap 1): the helper APK (its uninstall
+        also wipes the copied loopback keypair in its app data), the
+        staging directory, the custom-payload daemon file, and the
+        host-side saved key copies. The authorized adb_keys line
+        itself is removed by the native key-remove action during
+        this run's install loop (the provisioner sets the same env
+        key --remove-shizuku uses), and the exploit sentinel is
+        uninstalled by the run's normal exit path once staging is
+        gone. Runs under the autoroot guard, so the on-device
+        service is suspended throughout."""
+        installed, _ = self._package_sets()
+        if AUTOROOT_HELPER_PACKAGE in installed:
+            result = self._adb_run(
+                ["uninstall", AUTOROOT_HELPER_PACKAGE], timeout=60
+            )
+            if result.returncode != 0 or "Success" not in result.stdout:
+                raise ProvisionError(
+                    "failed to uninstall the autoroot helper: "
+                    f"{result.stdout.strip()}"
+                )
+            print("AUTOROOT_HELPER_REMOVED package=uninstalled")
+        self._adb_run(
+            ["shell", "rm", "-rf", AUTOROOT_REMOTE_DIR],
+            timeout=10,
+            check=True,
+        )
+        self._adb_run(
+            [
+                "shell", "rm", "-f",
+                CUSTOM_PAYLOAD_DST_REMOTE,
+                SHIZUKU_SAVED_KEY_REMOTE,
+                SHIZUKU_KEY_REMOTE,
+            ],
+            timeout=10,
+            check=True,
+        )
+        installed, _ = self._package_sets()
+        if AUTOROOT_HELPER_PACKAGE in installed:
+            raise ProvisionError("autoroot helper is still installed")
+        for path in (
+            f"{AUTOROOT_REMOTE_DIR}/run.sh",
+            CUSTOM_PAYLOAD_DST_REMOTE,
+        ):
+            if self._adb_run(
+                ["shell", "test", "-f", path], timeout=5
+            ).returncode == 0:
+                raise ProvisionError(f"autoroot unstage left {path} in place")
+        print(
+            "AUTOROOT_UNSTAGED_OK helper=absent staging=absent daemon=absent",
             flush=True,
         )
 

@@ -141,7 +141,8 @@ class PersistentWirelessAdbCliTest(unittest.TestCase):
             [
                 "provision_portal.py",
                 "--persistent-wireless-adb",
-                "--restore-adb-auth-timeout",
+                "--restore",
+                "adb-auth-timeout",
             ],
         ):
             with self.assertRaises(SystemExit):

@@ -186,9 +186,15 @@ class CliDefaultsTest(unittest.TestCase):
             {
                 "serial": None,
                 "attempts": 12,
+                "full": False,
+                "restore": [],
                 "persistent_wireless_adb": False,
                 "disable_adb_auth_timeout": False,
                 "restore_adb_auth_timeout": False,
+                "restore_autoroot": False,
+                "restore_wireless_adb": False,
+                "restore_theme": False,
+                "restore_meta_authenticators": False,
                 # No action selected and no mode/backup: audio is the
                 # default action.
                 "audio": True,
@@ -216,6 +222,7 @@ class CliDefaultsTest(unittest.TestCase):
                 "remove_meta_accounts": False,
                 "optimize_presence": False,
                 "presence_fps_cap": None,
+                "dns": None,
                 "privacy_dns": None,
                 "dhcp_dns": False,
                 "restore_privacy_dns": False,
@@ -261,9 +268,9 @@ class CliSingleFlagMappingTest(unittest.TestCase):
         (["--log-dir", "/tmp/logs"], "log_dir", pathlib.Path("/tmp/logs"), True),
         (["--persistent-wireless-adb"], "persistent_wireless_adb", True, False),
         (["--disable-adb-auth-timeout"], "disable_adb_auth_timeout", True, False),
-        (["--restore-adb-auth-timeout"], "restore_adb_auth_timeout", True, False),
+        (["--restore", "adb-auth-timeout"], "restore_adb_auth_timeout", True, False),
         (["--audio"], "audio", True, True),
-        (["--restore-audio"], "restore_audio", True, False),
+        (["--restore", "audio"], "restore_audio", True, False),
         (["--shizuku"], "shizuku", True, False),
         (["--remove-shizuku"], "remove_shizuku", True, False),
         (
@@ -273,21 +280,31 @@ class CliSingleFlagMappingTest(unittest.TestCase):
             False,
         ),
         (["--allow-app-updates"], "allow_app_updates", True, False),
-        (["--restore-app-verifier"], "restore_app_verifier", True, False),
+        (["--restore", "app-verifier"], "restore_app_verifier", True, False),
         (["--disable-updates"], "disable_updates", True, False),
-        (["--enable-updates"], "enable_updates", True, False),
+        (["--restore", "updates"], "enable_updates", True, False),
         (["--block-remote-wipe"], "block_remote_wipe", True, False),
-        (["--restore-remote-wipe"], "restore_remote_wipe", True, False),
-        (["--restore-camera-light"], "restore_camera_light", True, False),
+        (["--restore", "remote-wipe"], "restore_remote_wipe", True, False),
+        (["--restore", "camera-light"], "restore_camera_light", True, False),
         (["--debloat"], "debloat", True, False),
-        (["--restore-bloat"], "restore_bloat", True, False),
+        (["--restore", "bloat"], "restore_bloat", True, False),
         (["--remove-meta-accounts"], "remove_meta_accounts", True, False),
         (["--optimize-presence"], "optimize_presence", True, False),
-        (["--restore-presence-profile"], "restore_presence_profile", True, False),
-        (["--restore-presence-fps"], "restore_presence_fps", True, False),
-        (["--privacy-dns", "dns.example.com"], "privacy_dns", "dns.example.com", False),
-        (["--dhcp-dns"], "dhcp_dns", True, False),
-        (["--restore-privacy-dns"], "restore_privacy_dns", True, False),
+        (["--restore", "presence"], "restore_presence_profile", True, False),
+        (["--restore", "presence-fps"], "restore_presence_fps", True, False),
+        (["--dns", "dns.example.com"], "privacy_dns", "dns.example.com", False),
+        (["--dns", "off"], "dhcp_dns", True, False),
+        (["--restore", "dns"], "restore_privacy_dns", True, False),
+        (["--restore", "autoroot"], "restore_autoroot", True, False),
+        (["--restore", "wireless-adb"], "restore_wireless_adb", True, False),
+        (["--restore", "theme"], "restore_theme", True, False),
+        (
+            ["--restore", "meta-authenticators"],
+            "restore_meta_authenticators",
+            True,
+            False,
+        ),
+        (["--full"], "disable_updates", True, True),
         (["--system-theme-control", "light"], "system_theme_control", "light", False),
         (["--system-theme-control", "dark"], "system_theme_control", "dark", False),
         (["--status"], "status", True, False),
@@ -347,30 +364,81 @@ class CliSingleFlagMappingTest(unittest.TestCase):
 
 
 class CliValidationTest(unittest.TestCase):
+    # Pairs still enforced by argparse mutually exclusive groups.
     MUTUALLY_EXCLUSIVE = (
-        ["--disable-adb-auth-timeout", "--restore-adb-auth-timeout"],
-        ["--audio", "--restore-audio"],
         ["--shizuku", "--remove-shizuku"],
-        ["--allow-app-updates", "--restore-app-verifier"],
-        ["--disable-updates", "--enable-updates"],
-        ["--block-remote-wipe", "--restore-remote-wipe"],
-        ["--disable-camera-light", "--restore-camera-light"],
-        ["--debloat", "--restore-bloat"],
-        ["--optimize-presence", "--restore-presence-profile"],
-        ["--optimize-presence", "--restore-presence-fps"],
-        ["--restore-presence-profile", "--restore-presence-fps"],
-        ["--privacy-dns", "dns.example.com", "--dhcp-dns"],
-        ["--privacy-dns", "dns.example.com", "--restore-privacy-dns"],
-        ["--dhcp-dns", "--restore-privacy-dns"],
         ["--status", "--dry-run"],
         ["--status", "--recover"],
         ["--dry-run", "--recover"],
+    )
+
+    # Apply/restore pairs for one feature, rejected by the shell's
+    # own checks with these messages since the pairs moved onto the
+    # unified --restore <name> surface.
+    PAIR_ERRORS = (
+        (
+            ["--disable-adb-auth-timeout", "--restore", "adb-auth-timeout"],
+            "--disable-adb-auth-timeout cannot be combined with "
+            "--restore adb-auth-timeout",
+        ),
+        (
+            ["--audio", "--restore", "audio"],
+            "--audio cannot be combined with --restore audio",
+        ),
+        (
+            ["--allow-app-updates", "--restore", "app-verifier"],
+            "--allow-app-updates cannot be combined with "
+            "--restore app-verifier",
+        ),
+        (
+            ["--disable-updates", "--restore", "updates"],
+            "--disable-updates cannot be combined with --restore updates",
+        ),
+        (
+            ["--block-remote-wipe", "--restore", "remote-wipe"],
+            "--block-remote-wipe cannot be combined with "
+            "--restore remote-wipe",
+        ),
+        (
+            ["--disable-camera-light", "--restore", "camera-light"],
+            "--disable-camera-light cannot be combined with "
+            "--restore camera-light",
+        ),
+        (
+            ["--debloat", "--restore", "bloat"],
+            "--debloat cannot be combined with --restore bloat",
+        ),
+        (
+            ["--optimize-presence", "--restore", "presence"],
+            "--optimize-presence cannot be combined with --restore presence",
+        ),
+        (
+            ["--optimize-presence", "--restore", "presence-fps"],
+            "--optimize-presence cannot be combined with "
+            "--restore presence-fps",
+        ),
+        (
+            ["--restore", "presence", "--restore", "presence-fps"],
+            "--restore presence cannot be combined with "
+            "--restore presence-fps",
+        ),
+        (
+            ["--dns", "dns.example.com", "--restore", "dns"],
+            "--dns cannot be combined with --restore dns",
+        ),
+        (
+            ["--dns", "off", "--restore", "dns"],
+            "--dns cannot be combined with --restore dns",
+        ),
     )
 
     def test_mutually_exclusive_pairs_are_rejected(self) -> None:
         for argv in self.MUTUALLY_EXCLUSIVE:
             with self.subTest(argv=argv):
                 self.assertIn("not allowed with argument", parse_error(argv))
+        for argv, message in self.PAIR_ERRORS:
+            with self.subTest(argv=argv):
+                self.assertIn(message, parse_error(argv))
 
     def test_attempts_bounds(self) -> None:
         for value in ("0", "101"):
@@ -395,11 +463,11 @@ class CliValidationTest(unittest.TestCase):
                 )
 
     def test_presence_fps_cap_rejects_presence_rollbacks(self) -> None:
-        for rollback in ("--restore-presence-profile", "--restore-presence-fps"):
+        for rollback in ("presence", "presence-fps"):
             with self.subTest(rollback=rollback):
                 self.assertIn(
                     "--presence-fps-cap cannot be combined with a presence rollback",
-                    parse_error(["--presence-fps-cap", "5", rollback]),
+                    parse_error(["--presence-fps-cap", "5", "--restore", rollback]),
                 )
 
     def test_shizuku_apk_requires_shizuku(self) -> None:
@@ -431,9 +499,9 @@ class CliValidationTest(unittest.TestCase):
     def test_persistent_wireless_adb_rejects_auth_timeout_restore(self) -> None:
         self.assertIn(
             "--persistent-wireless-adb cannot be combined with "
-            "--restore-adb-auth-timeout",
+            "--restore adb-auth-timeout",
             parse_error(
-                ["--persistent-wireless-adb", "--restore-adb-auth-timeout"]
+                ["--persistent-wireless-adb", "--restore", "adb-auth-timeout"]
             ),
         )
 
@@ -495,7 +563,7 @@ class MainConfigMappingTest(unittest.TestCase):
                     "--debloat",
                     "--remove-meta-accounts",
                     "--presence-fps-cap", "4",
-                    "--privacy-dns", "dns.example.com",
+                    "--dns", "dns.example.com",
                     "--dry-run",
                     "--backup", "/tmp/backup.tar.gz",
                 ]
@@ -546,6 +614,10 @@ class MainConfigMappingTest(unittest.TestCase):
                 # Implied by --persistent-wireless-adb in parse_args.
                 "disable_adb_auth_timeout": True,
                 "restore_adb_auth_timeout": False,
+                "restore_autoroot": False,
+                "restore_wireless_adb": False,
+                "restore_theme": False,
+                "restore_meta_authenticators": False,
             },
         )
 
@@ -1500,6 +1572,9 @@ class ProvisionOkMarkerTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     provisioner, "adb_framework_boot_preflight", return_value=False
+                ),
+                mock.patch.object(
+                    provisioner, "record_system_theme_original"
                 ),
                 mock.patch.object(
                     provisioner,
