@@ -167,6 +167,19 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The WiFi flush guard's boot-age floor is 60 s on both sides
+  (host `RACE_BOOT_MIN_AGE_SECONDS` and the autoroot helper's
+  `BootFlushGuard.MIN_BOOT_AGE_MS`, helper 1.14, versionCode
+  15), down from the 120 s the guard shipped with. The step-down
+  is grounded in the 2026-11-19 timing measurement
+  (wifi-guard-timing-measurement-2026-11-19): the device
+  framework's WifiConfigStore deferred flush is a fixed 10.0 s
+  alarm (`BUFFERED_WRITE_ALARM_INTERVAL_MS` = 10,000 ms), live
+  change-to-write-complete measured 10.1-11.5 s, and the modeled
+  heavy-load worst case lands the flush by ~52 s. On-device,
+  the lower floor also halves the per-boot time-to-root on
+  finished devices. Live validation is deferred to the next
+  device session.
 - A finished unit in the recorded alohausers-disabled posture
   fell out of both re-run fast paths on any boot where autoroot
   had not won yet. `otad.nodemon` is per-boot and set only by a

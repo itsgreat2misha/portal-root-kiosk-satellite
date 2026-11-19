@@ -195,7 +195,13 @@ PACKAGE_STATE_SETTLE_SECONDS = 15
 # uncleanly (attempt panics, watchdog cuts, runner reboots) inside
 # that write's flush window — repeated episodes lost a unit's saved
 # network outright. See PortalProvisioner.wait_for_race_boot_window.
-RACE_BOOT_MIN_AGE_SECONDS = 120
+# The floor started at 120 s and is 60 s since the 2026-11-19 timing
+# measurement (wifi-guard-timing-measurement-2026-11-19): the store's
+# deferred flush is a fixed 10.0 s alarm in the device framework
+# (BUFFERED_WRITE_ALARM_INTERVAL_MS = 10,000 ms), live
+# change-to-write-complete measured 10.1-11.5 s, and the modeled
+# heavy-load worst case lands the flush by ~52 s.
+RACE_BOOT_MIN_AGE_SECONDS = 60
 RACE_BOOT_GUARD_POLL_SECONDS = 5
 OTA_UI_PACKAGE = "com.facebook.aloha.otaui"
 OTA_SETUP_PACKAGE = "com.facebook.aloha.alohaotasetup"
