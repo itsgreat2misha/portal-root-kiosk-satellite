@@ -494,6 +494,16 @@ class PortalProvisioner:
         # desired end state instead of treating it as drift.
         self._alohausers_disabled_at_start: bool | None = None
         self._posture_apply_attempted = False
+        # Set when this run has verified it ENDS in the disabled
+        # posture: the end-of-run posture step's own verification,
+        # or the completion-write end-state observation in
+        # write_state. _desired_state() then records the posture
+        # from the run's own end state, regardless of the start
+        # state or the flags requested (Defect J): the start-state
+        # rule alone made the posture unreachable from a drifted
+        # device, because the only run that recorded it had to
+        # start already disabled.
+        self._alohausers_posture_established = False
         # The live Private DNS values behind the most recent
         # _dns_drift verdict, for the fast-path drift log line.
         self._dns_drift_live: tuple[str, str] | None = None
@@ -2016,6 +2026,12 @@ class PortalProvisioner:
                 f"PROVISION_CHANNEL_FALLBACK reason={exc}", flush=True
             )
             return False
+        # The channel completion is this run's end state: record
+        # the disabled posture from it when it holds (Defect J).
+        # write_state's own observation is gated on no payload
+        # phase pending, which a channel-handled full request
+        # still shows, so the observation is made here instead.
+        self._observe_posture_end_state()
         self.write_state("complete", merge_prior=True)
         print(
             "PROVISION_CHANNEL_OK reboots=0 "
@@ -2126,11 +2142,13 @@ class PortalProvisioner:
     def _observe_start_package_state(self) -> None:
         """Record the alohausers package state as this run found
         it. Called once the target is known and before any phase
-        of the run can change the package; the desired-state
-        recording rule keys off this observation, never off the
-        end state (a run that removes Meta accounts ends with the
-        package enabled by construction, which would erase the
-        very posture it started from)."""
+        of the run can change the package; one desired-state
+        recording rule keys off this observation (a run that
+        removes Meta accounts ends with the package enabled by
+        construction, which would erase the very posture it
+        started from). The end-state rule in _desired_state is
+        separate: it keys off the posture the run verifies at
+        its own end (Defect J)."""
         if self._alohausers_disabled_at_start is not None:
             return
         if self.target is None or self.target.device != "aloha":
@@ -2144,17 +2162,24 @@ class PortalProvisioner:
 
     def _desired_state(self) -> dict[str, str]:
         """The desired state this run's manifest writes record
-        (C3-A): end state observed as already in place that future
-        boots should keep, currently the alohausers-disabled
-        posture on aloha.
+        (C3-A): end state future boots should keep, currently the
+        alohausers-disabled posture on aloha.
 
-        Recording rule: a run that requests Meta-account removal
-        and STARTS with the package disabled records the desire;
-        one that starts enabled records nothing (absence = no
-        posture desire, and the run's own finalize restores the
-        package enabled). A run that does not request removal
-        preserves a desire recorded by an earlier run, so an
-        unrelated re-provision never erases the posture record."""
+        Recording rules, applied in order: a run that does not
+        request removal preserves a desire recorded by an earlier
+        run, so an unrelated re-provision never erases the
+        posture record; a run that requests Meta-account removal
+        and STARTS with the package disabled records the desire,
+        while one that starts enabled drops it (absence = no
+        posture desire, and the removal flow ends with the
+        package enabled by construction); and a run that verifies
+        it ENDS in the posture — the end-of-run posture step
+        disabled the package, or found it disabled, with the
+        posture conf staged — records the desire from its own
+        end state regardless of start state or flags requested
+        (Defect J: the start-state rules alone made the posture
+        unreachable from a drifted device, because the only run
+        that recorded it had to start already disabled)."""
         desired: dict[str, str] = {}
         start = self._start_state
         if isinstance(start, dict):
@@ -2173,7 +2198,46 @@ class PortalProvisioner:
                 desired["alohausers_package"] = "disabled"
             else:
                 desired.pop("alohausers_package", None)
+        if (
+            self.target is not None
+            and self.target.device == "aloha"
+            and self._alohausers_posture_established
+        ):
+            desired["alohausers_package"] = "disabled"
         return desired
+
+    def _observe_posture_end_state(self) -> None:
+        """Record the disabled posture from this run's own end
+        state (Defect J): when the run ends with the alohausers
+        package disabled and the posture conf (OTA_NODEMON)
+        staged, the manifest records the desire, whatever the
+        start state or the flags requested. This is the general
+        form of the rule the end-of-run posture step applies on
+        the payload path, for completing paths that never run
+        that step; write_state calls it at completion writes
+        once no payload phase is still pending, and the channel
+        path calls it before its completion write. Fail-closed:
+        an unreadable package state or conf records nothing, a
+        run ending enabled records nothing, and a run that
+        already records the desire reads nothing."""
+        if self._alohausers_posture_established:
+            return
+        if self.target is None or self.target.device != "aloha":
+            return
+        if self._desired_state().get("alohausers_package") == "disabled":
+            return
+        try:
+            if not self.alohausers_package_disabled():
+                return
+            if not self._ota_nodemon_conf_staged():
+                return
+        except (ProvisionError, OSError):
+            return
+        self._alohausers_posture_established = True
+        print(
+            "ALOHAUSERS_POSTURE_RECORDED source=end-state",
+            flush=True,
+        )
 
     @staticmethod
     def _recorded_posture_ota_trusted(
@@ -2303,22 +2367,59 @@ class PortalProvisioner:
             return None
         return None if disabled else "alohausers-enabled"
 
+    def _posture_conf_backed(self, recorded: bool) -> bool:
+        """Whether a disabled posture this run ends in is backed
+        by the staged autoroot conf the per-boot drift pass
+        enforces from: an earlier run staged it (the recorded
+        case), this run's autoroot staging renders OTA_NODEMON
+        from its own --disable-updates request, or the staged
+        conf already carries OTA_NODEMON."""
+        return bool(
+            recorded or self.autoroot or self._ota_nodemon_conf_staged()
+        )
+
     def _apply_recorded_posture(self) -> None:
-        """End-of-run posture apply (C3-A): when this run's
-        manifest records the alohausers-disabled desire, put the
-        package back into that state through the payload daemon
-        after the final verification and with no reboot after it,
-        so the write gets its settle by construction (a package
-        write followed within about a minute by crash-reboots was
-        silently lost in C3-B validation). A failure is deferred,
-        never silent: the run must not report complete while the
-        device sits outside its recorded end state."""
+        """End-of-run posture apply (C3-A, extended by Defect J):
+        put the alohausers package into the disabled posture
+        through the payload daemon after the final verification
+        and with no reboot after it, so the write gets its settle
+        by construction (a package write followed within about a
+        minute by crash-reboots was silently lost in C3-B
+        validation).
+
+        The step engages when the run's manifest records the
+        desire (the C3-A case: the accounts flow re-enabled the
+        package mid-run and the recorded end state is restored),
+        or when the run itself stages the OTA posture — it
+        requested --disable-updates without --enable-updates, so
+        its staged autoroot conf carries OTA_NODEMON: the
+        disabled posture is the decided end state on aloha, so
+        such a run establishes it instead of only ever
+        preserving it (before Defect J a drifted device could
+        never re-enter the posture through the tool). A verified
+        disabled end state backed by the posture conf is marked
+        on the run (_alohausers_posture_established), so the
+        manifest records the desire from the run's own end state
+        and the staging that follows renders the conf's
+        ALOHAUSERS_DISABLED key from it. When the posture cannot
+        be established here (no payload daemon channel), the run
+        ends in the enabled posture instead: that outcome stays
+        visible — the DEFERRED line below, OTA judged by the
+        override path, and no desired_state recorded — never a
+        silent posture claim. A daemon disable that does not
+        verify is deferred, never silent: the run must not
+        report complete while the device sits outside the end
+        state this step set out to establish."""
         if self._posture_apply_attempted:
             return
         self._posture_apply_attempted = True
-        if self._desired_state().get("alohausers_package") != "disabled":
-            return
         if self.target is None or self.target.device != "aloha":
+            return
+        recorded = (
+            self._desired_state().get("alohausers_package") == "disabled"
+        )
+        ota_posture_run = self.disable_updates and not self.enable_updates
+        if not (recorded or ota_posture_run):
             return
         if self.custom_payload != DEFAULT_CUSTOM_PAYLOAD_LOCAL:
             print(
@@ -2328,6 +2429,8 @@ class PortalProvisioner:
             return
         if self.alohausers_package_disabled():
             print("ALOHAUSERS_POSTURE_OK state=already-disabled", flush=True)
+            if self._posture_conf_backed(recorded):
+                self._alohausers_posture_established = True
             return
         try:
             code, _output = self.daemon_exec(
@@ -2344,6 +2447,8 @@ class PortalProvisioner:
                 "state=disabled",
                 flush=True,
             )
+            if self._posture_conf_backed(recorded):
+                self._alohausers_posture_established = True
             return
         self.deferred_phase_failures.append(
             "alohausers_posture: end-of-run posture apply did not "
@@ -3018,6 +3123,16 @@ class PortalProvisioner:
                     f"artifacts={len(artifact_sha256)}",
                     flush=True,
                 )
+        if state_status == "complete" and not self._payload_phase_pending:
+            # A completion write with no payload phase still to
+            # run records the run's end state: let it pick up the
+            # disabled posture from that end state (Defect J). A
+            # combined run's mid-run completion write (the
+            # standard install phase's) skips this — the payload
+            # phase can still change the package state after it,
+            # and the end-of-run posture step owns the observation
+            # at the payload terminal instead.
+            self._observe_posture_end_state()
         self.run_state.write_state(
             state_status,
             fingerprint=fingerprint,

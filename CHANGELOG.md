@@ -167,6 +167,30 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A full run starting from a drifted aloha device never entered
+  the decided alohausers-disabled posture (Defect J, Phase D
+  closure session 13, Nov 19, 2026). `desired_state` was
+  recorded only by a run that requested
+  `--remove-meta-accounts` AND started with the package already
+  disabled; every other run only preserved an earlier record.
+  A device whose package had drifted back to enabled therefore
+  completed with the package still enabled, no `desired_state`
+  in the manifest, and no `ALOHAUSERS_DISABLED` key in the
+  staged conf, so the per-boot drift pass had nothing to
+  enforce for alohausers and OTA was judged by the enabled
+  posture's override path. The end-of-run posture step now
+  also engages for a run that stages the OTA posture (a
+  `--disable-updates` run): it disables the package through
+  the payload daemon, and a verified disabled end state backed
+  by the posture conf is recorded as `desired_state` from the
+  run's own end state, whatever the start state or the flags
+  requested; completion writes on paths that never run that
+  step observe the same end state. A run ending enabled
+  records no disabled desire, and a posture that cannot be
+  established (no payload daemon channel) stays visibly the
+  enabled-posture fallback: the `ALOHAUSERS_POSTURE_DEFERRED`
+  line, OTA judged by the override path, and no
+  `desired_state` recorded.
 - A re-provision after `--restore autoroot` died before any race
   (Defect I, Phase D closure session 12, Nov 19, 2026). The
   restore removes the whole staging directory, but the early
