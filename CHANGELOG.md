@@ -167,6 +167,24 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A finished unit in the recorded alohausers-disabled posture
+  fell out of both re-run fast paths on any boot where autoroot
+  had not won yet. `otad.nodemon` is per-boot and set only by a
+  payload win, and the MobileConfig override is inert behind
+  the disabled package, so a channel run ending on such a boot
+  recorded `disable_updates` as "unverified" from its posture
+  judgment — and the next run's no-op gate refused on that
+  action while its channel gate refused `ota-not-configured`,
+  sending the finished device into a full race. The two gates
+  now extend the recorded-posture trust to that record shape:
+  when the manifest records the disabled posture, the staged
+  autoroot conf carries `OTA_NODEMON`, and the alohausers
+  package is actually disabled, the OTA action counts as
+  satisfied for gating. The trust is gating-only — a run that
+  applies or re-applies OTA still ends in the unchanged
+  end-of-run verification and posture judgment, and nothing
+  records the action verified from the trust path. Live
+  validation is deferred to a later session.
 - The stages path's single-action exits kept the replace
   semantics the channel fix below left behind: a theme-only,
   presence-only or similar subset run that found its action
