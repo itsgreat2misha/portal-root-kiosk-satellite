@@ -167,6 +167,27 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A combined (stages + custom payload) run's final manifest
+  recorded null verification boots although the run had
+  verified two distinct boots (Defect K, Phase D closure
+  session 13, Nov 19, 2026). The standard install phase's
+  verification writes the boots it established; the payload
+  phase's terminal write then merges into the manifest the
+  run STARTED from, whose verification block predates the
+  run's own verification, and carried its nulls forward over
+  the recorded boots. (This also corrects the assumption
+  stated when the payload terminal write gained merge
+  semantics: that the final record was unaffected in
+  combined runs. It was not — the merged write is the last
+  write of a combined run, and its merge base is the start
+  snapshot.) `verify_across_two_reboots` now records the
+  boots it establishes on the run, merged completion writes
+  take the run's own boots over the start record's block
+  (which still carries over when the run verified none, and
+  a run that verified none records nulls, never fabricated
+  boots), and the OTA manifest-correction re-writes fall
+  back to the run's boots where the record's block is
+  missing them.
 - A full run starting from a drifted aloha device never entered
   the decided alohausers-disabled posture (Defect J, Phase D
   closure session 13, Nov 19, 2026). `desired_state` was
