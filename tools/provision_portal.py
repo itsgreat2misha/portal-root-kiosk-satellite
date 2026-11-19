@@ -1342,8 +1342,24 @@ class PortalProvisioner:
         if not isinstance(recorded_actions, dict):
             return "actions-unrecorded"
         for name, value in self.requested_actions().items():
-            if recorded_actions.get(name) != value:
-                return f"actions-{name}"
+            if recorded_actions.get(name) == value:
+                continue
+            if (
+                name == "disable_updates"
+                and self._recorded_posture_ota_gating_trusted(state)
+            ):
+                # Gating only: on a boot where autoroot has not
+                # won, no live OTA proof can pass in the recorded
+                # posture (otad.nodemon is per-boot and win-set;
+                # the override is inert behind the disabled
+                # package), so a completion recorded "unverified"
+                # by a win-less run's posture judgment would refuse
+                # the no-op forever. The posture criteria that CAN
+                # be read stand in at the gate; nothing here records
+                # the action verified, and a run that applies OTA
+                # still ends in the unchanged end-of-run judgment.
+                continue
+            return f"actions-{name}"
         recorded_hashes = state.get("artifact_sha256")
         if not isinstance(recorded_hashes, dict):
             return "artifacts-unrecorded"
@@ -1489,6 +1505,7 @@ class PortalProvisioner:
             self.disable_updates
             and not self.ota_preflight()
             and not self._recorded_posture_ota_trusted(state)
+            and not self._recorded_posture_ota_gating_trusted(state)
         ):
             # In the recorded alohausers-disabled posture the live
             # dump reads unconfigured by design; the manifest's
@@ -1496,6 +1513,12 @@ class PortalProvisioner:
             # The verify step re-checks the posture criteria
             # directly, so a device that left the posture still
             # fails there rather than passing on the record alone.
+            # The gating trust covers the record a win-less run's
+            # posture judgment left "unverified": it re-checks the
+            # posture criteria that can be read on any boot (the
+            # staged conf, the package state) and stands in only
+            # for the ones that cannot (the per-boot property, the
+            # app-private override file).
             return "ota-not-configured"
         if self.remove_meta_accounts and not self.meta_accounts_preflight():
             # In the recorded alohausers-disabled posture the
@@ -1903,6 +1926,51 @@ class PortalProvisioner:
             isinstance(desired, dict)
             and desired.get("alohausers_package") == "disabled"
         )
+
+    def _recorded_posture_ota_gating_trusted(
+        self, state: dict[str, object] | None
+    ) -> bool:
+        """Whether the fast-path gates (the no-op decision and the
+        channel OTA clause) may treat the OTA action as satisfied
+        on a device in the recorded alohausers-disabled posture
+        whose recorded completion is not a plain done — the shape a
+        win-less run leaves behind: its end-of-run posture judgment
+        cannot pass without a win this boot or this run (the
+        property is per-boot and only a payload win sets it; the
+        override file sits behind the disabled package's private
+        directory), so it records the action "unverified", and
+        re-deriving the block at the gate from the live dump or
+        the property refuses the finished device into a race on
+        every later win-less boot.
+
+        The trust mirrors the posture criteria, split by what a
+        win-less boot can read: the manifest records the posture,
+        the staged autoroot conf carries OTA_NODEMON (so the next
+        win re-asserts the property), and the alohausers package
+        is actually disabled live. The two criteria no win-less
+        boot can read — the property itself and the override
+        file — are exactly what the trust stands in for, and only
+        at the gates: a run that applies or re-applies OTA still
+        ends in the unchanged end-of-run verification and posture
+        judgment, and nothing on this path records the action
+        verified. Any precondition failing returns the gate to
+        the live checks exactly."""
+        if not isinstance(state, dict):
+            return False
+        desired = state.get("desired_state")
+        if not (
+            isinstance(desired, dict)
+            and desired.get("alohausers_package") == "disabled"
+        ):
+            return False
+        if self.target is None or self.target.device != "aloha":
+            return False
+        if not self._ota_nodemon_conf_staged():
+            return False
+        try:
+            return self.alohausers_package_disabled()
+        except (ProvisionError, OSError):
+            return False
 
     def _recorded_posture_meta_trusted(
         self, state: dict[str, object] | None

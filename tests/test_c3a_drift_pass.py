@@ -6,7 +6,7 @@
 """Phase C3-A (2026-11-18): the per-boot recorded-state drift pass
 and its host companions.
 
-Four surfaces are pinned:
+Five surfaces are pinned:
 
 - DriftPolicy, the helper's pure per-item decision table, compiled
   and executed when a JDK is available; the service wiring is
@@ -29,6 +29,16 @@ Four surfaces are pinned:
   Private DNS no-op gate confirms a lone mismatching sample with
   one re-read before calling it drift (the run-8 refusal was a
   single disagreeing read on a device verified minutes earlier).
+- The fast-path gates' posture trust for a completion recorded
+  "unverified" by a win-less run's posture judgment (Phase D
+  closure, 2026-11-19): otad.nodemon is per-boot and win-set, so
+  on a boot where autoroot has not won no live OTA proof can
+  pass, and both the no-op gate and the channel OTA clause
+  refused the finished device into a race. The gates now stand
+  in with the posture criteria a win-less boot CAN read (the
+  recorded posture, the staged conf's OTA_NODEMON, the package
+  actually disabled); the end-of-run judgment itself is
+  unchanged and still fails the same device.
 """
 
 from __future__ import annotations
@@ -571,6 +581,156 @@ class PostureTrustTest(unittest.TestCase):
             provisioner = self.ota_provisioner(temporary, posture_holds=True)
             with self.assertRaises(ProvisionError):
                 provisioner.verify_ota_block(wait_seconds=1)
+
+
+class OtaGatingPostureTrustTest(unittest.TestCase):
+    """The fast-path gates trust the recorded posture for a
+    completion a win-less run recorded "unverified".
+
+    The live shape (Phase D closure session, 2026-11-19): a
+    channel run on a boot where autoroot had not won ended with
+    the posture judgment unverified — nodemon unset, the override
+    unobservable — and its merged manifest recorded
+    disable_updates "unverified". The next --full run's no-op
+    gate refused on that action and its channel gate refused on
+    ota-not-configured, so the finished device raced. The gates
+    now apply the posture criteria a win-less boot can read; the
+    record-based trust above cannot cover this shape because it
+    requires a recorded plain done."""
+
+    def gating_provisioner(
+        self,
+        temporary: str,
+        *,
+        conf_staged: bool = True,
+        package_disabled: bool = True,
+    ) -> PortalProvisioner:
+        provisioner = test_fast_paths.make_provisioner(
+            temporary, **test_fast_paths.DOCUMENTED
+        )
+        provisioner._ota_nodemon_conf_staged = lambda: conf_staged
+        provisioner.alohausers_package_disabled = (
+            lambda: package_disabled
+        )
+        return provisioner
+
+    def channel_provisioner(
+        self,
+        temporary: str,
+        *,
+        conf_staged: bool = True,
+        package_disabled: bool = True,
+    ) -> PortalProvisioner:
+        provisioner, _device = test_fast_paths.eligible_provisioner(
+            temporary
+        )
+        provisioner.ota_preflight = lambda: False
+        provisioner._ota_nodemon_conf_staged = lambda: conf_staged
+        provisioner.alohausers_package_disabled = (
+            lambda: package_disabled
+        )
+        return provisioner
+
+    @staticmethod
+    def unverified_posture_state(provisioner) -> dict:
+        state = test_fast_paths.good_state(provisioner)
+        state["actions"]["disable_updates"] = "unverified"
+        state["desired_state"] = {"alohausers_package": "disabled"}
+        return state
+
+    def test_noop_gate_trusts_the_unverified_posture_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.gating_provisioner(temporary)
+            state = self.unverified_posture_state(provisioner)
+            self.assertIsNone(provisioner._noop_blocker(state))
+
+    def test_channel_gate_trusts_the_unverified_posture_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.channel_provisioner(temporary)
+            state = self.unverified_posture_state(provisioner)
+            self.assertIsNone(provisioner._channel_blocker(state))
+
+    def test_each_precondition_removed_returns_the_blocker(
+        self,
+    ) -> None:
+        variants = (
+            ("no-posture-record", {}, True, True),
+            (
+                "posture-record-enabled",
+                {"desired_state": {"alohausers_package": "enabled"}},
+                True,
+                True,
+            ),
+            ("conf-not-staged", None, False, True),
+            ("package-not-disabled", None, True, False),
+        )
+        for label, state_override, conf_staged, package_disabled in (
+            variants
+        ):
+            with self.subTest(precondition=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    provisioner = self.gating_provisioner(
+                        temporary,
+                        conf_staged=conf_staged,
+                        package_disabled=package_disabled,
+                    )
+                    state = self.unverified_posture_state(provisioner)
+                    if state_override is not None:
+                        if state_override:
+                            state.update(state_override)
+                        else:
+                            del state["desired_state"]
+                    self.assertEqual(
+                        provisioner._noop_blocker(state),
+                        "actions-disable_updates",
+                    )
+                    channel = self.channel_provisioner(
+                        temporary,
+                        conf_staged=conf_staged,
+                        package_disabled=package_disabled,
+                    )
+                    self.assertEqual(
+                        channel._channel_blocker(state),
+                        "ota-not-configured",
+                    )
+
+    def test_non_posture_record_is_unaffected(self) -> None:
+        """Live reads holding is not enough on its own: without
+        the recorded posture the unverified action blocks both
+        gates exactly as before."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.gating_provisioner(temporary)
+            state = self.unverified_posture_state(provisioner)
+            del state["desired_state"]
+            self.assertEqual(
+                provisioner._noop_blocker(state),
+                "actions-disable_updates",
+            )
+            channel = self.channel_provisioner(temporary)
+            self.assertEqual(
+                channel._channel_blocker(state), "ota-not-configured"
+            )
+
+    def test_posture_judgment_itself_is_unchanged(self) -> None:
+        """The trust is gating-only: the end-of-run posture
+        judgment still fails a device whose nodemon is unset and
+        whose override is unobserved, even with every gating
+        precondition holding — a run that applies OTA records
+        nothing verified from the trust path."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, disable_updates=True
+            )
+            provisioner.alohausers_package_disabled = lambda: True
+            provisioner._ota_nodemon_conf_staged = lambda: True
+            provisioner._ota_override_present = lambda: False
+            provisioner.adb_run = lambda args, **k: completed(args, "")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(provisioner._judge_ota_posture())
 
 
 class MetaPostureTrustTest(unittest.TestCase):
