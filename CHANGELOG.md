@@ -167,6 +167,27 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The system-theme restore left the ui_night_mode key and
+  UiModeManager diverged on shell-uimode targets (Defect F,
+  Phase D closure session 7, Nov 19, 2026). The restore set
+  or deleted the key truthfully but never transitioned the
+  manager, so after a factory-default restore the key read
+  absent while `cmd uimode night` still reported the applied
+  mode; the next same-state apply was then a no-op that
+  never rewrote the key, and its key-based verify failed
+  permanently. Both restore tiers now drive the end state
+  through the uimode transport on shell-uimode targets: a
+  recorded mode is replayed through `cmd uimode night` (the
+  transport writes the key itself), and the absent tier
+  transitions the manager to the absent key's boot-time
+  default (night off) before deleting the key. Theme
+  verification (apply and restore) now checks the key AND
+  the manager state and fails as diverged when they
+  disagree. The apply itself heals a diverged pair: when
+  the manager already reports the target state but the key
+  disagrees, it transitions through the opposite state
+  first so the transport rewrites the key. UID-1000 targets
+  are unchanged.
 - A recorded restore could satisfy itself, so a repeated
   restore silently no-oped against a changed live state
   (Defect E, Phase D closure session 6, Nov 19, 2026).
