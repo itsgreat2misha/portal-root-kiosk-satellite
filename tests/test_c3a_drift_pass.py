@@ -48,6 +48,15 @@ Five surfaces are pinned:
   staged config and a write that creates the directory first;
   the pins run both syncs and the restore-then-reprovision
   sequence against a fake device filesystem.
+- The posture bootstrap (Defect J, Phase D closure session 13,
+  2026-11-19): desired_state keyed only off the start state
+  under --remove-meta-accounts, so a run starting from a
+  drifted (enabled) device recorded nothing and the posture
+  was unreachable through the tool. A run that stages the OTA
+  posture now establishes it at the end-of-run posture step,
+  and a completing run whose end state is the disabled posture
+  records the desire from its own end state; a run ending
+  enabled records nothing.
 """
 
 from __future__ import annotations
@@ -1167,6 +1176,144 @@ class PostureApplyTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 provisioner._apply_recorded_posture()
             self.assertEqual(commands, [])
+
+
+class PostureBootstrapTest(unittest.TestCase):
+    """Defect J: the end-of-run posture step establishes the
+    posture for a run that stages it, and the desired-state
+    record follows the run's own end state."""
+
+    def provisioner(self, temporary: str, *, disabled: bool, daemon_ok: bool = True):
+        provisioner = make_provisioner(
+            temporary,
+            remove_meta_accounts=True,
+            disable_updates=True,
+            autoroot=True,
+            custom_payload=provision_portal.DEFAULT_CUSTOM_PAYLOAD_LOCAL,
+        )
+        provisioner._alohausers_disabled_at_start = False
+        state = {"disabled": disabled}
+        commands: list[str] = []
+
+        def daemon_exec(command: str, timeout: int = 40):
+            commands.append(command)
+            if daemon_ok:
+                state["disabled"] = True
+                return 0, "done"
+            return 1, "nope"
+
+        provisioner.daemon_exec = daemon_exec
+        provisioner.alohausers_package_disabled = lambda: state["disabled"]
+        provisioner._ota_nodemon_conf_staged = lambda: True
+        return provisioner, state, commands
+
+    def test_drifted_full_run_records_from_its_end_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, _state, commands = self.provisioner(
+                temporary, disabled=False
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                provisioner._apply_recorded_posture()
+            self.assertIn("ALOHAUSERS_POSTURE_APPLIED", stdout.getvalue())
+            self.assertEqual(len(commands), 1)
+            self.assertIn("pm disable", commands[0])
+            self.assertEqual(provisioner.deferred_phase_failures, [])
+            # The desire is recorded from the run's own end state,
+            # although the run started enabled and no earlier
+            # record exists.
+            self.assertEqual(
+                provisioner._desired_state(),
+                {"alohausers_package": "disabled"},
+            )
+            # And the staging resolver renders the staged conf's
+            # ALOHAUSERS_DISABLED key from that record.
+            feature = StagingDesiredTest().feature(
+                desired=provisioner._desired_state()
+            )
+            self.assertTrue(feature._alohausers_disabled_desired())
+
+    def test_drifted_run_finding_the_package_disabled_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, _state, commands = self.provisioner(
+                temporary, disabled=True
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                provisioner._apply_recorded_posture()
+            self.assertIn("ALOHAUSERS_POSTURE_OK", stdout.getvalue())
+            self.assertEqual(commands, [])
+            self.assertEqual(
+                provisioner._desired_state(),
+                {"alohausers_package": "disabled"},
+            )
+
+    def test_run_ending_enabled_records_no_posture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, _state, _commands = self.provisioner(
+                temporary, disabled=False, daemon_ok=False
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                provisioner._apply_recorded_posture()
+            self.assertEqual(len(provisioner.deferred_phase_failures), 1)
+            self.assertIn(
+                "alohausers_posture", provisioner.deferred_phase_failures[0]
+            )
+            # No false posture claim: the run ends enabled and
+            # records no disabled desire.
+            self.assertEqual(provisioner._desired_state(), {})
+
+    def test_no_daemon_channel_records_no_posture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner, _state, commands = self.provisioner(
+                temporary, disabled=False
+            )
+            provisioner.custom_payload = pathlib.Path("other-payload.bin")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                provisioner._apply_recorded_posture()
+            self.assertIn("ALOHAUSERS_POSTURE_DEFERRED", stdout.getvalue())
+            self.assertEqual(commands, [])
+            self.assertEqual(provisioner._desired_state(), {})
+
+    def test_completion_write_records_the_end_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, disable_updates=True)
+            provisioner.alohausers_package_disabled = lambda: True
+            provisioner._ota_nodemon_conf_staged = lambda: True
+            captured: dict = {}
+            provisioner.adb_run = lambda *a, **k: completed(
+                a, "fingerprint\n"
+            )
+            with mock.patch.object(
+                provisioner.run_state,
+                "write_state",
+                side_effect=lambda status, **kw: captured.update(kw),
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    provisioner.write_state("complete")
+            self.assertEqual(
+                captured.get("desired_state"),
+                {"alohausers_package": "disabled"},
+            )
+
+    def test_completion_write_ending_enabled_records_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, disable_updates=True)
+            provisioner.alohausers_package_disabled = lambda: False
+            provisioner._ota_nodemon_conf_staged = lambda: True
+            captured: dict = {}
+            provisioner.adb_run = lambda *a, **k: completed(
+                a, "fingerprint\n"
+            )
+            with mock.patch.object(
+                provisioner.run_state,
+                "write_state",
+                side_effect=lambda status, **kw: captured.update(kw),
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    provisioner.write_state("complete")
+            self.assertIsNone(captured.get("desired_state"))
 
 
 class MetaVerifyPostureTest(unittest.TestCase):
