@@ -6177,7 +6177,11 @@ class PortalProvisioner:
                 # after it, so the package write settles.
                 self._apply_recorded_posture()
                 self.apply_post_payload_root_steps()
-                self.write_state("complete")
+                # Terminal write of a payload-only invocation:
+                # merge into the start manifest like the other
+                # subset completions, so the payload phase does
+                # not shrink the recorded state it did not touch.
+                self.write_state("complete", merge_prior=True)
                 print(
                     f"CUSTOM_PAYLOAD_OK payload={CUSTOM_PAYLOAD_DST_REMOTE} "
                     f"port={CUSTOM_PAYLOAD_PORT} logs={self.log_dir}",
@@ -7249,7 +7253,12 @@ class PortalProvisioner:
                 and self.requested_actions()
                 == {"system_theme_control": self.system_theme_control}
             ):
-                self.write_state("complete")
+                # Subset completion writes in this method merge
+                # into the start manifest (write_state's
+                # merge_prior, as the channel path's does): the
+                # run applied only its own action and must not
+                # shrink the record earlier runs established.
+                self.write_state("complete", merge_prior=True)
                 print(
                     "PROVISION_OK reboots=0 "
                     f"system_theme={self.system_theme_control} logs={self.log_dir}"
@@ -7301,7 +7310,7 @@ class PortalProvisioner:
             except ProvisionError:
                 pass
             else:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
                 print(
                     "PROVISION_ALREADY_COMPLETE actions=restore-camera-light "
                     f"logs={self.log_dir}"
@@ -7449,7 +7458,7 @@ class PortalProvisioner:
             and self.requested_actions() == {"audio": True}
         ):
             if resumed_pending:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
             print(f"PROVISION_ALREADY_COMPLETE actions=audio logs={self.log_dir}")
             self.report_deferred_failures()
             return
@@ -7517,7 +7526,7 @@ class PortalProvisioner:
             and self.requested_actions() == {"disable_updates": True}
         ):
             if resumed_pending:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
             print(
                 f"PROVISION_ALREADY_COMPLETE actions=disable_updates "
                 f"logs={self.log_dir}"
@@ -7649,7 +7658,7 @@ class PortalProvisioner:
             and self.requested_actions() == {"remove_meta_accounts": True}
         ):
             if resumed_pending:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
             print(
                 f"PROVISION_ALREADY_COMPLETE actions=remove_meta_accounts "
                 f"logs={self.log_dir}"
@@ -7696,7 +7705,7 @@ class PortalProvisioner:
             and self.requested_actions() == {"debloat": True}
         ):
             if resumed_pending:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
             print(
                 f"PROVISION_ALREADY_COMPLETE actions=debloat "
                 f"logs={self.log_dir}"
@@ -7742,7 +7751,7 @@ class PortalProvisioner:
             and self.requested_actions() == {"block_remote_wipe": True}
         ):
             if resumed_pending:
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
             print(
                 "PROVISION_ALREADY_COMPLETE actions=block_remote_wipe "
                 f"logs={self.log_dir}"
@@ -7787,7 +7796,7 @@ class PortalProvisioner:
             and not self.persist_wireless_adb
             and self.requested_actions() == {"optimize_presence": True}
         ):
-            self.write_state("complete")
+            self.write_state("complete", merge_prior=True)
             print(
                 f"PROVISION_ALREADY_COMPLETE actions=optimize_presence "
                 f"logs={self.log_dir}"
@@ -7880,7 +7889,7 @@ class PortalProvisioner:
                 "restore_theme",
             }:
                 self.verify_requested_state()
-                self.write_state("complete")
+                self.write_state("complete", merge_prior=True)
                 print(f"PROVISION_OK reboots=0 logs={self.log_dir}")
                 self.report_deferred_failures()
                 return

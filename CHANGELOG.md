@@ -167,6 +167,24 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The stages path's single-action exits kept the replace
+  semantics the channel fix below left behind: a theme-only,
+  presence-only or similar subset run that found its action
+  already configured completed by rewriting the recorded
+  manifest with only its own action, dropping the other
+  recorded actions, artifact hashes and `autoroot_key_sha256`
+  even though the run had un-applied nothing — the same silent
+  fast-path loss the channel completion write was fixed for.
+  Those exits (theme-only, camera-light-restore-only, the
+  resumed audio / disable-updates / meta-accounts / debloat /
+  remote-wipe exits, presence-only, the unprivileged
+  adb-auth-timeout/theme subset exit) and the custom-payload
+  phase's terminal write now pass the same `merge_prior` flag
+  and merge into the manifest the run started from when that
+  record is complete, the run's own values winning per key.
+  The full run's completion write keeps its replace semantics,
+  so the channel entry's note below now applies only to it.
+  Live validation is deferred to a later session.
 - A delta run on the root-channel path replaced the recorded
   state manifest with a record of itself: a bare `--dns
   one.one.one.one` channel run on a fully provisioned unit

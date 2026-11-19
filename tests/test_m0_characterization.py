@@ -1684,7 +1684,7 @@ class ProvisionOkMarkerTest(unittest.TestCase):
             ):
                 _, lines = stdout_lines(provisioner.provision)
             reboot.assert_not_called()
-            write_state.assert_called_once_with("complete")
+            write_state.assert_called_once_with("complete", merge_prior=True)
             self.assertEqual(
                 lines,
                 [
@@ -1959,7 +1959,7 @@ class CustomPayloadMarkerTest(unittest.TestCase):
             stage.assert_called_once_with()
             reboot.assert_called_once_with()
             post_steps.assert_called_once_with()
-            write_state.assert_called_once_with("complete")
+            write_state.assert_called_once_with("complete", merge_prior=True)
             self.assertIn("CUSTOM_PAYLOAD_ATTEMPT=1 preparing clean boot", lines)
             self.assertIn(
                 "RUNTIME_ADDRESSES attempt=1 boot_id=boot-1 "
