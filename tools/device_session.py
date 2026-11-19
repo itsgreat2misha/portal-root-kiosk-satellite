@@ -100,6 +100,15 @@ class DeviceSession:
             timeout=5,
             check=True,
         ).stdout.strip()
+        # Flush before rebooting (F1, 2026-11-19): a reboot ends the
+        # boot, and any asynchronous write still in flight on it —
+        # the WiFi config store's connect-time write is the one that
+        # has bitten — must be durable first. Best-effort: a device
+        # that cannot answer sync is rebooted anyway, as before.
+        try:
+            self.adb_run(["shell", "sync"], timeout=60)
+        except ProvisionError:
+            pass
         try:
             self.adb_run(["reboot"], timeout=8)
         except ProvisionError:
