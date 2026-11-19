@@ -721,6 +721,14 @@ class ComponentDevice:
         self.shizuku_running = True
         self.jar_remote = True
         self.rish_results: list = []
+        self.rish_probe_results: list = []
+        self.rish_probe_fails = False
+        self.shizuku_config: str | None = (
+            '{"version":2,"packages":[{"uid":10066,"flags":0,'
+            '"packages":["me.jxl.kiosk_satellite"]}]}'
+        )
+        self.permission_dialog = False
+        self.taps: list[str] = []
 
     def adb_run(self, arguments, timeout=None, check=False):
         del timeout, check
@@ -737,6 +745,34 @@ class ComponentDevice:
             )
         if "test -f /data/local/tmp/portal-component-ctl.jar" in command:
             return completed(arguments, "", 0 if self.jar_remote else 1)
+        if "cat /data/user_de/0/com.android.shell/shizuku.json" in command:
+            if self.shizuku_config is None:
+                return completed(arguments, "", 1)
+            return completed(arguments, self.shizuku_config + "\n", 0)
+        if "uiautomator dump" in command:
+            return completed(arguments, "UI hierchary dumped\n", 0)
+        if "cat /data/local/tmp/portal-window-dump.xml" in command:
+            if self.permission_dialog:
+                return completed(
+                    arguments,
+                    '<hierarchy><node text="Allow all the time" '
+                    'resource-id="android:id/button1" '
+                    'class="android.widget.TextView" '
+                    'package="moe.shizuku.privileged.api" '
+                    'bounds="[576,557][1344,613]" /></hierarchy>\n',
+                    0,
+                )
+            return completed(arguments, "<hierarchy />\n", 0)
+        if "input tap" in command:
+            self.taps.append(command)
+            return completed(arguments, "", 0)
+        if "rish -c id" in command:
+            if self.rish_probe_fails:
+                return completed(arguments, "Server is not running\n", 1)
+            if self.rish_probe_results:
+                stdout, returncode = self.rish_probe_results.pop(0)
+                return completed(arguments, stdout, returncode)
+            return completed(arguments, "uid=0(root) gid=0(root)\n", 0)
         if "PortalComponentCtl" in command:
             if self.rish_results:
                 stdout, returncode = self.rish_results.pop(0)
@@ -752,11 +788,22 @@ class ChannelComponentExecutionTest(unittest.TestCase):
     actions file but never executed the jar, so a channel run that
     had to change component state failed its own verification and
     fell back to the race path. The executor runs the jar through
-    Shizuku's rish client (server-spawned, uid 0) with the
-    payload's arguments, settles like the payload does, and only
-    then does verification read the state back. Without Shizuku
-    root the step claims nothing and the verify-and-fallback
-    behaviour is unchanged."""
+    Shizuku's rish client (uid 0 through the root-mode server)
+    with the payload's arguments, settles like the payload does,
+    and only then does verification read the state back. Without
+    Shizuku root the step claims nothing and the verify-and-fallback
+    behaviour is unchanged.
+
+    The rish transport itself needs preparation (sessions 9.5/14):
+    the Shell attaches under com.android.shell, which the
+    root-mode server only serves with a Shizuku permission
+    grant; ungranted, the attach blocks behind the manager's
+    on-screen confirmation until the loader's 5 s watchdog
+    reports a misleading timeout. The prep whitelists the
+    manager and shell for deviceidle, persists the grant in
+    the server config, and probes the transport — tapping the
+    dialog's Allow or starting the manager by failure shape —
+    before the jar runs."""
 
     def _executor_provisioner(self, temporary: str, device, **kwargs):
         import provision_portal as pp_module
@@ -829,6 +876,167 @@ class ChannelComponentExecutionTest(unittest.TestCase):
                 "none",
                 run_command,
             )
+
+    def test_rish_transport_prep_whitelists_grants_and_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            provisioner = self._executor_provisioner(temporary, device)
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            output = stdout.getvalue()
+            self.assertIn("COMPONENT_CTL_RISH_GRANT_WRITTEN", output)
+            self.assertIn("COMPONENT_CTL_RISH_READY attempt=1", output)
+            run = next(
+                index
+                for index, command in enumerate(device.commands)
+                if "PortalComponentCtl" in command
+            )
+            for package in (
+                "moe.shizuku.privileged.api",
+                "com.android.shell",
+            ):
+                whitelist = next(
+                    index
+                    for index, command in enumerate(device.commands)
+                    if "deviceidle whitelist" in command
+                    and f"+{package}" in command
+                )
+                self.assertLess(whitelist, run)
+            grant = next(
+                index
+                for index, command in enumerate(device.commands)
+                if "cp /data/local/tmp/shizuku.json.tmp" in command
+            )
+            probe = next(
+                index
+                for index, command in enumerate(device.commands)
+                if "rish -c id" in command
+            )
+            self.assertLess(grant, probe)
+            self.assertLess(probe, run)
+
+    def test_rish_grant_already_persisted_no_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.shizuku_config = (
+                '{"version":2,"packages":[{"uid":2000,"flags":2,'
+                '"packages":["com.android.shell"]}]}'
+            )
+            provisioner = self._executor_provisioner(temporary, device)
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            self.assertIn(
+                "COMPONENT_CTL_RISH_GRANT_PRESENT", stdout.getvalue()
+            )
+            self.assertFalse(
+                any(
+                    "shizuku.json.tmp" in command
+                    for command in device.commands
+                )
+            )
+
+    def test_rish_transport_taps_allow_on_permission_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.permission_dialog = True
+            device.rish_probe_results = [
+                (
+                    "Request timeout. The connection between the "
+                    "current app (com.android.shell) and Shizuku "
+                    "app may be blocked by your system.\n",
+                    1,
+                )
+            ]
+            provisioner = self._executor_provisioner(temporary, device)
+            sleeps: list = []
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: sleeps.append(seconds)
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            output = stdout.getvalue()
+            self.assertIn(
+                "COMPONENT_CTL_RISH_NOT_READY attempt=1", output
+            )
+            self.assertIn(
+                "COMPONENT_CTL_RISH_GRANT_TAPPED x=960 y=585", output
+            )
+            self.assertIn("COMPONENT_CTL_RISH_READY attempt=2", output)
+            self.assertEqual(device.taps, ["shell input tap 960 585"])
+            self.assertFalse(
+                any(
+                    "am start" in command for command in device.commands
+                )
+            )
+            self.assertEqual(sleeps, [2, 15])
+
+    def test_rish_transport_retries_with_manager_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.rish_probe_results = [
+                ("Server is not running\n", 1)
+            ]
+            provisioner = self._executor_provisioner(temporary, device)
+            sleeps: list = []
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: sleeps.append(seconds)
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            output = stdout.getvalue()
+            self.assertIn(
+                "COMPONENT_CTL_RISH_NOT_READY attempt=1", output
+            )
+            self.assertIn("COMPONENT_CTL_RISH_READY attempt=2", output)
+            probes = [
+                command
+                for command in device.commands
+                if "rish -c id" in command
+            ]
+            self.assertEqual(len(probes), 2)
+            starts = [
+                command
+                for command in device.commands
+                if "am start" in command
+                and "moe.shizuku.manager.MainActivity" in command
+            ]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(device.taps, [])
+            self.assertEqual(sleeps, [2, 15])
+            self.assertTrue(
+                any(
+                    "PortalComponentCtl" in command
+                    for command in device.commands
+                )
+            )
+
+    def test_rish_transport_never_ready_claims_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.rish_probe_fails = True
+            provisioner = self._executor_provisioner(temporary, device)
+            with unittest.mock.patch("time.sleep", lambda seconds: None):
+                with self.assertRaises(ProvisionError):
+                    provisioner.execute_component_actions()
+            probes = [
+                command
+                for command in device.commands
+                if "rish -c id" in command
+            ]
+            self.assertEqual(len(probes), 3)
+            self.assertFalse(
+                any(
+                    "PortalComponentCtl" in command
+                    for command in device.commands
+                )
+            )
+            self.assertNotIn("shell sync", device.commands)
 
     def test_execution_failure_raises_without_settling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

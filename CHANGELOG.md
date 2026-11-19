@@ -167,6 +167,39 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The root-channel PortalComponentCtl execution (Defect G's
+  rish transport) timed out against the root-mode Shizuku
+  server (Phase D closure sessions 9.5 and 14, Nov 19, 2026).
+  The assumption recorded with the executor — that the
+  root-mode server simply accepts a rish client from an adb
+  shell — was wrong: rish's loader receives the server binder
+  from the Shizuku manager app, but the Shell then attaches
+  as a server client under com.android.shell (uid 2000),
+  which needs a Shizuku permission grant. With no allowed
+  entry for that uid in the server config, the server starts
+  the manager's on-screen permission confirmation and blocks
+  the attach; the loader's fixed 5-second watchdog kills it
+  and prints a misleading "Request timeout ... disable all
+  battery optimization features" message (diagnosed live:
+  the binder is delivered in milliseconds, a permission
+  activity START from uid 0 follows every blocked probe, and
+  the probe exits at exactly +5 s; a shell-mode server
+  exempts its own uid, which is why manual shell-mode tests
+  passed). The channel executor now prepares the transport
+  before running the jar: it adds the manager and the shell
+  to the deviceidle whitelist, merges the persisted grant
+  for uid 2000 into the server config file (shell-owned, so
+  the shell channel writes it directly; every later server
+  start loads it), and probes the transport with a trivial
+  rish command — repairing the already-running server by
+  failure shape (tapping "Allow all the time" on the
+  permission dialog, bounds read live from a uiautomator
+  dump, for the timeout shape; starting the manager
+  activity for the cold-manager shape) — and only runs the
+  jar once a probe answers as uid 0. If no probe answers,
+  the step raises and claims nothing, so verification and
+  the race fallback are unchanged, as is the
+  no-Shizuku-root skip.
 - A combined (stages + custom payload) run's final manifest
   recorded null verification boots although the run had
   verified two distinct boots (Defect K, Phase D closure

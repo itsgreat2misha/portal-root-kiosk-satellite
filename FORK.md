@@ -457,6 +457,29 @@ logs `PROVISION_CHANNEL_FALLBACK` with the reason and continues into
 the normal guarded race run — every channel apply is idempotent, so
 nothing is ever half-applied silently.
 
+**Channel component execution** (Defect G, 2026-11-19): a channel
+run carrying PortalComponentCtl actions executes the jar through
+Shizuku's rish client after staging it. rish is not a direct
+server connection: its loader receives the server binder from the
+Shizuku manager app, and the Shell then attaches as a server
+client under `com.android.shell` (uid 2000), which needs a
+Shizuku permission grant against the root-mode server. Without
+one, the server raises its on-screen permission confirmation and
+blocks the attach until the loader's 5-second watchdog kills it
+with a misleading battery-optimization timeout message (a
+shell-mode server exempts its own uid, so the failure only
+appears against root-mode servers). The executor therefore
+prepares the transport first: deviceidle-whitelists the manager
+and the shell, merges the persisted grant for uid 2000 into the
+server config (`/data/user_de/0/com.android.shell/shizuku.json`,
+shell-owned; loaded by every later server start), and probes
+with a trivial rish command, repairing the running server by
+failure shape — tapping "Allow all the time" on the permission
+dialog (bounds read live via uiautomator) or starting the
+manager activity for a cold manager — before the jar runs.
+Success still requires the jar's own OK marker; a transport
+that never answers raises and claims nothing.
+
 **`--force`** bypasses both fast paths: a full race-based run that
 re-installs the provisioner's own packages even when byte-identical
 (the `APK_INSTALL_SKIP` comparison is skipped), re-executes the

@@ -180,6 +180,27 @@ COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
 COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
 RISH_SCRIPT_REMOTE = "/data/local/tmp/rish"
 RISH_DEX_REMOTE = "/data/local/tmp/rish_shizuku.dex"
+#: The Shizuku manager activity the rish transport prep starts to
+#: wake the manager process (see _prepare_rish_transport). The
+#: component name is part of the pinned, hash-verified Shizuku
+#: APK (SHIZUKU_VERSION), as stable as the rish asset paths above.
+SHIZUKU_MANAGER_ACTIVITY = (
+    "moe.shizuku.privileged.api/moe.shizuku.manager.MainActivity"
+)
+#: How many rish probes the transport prep runs before giving up.
+RISH_PROBE_ATTEMPTS = 3
+#: Shizuku's server config: the shell app's own data file, which
+#: the server loads at start and which adb shell can read and
+#: write directly (the shell user owns it). The rish client
+#: attaches as uid 2000 / com.android.shell; without an allowed
+#: entry for that uid the root-mode server demands an on-screen
+#: permission confirmation nobody can answer on a kiosk (see
+#: _prepare_rish_transport). FLAG_ALLOWED is ConfigManager's
+#: 1 << 1 in the pinned Shizuku API; FLAG_DENIED is 1 << 2.
+SHIZUKU_CONFIG_REMOTE = "/data/user_de/0/com.android.shell/shizuku.json"
+SHIZUKU_RISH_UID = 2000
+SHIZUKU_FLAG_ALLOWED = 2
+SHIZUKU_FLAG_DENIED = 4
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
 APP_VERIFIER_PACKAGE = "com.facebook.appverifier"
 ADB_ENABLED_SETTING = "adb_enabled"
@@ -1788,10 +1809,24 @@ class PortalProvisioner:
         (Defect G, closure session 8 leg 2b). Here the same jar
         runs with the same arguments through Shizuku's own shell
         client (rish, extracted from the pinned Shizuku APK): the
-        server spawns it, so it runs as uid 0, the identity class
-        the jar already runs under post-win. Loopback-ADB shell
-        cannot substitute — PackageManager's binder caller check
-        excludes uid 2000.
+        server-side shell the binder spawns runs it as uid 0, the
+        identity class the jar already runs under post-win.
+        Loopback-ADB shell cannot substitute — PackageManager's
+        binder caller check excludes uid 2000.
+
+        rish itself does not talk to the server directly (the
+        assumption recorded with PR #73, that the root-mode
+        server simply accepts a rish client from an adb shell,
+        proved wrong live in closure sessions 9.5 and 14): its
+        loader gets the server binder from the Shizuku manager
+        app, but the Shell then attaches as a client under
+        com.android.shell, which the root-mode server only
+        serves with a Shizuku permission grant — ungranted,
+        the attach blocks behind the manager's on-screen
+        confirmation until the loader's 5 s watchdog reports
+        a misleading timeout. _prepare_rish_transport
+        establishes the grant before the jar runs; see its
+        docstring for the full mechanism.
 
         Without Shizuku root (the --skip-shizuku-root opt-out, or
         the server not answering as uid 0) the step does not run
@@ -1832,6 +1867,7 @@ class PortalProvisioner:
                 "component ctl jar is neither built nor staged"
             )
         self._stage_rish_client()
+        self._prepare_rish_transport()
         presence_action = self._component_ctl_presence_action()
         result = self._run_component_ctl_via_rish(
             "/system/bin/app_process64", presence_action
@@ -1881,6 +1917,250 @@ class PortalProvisioner:
             ["shell", f"sh {RISH_SCRIPT_REMOTE} -c {shlex.quote(inner)}"],
             timeout=120,
         )
+
+    def _prepare_rish_transport(self) -> None:
+        """Make the rish transport answer before the jar runs.
+
+        rish does not talk to the server directly. Its loader
+        (rikka.shizuku.shell.ShizukuShellLoader) broadcasts a
+        binder request to the Shizuku manager app, receives the
+        server binder, and runs moe.shizuku.manager.shell.Shell
+        as a server client under the calling package
+        com.android.shell (uid 2000, the only package for the
+        shell uid). Against the root-mode server that client
+        needs a Shizuku permission grant: with no allowed entry
+        for uid 2000 in the server config, the server starts the
+        manager's RequestPermissionActivity ("Allow Shell to
+        access Shizuku?") and blocks the attach pending an
+        answer; the loader's fixed 5 s watchdog then kills it
+        and prints the misleading "Request timeout ... disable
+        all battery optimization features" message. That is the
+        failure closure sessions 9.5 and 14 hit (diagnosed live
+        Nov 19, 2026: the broadcast history shows the binder
+        delivered in milliseconds and a permission-activity
+        START from uid 0 half a second into every blocked
+        probe, with the probe exiting at exactly +5 s; granting
+        "Allow all the time" made the next probe answer uid=0
+        immediately, and the exact jar invocation then printed
+        PORTAL_COMPONENT_CTL_OK). A shell-mode server exempts
+        its own uid, which is why the same invocation worked in
+        manual shell-mode tests. The secondary shape is a cold
+        manager process: the broadcast cold-starts it and its
+        receiver can answer before the server's BinderSender
+        delivers the binder, yielding a null-binder reply
+        ("Server is not running"); foregrounding the manager is
+        the delivery trigger that resolves it.
+
+        The prep therefore, in order: (a) adds the manager and
+        the shell to the deviceidle whitelist — the timeout
+        message's own remedy, so doze cannot defer the binder
+        broadcast on other builds; (b) ensures the persisted
+        grant in the server config file (shell-owned, so adb
+        shell writes it directly), which every later server
+        start loads — a server already running does not re-read
+        it, so (c) probes the transport with a trivial rish
+        command and repairs the running server by shape: a
+        timeout-shaped failure taps "Allow all the time" on
+        the permission dialog (bounds read live from a
+        uiautomator dump of the pinned manager), which records
+        the grant in the running server; any other failure
+        starts the manager activity. If no probe answers as
+        uid 0, the step raises and claims nothing, so
+        verification and the race fallback behave exactly as
+        for a failed execution.
+        """
+        for package in (SHIZUKU_PACKAGE, "com.android.shell"):
+            self.adb_run(
+                [
+                    "shell",
+                    "dumpsys",
+                    "deviceidle",
+                    "whitelist",
+                    f"+{package}",
+                ],
+                timeout=10,
+            )
+        self._ensure_shizuku_rish_grant()
+        last = ""
+        for attempt in range(1, RISH_PROBE_ATTEMPTS + 1):
+            result = self.adb_run(
+                ["shell", f"sh {RISH_SCRIPT_REMOTE} -c id"],
+                timeout=30,
+            )
+            last = result.stdout.strip()
+            if result.returncode == 0 and "uid=0" in result.stdout:
+                print(
+                    "COMPONENT_CTL_RISH_READY "
+                    f"attempt={attempt} output={last[:80]!r}",
+                    flush=True,
+                )
+                return
+            print(
+                "COMPONENT_CTL_RISH_NOT_READY "
+                f"attempt={attempt} exit={result.returncode} "
+                f"output={last[-160:]!r}",
+                flush=True,
+            )
+            if attempt < RISH_PROBE_ATTEMPTS:
+                tapped = "Request timeout" in last and (
+                    self._tap_shizuku_permission_allow()
+                )
+                if not tapped:
+                    self.adb_run(
+                        [
+                            "shell",
+                            "am",
+                            "start",
+                            "-n",
+                            SHIZUKU_MANAGER_ACTIVITY,
+                        ],
+                        timeout=10,
+                    )
+                time.sleep(2)
+        raise ProvisionError(
+            "component ctl rish transport did not become ready: "
+            f"last probe output={last[-200:]!r}"
+        )
+
+    def _ensure_shizuku_rish_grant(self) -> None:
+        """Persist the Shizuku grant for the rish client uid.
+
+        The server config (/data/user_de/0/com.android.shell/
+        shizuku.json) is owned by the shell user, so the host
+        shell channel can merge the grant in directly: an entry
+        for uid 2000 with FLAG_ALLOWED and the com.android.shell
+        package, other entries preserved. A server already
+        running loaded its config at start and will not re-read
+        the file (the probe loop repairs that case separately);
+        every later start — each boot's autoroot handoff, each
+        provision run's root start — loads the grant from here.
+        An unreadable file is treated as an empty config; an
+        unparseable one is left untouched (it may carry other
+        apps' grants) and logged.
+        """
+        result = self.adb_run(
+            ["shell", "cat", SHIZUKU_CONFIG_REMOTE], timeout=10
+        )
+        raw = result.stdout.strip() if result.returncode == 0 else ""
+        if raw:
+            try:
+                config = json.loads(raw)
+                entries = config["packages"]
+                if not isinstance(entries, list):
+                    raise ValueError("packages is not a list")
+            except (ValueError, KeyError, TypeError):
+                print(
+                    "COMPONENT_CTL_RISH_GRANT_SKIPPED "
+                    "reason=config-unparseable",
+                    flush=True,
+                )
+                return
+        else:
+            config = {"version": 2, "packages": []}
+            entries = config["packages"]
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("uid") != (
+                SHIZUKU_RISH_UID
+            ):
+                continue
+            flags = entry.get("flags", 0)
+            packages = entry.get("packages", [])
+            if (flags & SHIZUKU_FLAG_ALLOWED) and (
+                "com.android.shell" in packages
+            ):
+                print(
+                    "COMPONENT_CTL_RISH_GRANT_PRESENT "
+                    f"uid={SHIZUKU_RISH_UID}",
+                    flush=True,
+                )
+                return
+            entry["flags"] = (
+                flags & ~SHIZUKU_FLAG_DENIED
+            ) | SHIZUKU_FLAG_ALLOWED
+            if "com.android.shell" not in packages:
+                packages.append("com.android.shell")
+                entry["packages"] = packages
+            break
+        else:
+            entries.append(
+                {
+                    "uid": SHIZUKU_RISH_UID,
+                    "flags": SHIZUKU_FLAG_ALLOWED,
+                    "packages": ["com.android.shell"],
+                }
+            )
+        payload = json.dumps(config)
+        with tempfile.TemporaryDirectory(
+            prefix="portal-shizuku-config-"
+        ) as tmp:
+            local = pathlib.Path(tmp) / "shizuku.json"
+            local.write_text(payload)
+            self.adb_run(
+                ["push", str(local), "/data/local/tmp/shizuku.json.tmp"],
+                timeout=15,
+                check=True,
+            )
+        self.adb_run(
+            [
+                "shell",
+                "cp /data/local/tmp/shizuku.json.tmp "
+                f"{SHIZUKU_CONFIG_REMOTE} && "
+                "rm /data/local/tmp/shizuku.json.tmp",
+            ],
+            timeout=10,
+            check=True,
+        )
+        print(
+            "COMPONENT_CTL_RISH_GRANT_WRITTEN "
+            f"uid={SHIZUKU_RISH_UID} flags={SHIZUKU_FLAG_ALLOWED}",
+            flush=True,
+        )
+
+    def _tap_shizuku_permission_allow(self) -> bool:
+        """Tap "Allow all the time" on Shizuku's permission dialog.
+
+        The dialog is the pinned manager's own grant UI for the
+        rish client (com.android.shell); its button bounds are
+        read live from a uiautomator dump, never assumed. The
+        grant is recorded by the server for the uid, so the tap
+        unblocks later probes even though the probe that raised
+        the dialog has already hit its 5 s watchdog. Returns
+        False when no such dialog is on screen.
+        """
+        dump_remote = "/data/local/tmp/portal-window-dump.xml"
+        dumped = self.adb_run(
+            ["shell", "uiautomator", "dump", dump_remote], timeout=15
+        )
+        if dumped.returncode != 0:
+            return False
+        try:
+            xml = self.adb_run(
+                ["shell", "cat", dump_remote], timeout=10
+            ).stdout
+            for node in re.findall(r"<node[^>]*>", xml):
+                if 'text="Allow all the time"' not in node:
+                    continue
+                if f'package="{SHIZUKU_PACKAGE}"' not in node:
+                    continue
+                bounds = re.search(
+                    r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node
+                )
+                if bounds is None:
+                    continue
+                x = (int(bounds.group(1)) + int(bounds.group(3))) // 2
+                y = (int(bounds.group(2)) + int(bounds.group(4))) // 2
+                self.adb_run(
+                    ["shell", "input", "tap", str(x), str(y)],
+                    timeout=10,
+                )
+                print(
+                    f"COMPONENT_CTL_RISH_GRANT_TAPPED x={x} y={y}",
+                    flush=True,
+                )
+                return True
+            return False
+        finally:
+            self.adb_run(["shell", "rm", "-f", dump_remote], timeout=5)
 
     def _stage_rish_client(self) -> None:
         """Push Shizuku's rish shell client (script + dex) from the
