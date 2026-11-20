@@ -3423,6 +3423,22 @@ class PortalProvisioner:
         ]
         if self.autoroot:
             own_pair_drops.append("restore_autoroot")
+        if self._verified_boots is not None:
+            # The boots THIS run established fill any the caller
+            # did not supply, on every write (Defect M): the fill
+            # used to live inside the merge below, gated on the
+            # start record being complete, so a combined run that
+            # started from a pending record (a recovered run) let
+            # its payload phase's terminal write replace the
+            # verification write's good record with null boots.
+            # Explicit caller boots still win, and the merge below
+            # still carries the start record's block over where
+            # this run verified none.
+            own_first, own_second = self._verified_boots
+            if first_boot is None:
+                first_boot = own_first
+            if second_boot is None:
+                second_boot = own_second
         if merge_prior:
             # Merge into the manifest this run started from instead
             # of replacing it: the recorded manifest is the device's
@@ -3431,20 +3447,42 @@ class PortalProvisioner:
             # dropping them would falsify the record the fast-path
             # gates, the OTA posture trust and --status all read.
             # This run's applied actions and artifact hashes win
-            # per key; the recorded autoroot key hash survives
-            # unless this run restaged autoroot (then the staged
-            # hash above is the new one); the verification boots
-            # this run itself established win over the start
-            # record's block, which otherwise carries over where
-            # this write supplies none (the manifest-correction
-            # re-writes preserve them the same way). Tool revision
-            # and desired state follow the completing run, as in
-            # every other write.
+            # per key, with one exception: verification-grade
+            # values merge monotonically (below). The recorded
+            # autoroot key hash survives unless this run restaged
+            # autoroot (then the staged hash above is the new
+            # one); the start record's verification block carries
+            # over where this write supplies no boots (this run's
+            # own verified boots were filled in above, before the
+            # merge; the manifest-correction re-writes preserve
+            # them the same way). Tool revision and desired state
+            # follow the completing run, as in every other write.
             prior = self._start_state
             if isinstance(prior, dict) and prior.get("status") == "complete":
                 prior_actions = prior.get("actions")
                 if isinstance(prior_actions, dict):
                     actions = {**prior_actions, **actions}
+                    if (
+                        actions.get("disable_updates") == "unverified"
+                        and prior_actions.get("disable_updates") is True
+                    ):
+                        # Defect M: this run's "unverified" records
+                        # that it could not positively judge the
+                        # OTA block (a win-less boot cannot read
+                        # the posture's per-boot property or stat
+                        # the override file), not that the block
+                        # is absent, so it does not downgrade a
+                        # value an earlier run positively
+                        # verified. Only a run that itself
+                        # verifies (records the action done) or
+                        # positively refutes it (the
+                        # enable-updates restore, whose pair
+                        # hygiene drops the key below) changes
+                        # the recorded value. Nothing here
+                        # creates a verified value: with no
+                        # verified prior, "unverified" records
+                        # exactly as before.
+                        actions["disable_updates"] = True
                 prior_hashes = prior.get("artifact_sha256")
                 if isinstance(prior_hashes, dict):
                     artifact_sha256 = {**prior_hashes, **artifact_sha256}
@@ -3452,20 +3490,6 @@ class PortalProvisioner:
                     recorded_key = prior.get("autoroot_key_sha256")
                     if isinstance(recorded_key, str):
                         autoroot_key_sha256 = recorded_key
-                if self._verified_boots is not None:
-                    # The boots THIS run established win over the
-                    # start snapshot's block (Defect K): the merge
-                    # base predates the run's own verification, so
-                    # carrying its block forward unconditionally
-                    # overwrote the boots the run had just recorded
-                    # (a combined run's install phase writes them;
-                    # the payload phase's terminal write then
-                    # replaced them with the start record's nulls).
-                    own_first, own_second = self._verified_boots
-                    if first_boot is None:
-                        first_boot = own_first
-                    if second_boot is None:
-                        second_boot = own_second
                 verification = prior.get("verification")
                 if isinstance(verification, dict):
                     if first_boot is None and isinstance(
