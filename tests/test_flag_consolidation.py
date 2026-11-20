@@ -80,9 +80,10 @@ class FullPresetTest(unittest.TestCase):
             self.assertEqual(getattr(arguments, attribute), value, attribute)
         # The preset is exactly the documented line: audio,
         # disable-updates, block-remote-wipe, debloat,
-        # remove-meta-accounts, optimize-presence, allow-app-updates,
+        # remove-meta-accounts, optimize-presence,
         # disable-adb-auth-timeout, autoroot. (Debloat carries the
-        # Private-DNS-off change with it; see DebloatDnsTest.)
+        # Private-DNS-off change and the app-verifier disable with
+        # it; see DebloatDnsTest and AppVerifierFoldTest.)
         self.assertEqual(
             set(cli_module.FULL_PRESET),
             {
@@ -92,14 +93,15 @@ class FullPresetTest(unittest.TestCase):
                 "debloat",
                 "remove_meta_accounts",
                 "optimize_presence",
-                "allow_app_updates",
                 "disable_adb_auth_timeout",
                 "autoroot",
             },
         )
-        # The full run still turns Private DNS off, via debloat.
+        # The full run still turns Private DNS off and disables
+        # the app verifier, both via debloat.
         self.assertTrue(arguments.dhcp_dns)
         self.assertIsNone(arguments.privacy_dns)
+        self.assertTrue(arguments.allow_app_updates)
         # Taste opt-ins stay out of the bundle.
         self.assertIsNone(arguments.presence_fps_cap)
         self.assertIsNone(arguments.system_theme_control)
@@ -223,6 +225,37 @@ class DebloatDnsTest(unittest.TestCase):
         self.assertIsNone(arguments.privacy_dns)
         self.assertEqual(store.mode, "off")
         self.assertEqual(store.specifier, "null")
+
+
+class AppVerifierFoldTest(unittest.TestCase):
+    """Disabling Meta's app verifier (so non-Meta apps can
+    update) is part of the debloat action set now; the standalone
+    --allow-app-updates flag is a clean break, and
+    --restore app-verifier keeps working on its own."""
+
+    def test_debloat_disables_the_app_verifier(self) -> None:
+        arguments = parse(["--debloat"])
+        self.assertTrue(arguments.allow_app_updates)
+
+    def test_no_debloat_no_app_verifier_change(self) -> None:
+        arguments = parse(["--audio"])
+        self.assertFalse(arguments.allow_app_updates)
+
+    def test_allow_app_updates_flag_is_a_clean_break(self) -> None:
+        self.assertIn(
+            "unrecognized arguments", parse_error(["--allow-app-updates"])
+        )
+
+    def test_debloat_rejects_an_app_verifier_restore(self) -> None:
+        self.assertIn(
+            "--debloat cannot be combined with --restore app-verifier",
+            parse_error(["--debloat", "--restore", "app-verifier"]),
+        )
+
+    def test_app_verifier_restore_still_parses_alone(self) -> None:
+        arguments = parse(["--restore", "app-verifier"])
+        self.assertTrue(arguments.restore_app_verifier)
+        self.assertFalse(arguments.allow_app_updates)
 
 
 class RestoreSurfaceTest(unittest.TestCase):

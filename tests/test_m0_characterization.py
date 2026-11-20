@@ -279,7 +279,6 @@ class CliSingleFlagMappingTest(unittest.TestCase):
             pathlib.Path("/tmp/s.apk"),
             False,
         ),
-        (["--allow-app-updates"], "allow_app_updates", True, False),
         (["--restore", "app-verifier"], "restore_app_verifier", True, False),
         (["--disable-updates"], "disable_updates", True, False),
         (["--restore", "updates"], "enable_updates", True, False),
@@ -393,8 +392,8 @@ class CliValidationTest(unittest.TestCase):
             "--audio cannot be combined with --restore audio",
         ),
         (
-            ["--allow-app-updates", "--restore", "app-verifier"],
-            "--allow-app-updates cannot be combined with "
+            ["--debloat", "--restore", "app-verifier"],
+            "--debloat cannot be combined with "
             "--restore app-verifier",
         ),
         (
@@ -559,7 +558,6 @@ class MainConfigMappingTest(unittest.TestCase):
                     "--autoroot",
                     "--verify-boots", "2",
                     "--system-theme-control", "dark",
-                    "--allow-app-updates",
                     "--disable-updates",
                     "--block-remote-wipe",
                     "--debloat",

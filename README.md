@@ -224,7 +224,7 @@ full-setup line plus `--autoroot`:
 ```sh
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" \
   --audio --disable-updates --block-remote-wipe --debloat \
-  --remove-meta-accounts --optimize-presence --allow-app-updates \
+  --remove-meta-accounts --optimize-presence \
   --disable-adb-auth-timeout --autoroot
 ```
 
@@ -241,10 +241,9 @@ verification boot ID (two different boot IDs with `--verify-boots 2`).
 - `--audio` — disable hardware echo cancellation and noise suppression, so the microphone is not suppressed while the speaker plays.
 - `--disable-updates` — block automatic Meta firmware updates.
 - `--block-remote-wipe` — disable Meta's known remote factory-reset receivers; local recovery stays available.
-- `--debloat` — disable unused Meta apps, cloud clients and diagnostics. The list depends on the model: up to 196 components on most models, 39 on the Portal+ (1st generation) and 14 on Portal TV. It also turns Android Private DNS off, so the Portal uses the DNS server supplied by the local network, including private LAN hostnames.
+- `--debloat` — disable unused Meta apps, cloud clients and diagnostics. The list depends on the model: up to 196 components on most models, 39 on the Portal+ (1st generation) and 14 on Portal TV. It also turns Android Private DNS off, so the Portal uses the DNS server supplied by the local network, including private LAN hostnames, and disables Meta's app verifier, so correctly signed third-party and other non-Meta apps can update normally.
 - `--remove-meta-accounts` — remove local Meta accounts. **One-way** (see [What can't be undone](#what-cant-be-undone)).
 - `--optimize-presence` — reduce AIService CPU use while preserving full-view, LED-free person detection.
-- `--allow-app-updates` — let correctly signed third-party and other non-Meta APKs update normally.
 - `--disable-adb-auth-timeout` — keep already-approved ADB computers authorized indefinitely. A new computer must still be approved on the Portal; this does not disable ADB authentication.
 
 ### Standalone

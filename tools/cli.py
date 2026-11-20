@@ -89,7 +89,6 @@ FULL_PRESET = {
     "debloat": True,
     "remove_meta_accounts": True,
     "optimize_presence": True,
-    "allow_app_updates": True,
     "disable_adb_auth_timeout": True,
     "autoroot": True,
 }
@@ -122,7 +121,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         help=(
             "apply the full documented setup in one run: audio, "
             "disable-updates, block-remote-wipe, debloat, "
-            "remove-meta-accounts, optimize-presence, allow-app-updates, "
+            "remove-meta-accounts, optimize-presence, "
             "disable-adb-auth-timeout, and "
             "autoroot. Exactly the long flag line it replaces; the "
             "granular flags below remain for partial setups"
@@ -255,14 +254,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--allow-app-updates",
-        action="store_true",
-        help=(
-            "persistently disable Meta's certificate allowlist so "
-            "third-party and other non-Meta apps can update"
-        ),
-    )
-    parser.add_argument(
         "--disable-updates",
         action="store_true",
         help=(
@@ -293,7 +284,8 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "persistently disable the conservative Meta app/telemetry "
             "profile and save each package's original state; also "
             "turns Android Private DNS off so the Portal uses the "
-            "network's own DNS"
+            "network's own DNS, and disables Meta's app verifier so "
+            "third-party and other non-Meta apps can update"
         ),
     )
     parser.add_argument(
@@ -369,6 +361,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         setattr(args, RESTORE_FLAG_MAP[name], True)
     args.privacy_dns = None
     args.dhcp_dns = False
+    args.allow_app_updates = False
     # Internal, not a user option: the root-payload step always uses
     # the in-repo root daemon. Only the autoroot implication below
     # arms it; there is deliberately no flag (and no PATH override)
@@ -379,15 +372,19 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     if args.full:
         for attribute, value in FULL_PRESET.items():
             setattr(args, attribute, value)
-    # Debloat carries the DNS change with it: a debloated Portal
-    # uses the network's own DNS, so turning Android Private DNS
-    # off is part of the debloat action set. There is no separate
-    # --dns flag anymore and no resolver-hostname form. The
-    # internal dhcp_dns attribute set here is what the apply, the
-    # verify, the manifest recording and the recorded-state
-    # readers all key off, exactly as before.
+    # Debloat carries two fellow-traveller changes with it: a
+    # debloated Portal uses the network's own DNS, so turning
+    # Android Private DNS off is part of the debloat action set
+    # (no separate --dns flag anymore, and no resolver-hostname
+    # form), and Meta's app verifier is disabled so non-Meta apps
+    # can update (no separate --allow-app-updates flag anymore).
+    # The internal attributes set here — dhcp_dns and
+    # allow_app_updates — are what the applies, the verifies, the
+    # manifest recording and the recorded-state readers all key
+    # off, exactly as before.
     if args.debloat:
         args.dhcp_dns = True
+        args.allow_app_updates = True
     # Apply/restore pairs for one feature stay mutually exclusive,
     # as they were when each pair had its own flag group.
     for apply_attribute, restore_name, apply_label in (
@@ -396,7 +393,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         ("block_remote_wipe", "remote-wipe", "--block-remote-wipe"),
         ("debloat", "bloat", "--debloat"),
         ("optimize_presence", "presence", "--optimize-presence"),
-        ("allow_app_updates", "app-verifier", "--allow-app-updates"),
         (
             "disable_adb_auth_timeout",
             "adb-auth-timeout",
@@ -421,6 +417,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         )
     if (args.privacy_dns or args.dhcp_dns) and "dns" in args.restore:
         parser.error("--debloat cannot be combined with --restore dns")
+    if args.debloat and "app-verifier" in args.restore:
+        parser.error(
+            "--debloat cannot be combined with --restore app-verifier"
+        )
     if args.persistent_wireless_adb and "wireless-adb" in args.restore:
         parser.error(
             "--persistent-wireless-adb cannot be combined with "
