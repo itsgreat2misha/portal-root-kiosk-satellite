@@ -187,6 +187,7 @@ class CliDefaultsTest(unittest.TestCase):
                 "serial": None,
                 "attempts": 12,
                 "full": False,
+                "strip_meta": False,
                 "restore": [],
                 "persistent_wireless_adb": False,
                 "disable_adb_auth_timeout": False,

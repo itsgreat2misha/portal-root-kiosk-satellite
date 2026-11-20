@@ -116,6 +116,48 @@ class FullPresetTest(unittest.TestCase):
         )
 
 
+class StripMetaPresetTest(unittest.TestCase):
+    """--strip-meta expands to exactly block-remote-wipe +
+    debloat + disable-updates, composed like --full. The one-way
+    account removal is NOT in it and stays explicit."""
+
+    def test_preset_expands_to_exactly_its_documented_set(self) -> None:
+        self.assertEqual(
+            set(cli_module.STRIP_META_PRESET),
+            {"block_remote_wipe", "debloat", "disable_updates"},
+        )
+        arguments = parse(["--strip-meta"])
+        self.assertTrue(arguments.block_remote_wipe)
+        self.assertTrue(arguments.debloat)
+        self.assertTrue(arguments.disable_updates)
+
+    def test_preset_excludes_account_removal_and_root(self) -> None:
+        arguments = parse(["--strip-meta"])
+        self.assertFalse(arguments.remove_meta_accounts)
+        self.assertFalse(arguments.autoroot)
+        self.assertIsNone(arguments.custom_payload)
+        self.assertFalse(arguments.audio)
+        self.assertFalse(arguments.optimize_presence)
+
+    def test_preset_carries_the_debloat_fellow_travellers(self) -> None:
+        arguments = parse(["--strip-meta"])
+        self.assertTrue(arguments.dhcp_dns)
+        self.assertTrue(arguments.allow_app_updates)
+
+    def test_preset_members_still_conflict_with_their_restores(
+        self,
+    ) -> None:
+        self.assertIn(
+            "--disable-updates cannot be combined with "
+            "--restore updates",
+            parse_error(["--strip-meta", "--restore", "updates"]),
+        )
+        self.assertIn(
+            "--debloat cannot be combined with --restore bloat",
+            parse_error(["--strip-meta", "--restore", "bloat"]),
+        )
+
+
 class DnsMergeTest(unittest.TestCase):
     def test_debloat_turns_private_dns_off(self) -> None:
         arguments = parse(["--debloat"])

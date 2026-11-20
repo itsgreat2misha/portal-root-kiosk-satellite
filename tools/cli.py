@@ -93,6 +93,16 @@ FULL_PRESET = {
     "autoroot": True,
 }
 
+#: The Meta-control removal set, as --strip-meta expands it:
+#: block remote wipe, debloat, disable updates. Deliberately NOT
+#: in it: --remove-meta-accounts (the project's only one-way
+#: action stays explicit everywhere) and anything root-related.
+STRIP_META_PRESET = {
+    "block_remote_wipe": True,
+    "debloat": True,
+    "disable_updates": True,
+}
+
 
 def parse_args(config: CliConfig) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -125,6 +135,18 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "disable-adb-auth-timeout, and "
             "autoroot. Exactly the long flag line it replaces; the "
             "granular flags below remain for partial setups"
+        ),
+    )
+    parser.add_argument(
+        "--strip-meta",
+        action="store_true",
+        help=(
+            "apply the Meta-control removal set in one run: "
+            "block-remote-wipe, debloat (which also turns Private "
+            "DNS off and disables Meta's app verifier), and "
+            "disable-updates. No root, and it does NOT remove Meta "
+            "accounts: that stays a separate explicit "
+            "--remove-meta-accounts step"
         ),
     )
     parser.add_argument(
@@ -371,6 +393,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     # --full expands to exactly the documented full-setup line.
     if args.full:
         for attribute, value in FULL_PRESET.items():
+            setattr(args, attribute, value)
+    # --strip-meta expands the same way, to its smaller set.
+    if args.strip_meta:
+        for attribute, value in STRIP_META_PRESET.items():
             setattr(args, attribute, value)
     # Debloat carries two fellow-traveller changes with it: a
     # debloated Portal uses the network's own DNS, so turning

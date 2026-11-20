@@ -14,6 +14,10 @@ the fork diverged from upstream:
 
 ### Added
 
+- `--strip-meta`, a preset for the Meta-control removal set:
+  `--block-remote-wipe --debloat --disable-updates` in one run.
+  No root, and it deliberately does not remove Meta accounts;
+  `--remove-meta-accounts` stays a separate explicit step.
 - Cross-platform host support, first half (Phase F): the exploit
   attempt runner streams process output through a reader thread and
   a queue instead of `select()` on a pipe (Windows accepts sockets
