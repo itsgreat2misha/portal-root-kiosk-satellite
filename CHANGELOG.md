@@ -219,6 +219,17 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The autoroot helper's root-daemon check ran a single probe
+  and silently reported "daemon absent" on any failure. The
+  verdict-time decisions that consume it (the post-verdict cut
+  and the fail-stall sweep) could therefore act on a daemon
+  that was still binding, and a genuinely absent daemon left
+  no evidence of why. The check now retries the ID probe up
+  to three times with 500 ms pauses and, on giving up, logs
+  the failure reason (unexpected response or exception) plus
+  a TCP reachability probe of the daemon port. Ported from
+  PR #49, whose remaining content this supersedes; helper
+  bumped to 1.16/vc17.
 - Two bundle-mode defects caught by the v0.9.0 live proof
   (Nov 20, 2026) after the certificate fix: the bundle did not
   ship `autoroot-helper/run.sh`, which the runtime stages
