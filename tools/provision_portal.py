@@ -3462,7 +3462,7 @@ class PortalProvisioner:
         )
         try:
             interactive = sys.stdin.isatty()
-        except (AttributeError, ValueError):
+        except (AttributeError, OSError, ValueError):
             interactive = False
         if not interactive:
             return
