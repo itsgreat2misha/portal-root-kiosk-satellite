@@ -14,6 +14,14 @@ the fork diverged from upstream:
 
 ### Added
 
+- Guided connect (`--connect`): finds the Portal plugged in by
+  USB, waits for the Debug-menu ADB enable and the on-screen
+  Allow tap with plain messages, runs `adb tcpip 5555` itself,
+  reads the Portal's Wi-Fi address on the device (`ip addr show
+  wlan0`, verified live on aloha and omni; route source as
+  fallback) and connects to it. With action flags the run
+  continues on the wireless connection; on its own it connects,
+  prints the serial and the provisioning command, and exits.
 - First-run ergonomics: a plain-language pre-flight summary of
   what a run will do (naming the one-way Meta account removal
   when it is in the run, and debloat's contents in plain words),

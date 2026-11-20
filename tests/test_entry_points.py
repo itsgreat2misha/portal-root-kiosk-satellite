@@ -285,5 +285,167 @@ class ConnectDiagnosticsTest(unittest.TestCase):
         self.assertIn("same Wi-Fi network", output)
 
 
+class GuidedConnectTest(unittest.TestCase):
+    """Guided connect against scripted adb seams: the device-list
+    sequence, the on-device Wi-Fi read (ip addr, route fallback),
+    the tcpip switch and the wireless connect."""
+
+    def run_guided(self, device_script, command_outputs):
+        clock = _FakeClock()
+        devices = list(device_script)
+        calls = []
+
+        def fake_devices():
+            return devices.pop(0) if devices else []
+
+        def fake_command(arguments, timeout=15):
+            del timeout
+            calls.append(list(arguments))
+            key = " ".join(str(argument) for argument in arguments)
+            for fragment, (returncode, stdout) in command_outputs.items():
+                if fragment in key:
+                    return subprocess.CompletedProcess(
+                        arguments, returncode, stdout, ""
+                    )
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(cli_module, "_adb_devices", fake_devices)
+            )
+            stack.enter_context(
+                mock.patch.object(cli_module, "_adb_command", fake_command)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli_module,
+                    "time",
+                    types.SimpleNamespace(
+                        monotonic=clock.monotonic, sleep=clock.sleep
+                    ),
+                )
+            )
+            stack.enter_context(contextlib.redirect_stdout(output))
+            try:
+                serial = cli_module.guided_connect(wait_seconds=30)
+                error = None
+            except ProvisionError as exc:
+                serial, error = None, exc
+        return serial, error, output.getvalue(), calls
+
+    HAPPY_COMMANDS = {
+        "ip addr show wlan0": (
+            0,
+            "    inet 192.0.2.5/24 brd 192.0.2.255 scope global wlan0",
+        ),
+        "tcpip": (0, "restarting in TCP mode port: 5555"),
+        "connect": (0, "connected to 192.0.2.5:5555"),
+        "get-state": (0, "device"),
+    }
+
+    def test_happy_path_waits_for_allow_then_connects(self) -> None:
+        serial, error, output, calls = self.run_guided(
+            [
+                [],
+                [("USB1", "unauthorized")],
+                [("USB1", "device")],
+            ],
+            self.HAPPY_COMMANDS,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(serial, "192.0.2.5:5555")
+        self.assertIn("tap Allow", output)
+        self.assertIn("Connected: 192.0.2.5:5555", output)
+        joined = [" ".join(call) for call in calls]
+        self.assertTrue(any("tcpip 5555" in call for call in joined))
+
+    def test_route_source_is_the_ip_fallback(self) -> None:
+        commands = dict(self.HAPPY_COMMANDS)
+        commands["ip addr show wlan0"] = (0, "wlan0: DOWN")
+        commands["ip route"] = (
+            0,
+            "192.0.2.0/24 dev wlan0 proto kernel scope link "
+            "src 192.0.2.5",
+        )
+        serial, error, _, _ = self.run_guided(
+            [[("USB1", "device")]], commands
+        )
+        self.assertIsNone(error)
+        self.assertEqual(serial, "192.0.2.5:5555")
+
+    def test_no_usb_portal_is_a_plain_error(self) -> None:
+        serial, error, _, _ = self.run_guided([], self.HAPPY_COMMANDS)
+        self.assertIsNone(serial)
+        self.assertIn("no USB Portal appeared", str(error))
+        self.assertIn("Debug menu", str(error))
+
+    def test_two_usb_devices_are_not_guessed(self) -> None:
+        serial, error, _, _ = self.run_guided(
+            [[("USB1", "device"), ("USB2", "device")]],
+            self.HAPPY_COMMANDS,
+        )
+        self.assertIsNone(serial)
+        self.assertIn("more than one USB device", str(error))
+
+    def test_no_wifi_address_is_a_plain_error(self) -> None:
+        commands = dict(self.HAPPY_COMMANDS)
+        commands["ip addr show wlan0"] = (0, "wlan0: DOWN")
+        commands["ip route"] = (0, "")
+        serial, error, _, _ = self.run_guided(
+            [[("USB1", "device")]], commands
+        )
+        self.assertIsNone(serial)
+        self.assertIn("Wi-Fi address", str(error))
+
+
+class MainConnectTest(unittest.TestCase):
+    def run_main(self, argv):
+        constructed = []
+
+        class FakeProvisioner:
+            def __init__(self, *args, **kwargs):
+                constructed.append((args, kwargs))
+
+            def provision(self):
+                return None
+
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(sys, "argv", ["provision_portal.py", *argv])
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli_module.shutil, "which", return_value="/usr/bin/adb"
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli_module,
+                    "guided_connect",
+                    return_value="192.0.2.5:5555",
+                )
+            )
+            stack.enter_context(contextlib.redirect_stdout(output))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            result = cli_module.main(CONFIG, FakeProvisioner)
+        return result, constructed, output.getvalue()
+
+    def test_connect_alone_connects_and_prints_the_next_command(
+        self,
+    ) -> None:
+        result, constructed, output = self.run_main(["--connect"])
+        self.assertEqual(result, 0)
+        self.assertEqual(constructed, [])
+        self.assertIn("--serial 192.0.2.5:5555 --full", output)
+
+    def test_connect_with_actions_continues_the_run(self) -> None:
+        result, constructed, _ = self.run_main(["--connect", "--full"])
+        self.assertEqual(result, 0)
+        self.assertEqual(constructed[0][0][0], "192.0.2.5:5555")
+        self.assertTrue(constructed[0][1]["autoroot"])
+
+
 if __name__ == "__main__":
     unittest.main()
