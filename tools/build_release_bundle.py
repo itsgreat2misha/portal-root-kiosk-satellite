@@ -71,8 +71,14 @@ ROOT_FILES = (
 
 
 def expected_artifact_relpaths() -> list[str]:
-    """Every build output the bundle must carry, repo-relative."""
+    """Every file the bundle must carry, repo-relative: the build
+    outputs, plus the autoroot runner script. run.sh is a source
+    file, not a build output, but the runtime stages it on-device
+    from the tree, so a bundle without it cannot stage autoroot
+    (the channel path fell back to a full install in the v0.9.0
+    live proof, Nov 20, 2026)."""
     relpaths = {
+        "autoroot-helper/run.sh",
         "helper/build/libportal_audio_persist.so",
         "helper/build/libportal_audio_persist_java.so",
         "exploit/build/portal-audio-ctl.jar",

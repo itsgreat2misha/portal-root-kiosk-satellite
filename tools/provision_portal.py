@@ -5490,6 +5490,7 @@ class PortalProvisioner:
             disable_updates=self.disable_updates,
             enable_updates=self.enable_updates,
             skip_build=self.skip_build,
+            bundle=self.bundle,
             ota_backend_value=value,
         ).provision()
         return True
@@ -8519,6 +8520,7 @@ class PortalProvisioner:
                 self.attempts,
                 phase_logs,
                 skip_build=self.skip_build,
+                bundle=self.bundle,
                 wireless_adb_only=True,
             ).provision()
             self.connect(wait_seconds=30)
@@ -8557,6 +8559,7 @@ class PortalProvisioner:
                 self.attempts,
                 phase_logs,
                 skip_build=self.skip_build,
+                bundle=self.bundle,
                 adb_framework_only=True,
             ).provision()
             self.connect(wait_seconds=30)
@@ -8591,6 +8594,7 @@ class PortalProvisioner:
                     phase_logs,
                     audio=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
@@ -8647,6 +8651,7 @@ class PortalProvisioner:
                     phase_logs,
                     disable_updates=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 )
                 bootstrap.provision()
                 if bootstrap.ota_nodemon_set_this_run:
@@ -8714,6 +8719,7 @@ class PortalProvisioner:
                         auth_logs,
                         remove_meta_accounts=True,
                         skip_build=self.skip_build,
+                        bundle=self.bundle,
                         meta_accounts_auth_only=True,
                     ).provision()
                     self.connect(wait_seconds=30)
@@ -8739,6 +8745,7 @@ class PortalProvisioner:
                         phase_logs,
                         remove_meta_accounts=True,
                         skip_build=self.skip_build,
+                        bundle=self.bundle,
                         meta_accounts_local_only=True,
                     ).provision()
                     self.connect(wait_seconds=30)
@@ -8756,6 +8763,7 @@ class PortalProvisioner:
                     finalize_logs,
                     remove_meta_accounts=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                     meta_accounts_finalize_only=True,
                 ).provision()
                 self.connect(wait_seconds=30)
@@ -8788,6 +8796,7 @@ class PortalProvisioner:
                     phase_logs,
                     remove_meta_accounts=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
@@ -8837,6 +8846,7 @@ class PortalProvisioner:
                     debloat=True,
                     block_remote_wipe=self.block_remote_wipe,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
@@ -8883,6 +8893,7 @@ class PortalProvisioner:
                     phase_logs,
                     block_remote_wipe=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
@@ -8929,6 +8940,7 @@ class PortalProvisioner:
                     phase_logs,
                     optimize_presence=True,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()
@@ -8984,6 +8996,7 @@ class PortalProvisioner:
                     optimize_presence=True,
                     presence_fps_cap=self.presence_fps_cap,
                     skip_build=self.skip_build,
+                    bundle=self.bundle,
                 ).provision()
                 self.connect(wait_seconds=30)
                 self.verify_target()

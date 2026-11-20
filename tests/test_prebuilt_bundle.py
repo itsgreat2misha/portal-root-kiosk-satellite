@@ -177,6 +177,41 @@ class PrebuiltBundleTest(unittest.TestCase):
             (REPOSITORY / prebuilt_bundle.RELEASE_CERT_NAME).is_file()
         )
 
+    def test_builder_ships_the_autoroot_runner_script(self) -> None:
+        # stage_autoroot_payload reads autoroot-helper/run.sh from
+        # the tree at runtime; a bundle without it cannot stage
+        # autoroot and the channel path falls back to a full
+        # install (the v0.9.0 live proof, Nov 20, 2026).
+        import build_release_bundle
+
+        self.assertIn(
+            "autoroot-helper/run.sh",
+            build_release_bundle.expected_artifact_relpaths(),
+        )
+
+    def test_nested_phase_provisioners_inherit_the_bundle(self) -> None:
+        # Phase runs construct nested PortalProvisioner instances;
+        # every one must receive the bundle or its address
+        # discovery loses the bundled simpleperf on a host without
+        # an NDK (the v0.9.0 live proof, Nov 20, 2026: the nested
+        # OTA bootstrap burned all 12 attempts on exactly this).
+        import provision_portal
+
+        source = pathlib.Path(provision_portal.__file__).read_text(
+            encoding="utf-8"
+        )
+        lines = source.splitlines()
+        for index, line in enumerate(lines):
+            if "skip_build=self.skip_build," in line:
+                indent = line[: len(line) - len(line.lstrip())]
+                self.assertEqual(
+                    lines[index + 1].strip(),
+                    "bundle=self.bundle,",
+                    f"nested construction at line {index + 1} drops "
+                    "the bundle",
+                )
+                self.assertTrue(indent)
+
     def test_unsigned_bundle_reports_no_signature(self) -> None:
         root = write_bundle(self.base / "bundle")
         bundle = self.load(root)
