@@ -187,6 +187,14 @@ the fork diverged from upstream:
 
 ### Changed
 
+- README restructured around the final flag surface: flags are
+  grouped as the setup / root access modes / run controls;
+  step 3 is rewritten for guided connect (`--connect`), step 5
+  for bundle self-detection (no `--bundle` flag when running
+  from inside the bundle), and the archive format note is zip
+  only. The removed flags and their folds are described where
+  they landed (debloat carries Private DNS off and the app
+  verifier disable; `--strip-meta` is the smaller preset).
 - README rewritten to be shorter and more direct: the step-by-step
   installation now covers only the prebuilt-bundle path (download,
   extract, run the provisioner), building from source moved to an

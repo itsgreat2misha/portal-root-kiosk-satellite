@@ -44,12 +44,10 @@ you want only some of them. Each flag is described under
 | Hardware audio processing control | Stops the Portal from suppressing microphone audio while its speaker is playing. |
 | Firmware-update blocking | Prevents an unexpected Meta update from breaking a known working setup. |
 | Meta remote-wipe blocking | Disables Meta's known remote factory-reset entry points while retaining local recovery options. |
-| Meta app debloat | Reduces background work from unused Meta apps, cloud clients and diagnostics. |
+| Meta app debloat | Reduces background work from unused Meta apps, cloud clients and diagnostics; also turns Android Private DNS off (the Portal uses the network's DNS) and disables Meta's app verifier so correctly signed third-party and other non-Meta apps can update normally. |
 | Meta-account removal | Removes obsolete local account data while retaining services the camera and Portal need. **One-way: cannot be undone** (see [What can't be undone](#what-cant-be-undone)). |
 | Presence optimization | Lowers AIService CPU use while preserving full-view, LED-free person detection. |
 | Presence frame-rate cap | Optional: further reduces presence-analysis work without limiting the camera's capture frame rate. |
-| DNS configuration | Optional: use the network-provided DNS server, or send DNS to a chosen filtering resolver. |
-| Third-party app updates | Lets correctly signed third-party and other non-Meta APKs update normally. |
 | Runtime system theme control | Optional: switches locked Android 10 Portals between light and dark mode. |
 | Automatic Shizuku startup | Optional: starts Shizuku after every boot for apps that need ADB-shell privileges. |
 | Per-boot root daemon | Optional: leaves a small root command daemon running on loopback for the rest of the boot. |
@@ -85,8 +83,8 @@ remains the universal undo for everything else.
 - Python 3.9 or newer and Android Debug Bridge (`adb`)
 - A USB data cable for initial stock-device setup
 
-Releases ship the bundle as both `.zip` and `.tar.gz`; on Windows
-download the `.zip`. Run the provisioner with `python` on Windows
+Releases ship the bundle as a `.zip`, which every supported host
+opens natively. Run the provisioner with `python` on Windows
 and `python3` on macOS/Linux (the examples in this document use
 `python3`).
 
@@ -94,8 +92,7 @@ and `python3` on macOS/Linux (the examples in this document use
 
 - An exact model and firmware build listed under [Supported models](#supported-models)
 - The initial on-screen setup (OOBE) completed so the Debug menu is available
-- ADB enabled in the Portal's Debug menu and the host authorized over USB
-- Wireless ADB enabled for the current boot with `adb -d tcpip 5555`
+- ADB enabled in the Portal's Debug menu (guided connect in step 3 handles the host authorization and the switch to wireless ADB)
 - Stable network, a stable IP address and external power for several reboots
 - For presence features: the physical camera cover open and the camera/microphone privacy control off. A closed cover no longer fails the run: the durable presence state is verified and the live verification defers to a later run with the cover open. Nobody needs to remain in view during the reboot sequence.
 
@@ -148,11 +145,11 @@ adb shell uname -a
 
 ### 1. Download the release bundle
 
-Download `portal-provisioner-bundle-0.9.0.tar.gz` (or the `.zip` of the
-same name on Windows) from the project's releases, extract it, and change
-into the extracted directory. The bundle is a complete runnable checkout:
-it carries one payload per supported model plus the shared helper APKs,
-and needs no clone and no Android toolchain.
+Download `portal-provisioner-bundle-<version>.zip` from the project's
+releases, extract it, and change into the extracted directory. The bundle
+is a complete runnable checkout: it carries one payload per supported
+model plus the shared helper APKs, and needs no clone and no Android
+toolchain.
 
 Before anything changes on the Portal, the provisioner checks the
 bundle's manifest against the device's exact target and verifies every
@@ -173,8 +170,34 @@ privacy control.
 <a id="connect-to-the-portal"></a>
 ### 3. Connect to the Portal
 
-Stock firmware disables ADB after every reboot. Open the Portal's Debug menu,
-enable ADB, connect the USB data cable, authorize the host and run:
+Stock firmware disables ADB after every reboot, and the first
+connection is made over USB. Two things only you can do on the
+Portal itself:
+
+1. Open the Portal's Debug menu (available once the initial
+   on-screen setup has finished) and turn ADB on.
+2. When the Portal asks whether to allow this computer, tap
+   **Allow**.
+
+Everything else is guided. Plug in the USB data cable and run:
+
+```sh
+python3 tools/provision_portal.py --connect
+```
+
+Guided connect finds the USB-connected Portal, waits while you
+do the two steps above (it says what it is waiting for), switches
+the Portal to wireless ADB itself, reads the Portal's Wi-Fi
+address from the device, and connects to it. It ends by printing
+the serial, which looks like `192.168.1.100:5555`. You do not
+need to find the address yourself; if you ever do need it, it is
+also in your router's client list.
+
+`--connect` can also be combined with a provisioning command
+(`--connect --full`), in which case the run continues on the
+wireless connection it just made.
+
+Manual alternative: the same steps by hand are
 
 ```sh
 adb -d get-state
@@ -196,6 +219,9 @@ reboots and USB is no longer needed.
 
 ### 4. Confirm compatibility
 
+Use the serial guided connect printed (or `"$PORTAL_IP:5555"` if you
+connected manually):
+
 ```sh
 adb -s "$PORTAL_IP:5555" shell getprop ro.product.device
 adb -s "$PORTAL_IP:5555" shell getprop ro.build.fingerprint
@@ -210,13 +236,19 @@ provisioner checks them again before making any kernel change.
 From inside the extracted bundle directory, run a full setup with:
 
 ```sh
-python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full \
-  --bundle .
+python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full
 ```
 
-(`--bundle` names the bundle to provision from: the extracted directory
-when you run from inside it, or the downloaded archive file when you run
-from a source checkout instead.)
+Running from inside the bundle is detected automatically (the
+`bundle-manifest.json` next to the tool), so no `--bundle` flag is
+needed; `--bundle PATH` still names a bundle explicitly when you run
+from a source checkout instead.
+
+Before anything changes, the run prints a plain-language summary of
+what it is about to do — including a warning when the one-way Meta
+account removal is part of it — and, on an interactive terminal, asks
+for confirmation. `--serial` also accepts a bare IP address (`:5555`
+is added) and can be omitted when exactly one device is connected.
 
 `--full` is a preset, not a separate mode: it expands to the documented
 full-setup line plus `--autoroot`:
@@ -241,34 +273,45 @@ verification boot ID (two different boot IDs with `--verify-boots 2`).
 
 ## Feature flags
 
-### Core features (all included in `--full`)
+The flags fall into three groups: **the setup** (what the Portal
+ends up as), **root access modes** (how much standing root access
+the Portal keeps), and **run controls** (how this one run behaves;
+they change no end state).
+
+### The setup
+
+Presets first: `--full` applies the whole documented setup line
+(see step 5); `--strip-meta` applies just the Meta-control removal
+set (`--block-remote-wipe --debloat --disable-updates`) — no root,
+and no Meta-account removal. Or combine the individual flags:
 
 - `--audio` — disable hardware echo cancellation and noise suppression, so the microphone is not suppressed while the speaker plays.
 - `--disable-updates` — block automatic Meta firmware updates.
 - `--block-remote-wipe` — disable Meta's known remote factory-reset receivers; local recovery stays available.
 - `--debloat` — disable unused Meta apps, cloud clients and diagnostics. The list depends on the model: up to 196 components on most models, 39 on the Portal+ (1st generation) and 14 on Portal TV. It also turns Android Private DNS off, so the Portal uses the DNS server supplied by the local network, including private LAN hostnames, and disables Meta's app verifier, so correctly signed third-party and other non-Meta apps can update normally.
-- `--remove-meta-accounts` — remove local Meta accounts. **One-way** (see [What can't be undone](#what-cant-be-undone)).
+- `--remove-meta-accounts` — remove local Meta accounts. **One-way** (see [What can't be undone](#what-cant-be-undone)). Never part of a preset other than `--full`, and always a deliberate step.
 - `--optimize-presence` — reduce AIService CPU use while preserving full-view, LED-free person detection.
-- `--disable-adb-auth-timeout` — keep already-approved ADB computers authorized indefinitely. A new computer must still be approved on the Portal; this does not disable ADB authentication.
-
-### Standalone
-
-- `--persistent-wireless-adb` — apply only persistent wireless ADB (port 5555) plus the authorization-timeout change above, and nothing else. Wireless ADB persistence is also installed automatically whenever another privileged provisioning action runs.
-
-### Optional add-ons
-
 - `--presence-fps-cap N` — cap Meta's presence-analysis frame rate (with `--optimize-presence`) without limiting the camera's capture rate.
-- `--system-theme-control light|dark` — enable live light/dark theme control on locked Android 10 Portals and set the theme.
-- `--shizuku` — install Shizuku and start it automatically after every boot. `--shizuku-apk PATH` uses a specific Shizuku APK; `--remove-shizuku` removes Shizuku again.
+- `--disable-adb-auth-timeout` — keep already-approved ADB computers authorized indefinitely. A new computer must still be approved on the Portal; this does not disable ADB authentication.
+- `--persistent-wireless-adb` — apply only persistent wireless ADB (port 5555) plus the authorization-timeout change above, and nothing else. Wireless ADB persistence is also installed automatically whenever another privileged provisioning action runs.
+- `--system-theme-control light|dark` — enable live light/dark theme control on locked Android 10 Portals and set the theme. (The Portal's own settings offer no system dark-theme switch on these builds — the Display panel's Night Mode is a dimming feature, not the Android theme — so the tool provides it.)
+
+### Root access modes
+
+- `--shizuku` — install Shizuku and start it automatically after every boot, giving apps ADB-shell privileges. `--shizuku-apk PATH` uses a specific Shizuku APK; `--remove-shizuku` removes Shizuku again.
 - `--autoroot` — re-run the exploit automatically after every reboot and restore the root daemon and root-mode Shizuku with no host involved. Implies `--shizuku` and the root-daemon step. During each boot's root window the root daemon listens on loopback (127.0.0.1:37373) with no authentication — any app on the Portal that can open a loopback connection can run commands as UID 0 while it is up; it is stopped once root-mode Shizuku is verified, and it never survives the boot on its own. A session allows up to 8 attempts in a 60-minute window. Attempts that start but never finish count against a failure budget: After 10 such boots in a row, the on-device helper turns autoroot off by itself and posts a notification instead of crash-looping the Portal. Open the helper from the notification to re-enable it; the budget re-arms, so a fault that is still there turns autoroot off again after 10 more bad boots. The helper app also shows the session state and offers stop, disable/enable and run-now controls. Validated end-to-end on the Portal+ (`aloha`) build; other supported models have not been validated for this mode.
+- `--skip-shizuku-root` — with `--autoroot`, keep Shizuku in its normal shell mode instead of restarting it as UID 0 through the root daemon.
 
 ### Run controls
 
-- `--serial SERIAL` — the ADB serial to talk to (a USB serial or `IP:5555`).
+- `--connect` — guided connect (see step 3): find the USB-connected Portal, switch it to wireless ADB, read its Wi-Fi address and connect. Combined with action flags, the run continues on that connection; on its own it just connects and prints the serial.
+- `--serial SERIAL` — the ADB serial to talk to: a USB serial, `IP:5555`, or a bare IP address (`:5555` is added). With no `--serial`, the only connected device is used.
 - `--attempts N` — maximum exploit attempts per phase (default 12, between 1 and 100).
 - `--verify-boots N` — verification boots after a run (default 1; `2` adds a second distinct verification boot).
 - `--force` — redo the full race-based provisioning even on an already provisioned Portal (see [Troubleshooting](#troubleshooting)).
 - `--log-dir DIR` — where attempt logs are written (default: a timestamped directory in the system temp folder).
+- `--bundle PATH` — provision from a prebuilt bundle (directory or archive) instead of building from source. Detected automatically when running from inside an extracted bundle.
+- `--skip-build` — skip the source build and use outputs already built (source checkouts only).
 
 ## Restoring changes
 
