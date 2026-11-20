@@ -79,15 +79,15 @@ jobs:
           printf '%s' "${RELEASE_SIGNING_KEY_PEM_B64}" | base64 -d > "${KEY_FILE}"
           chmod 600 "${KEY_FILE}"
           python3 tools/build_release_bundle.py \
-            --output dist --sign-key "${KEY_FILE}" --tarball --zip
+            --output dist --sign-key "${KEY_FILE}" --zip
           rm -f "${KEY_FILE}"
-          (cd dist && sha256sum portal-provisioner-bundle-*.tar.gz portal-provisioner-bundle-*.zip > SHA256SUMS)
+          (cd dist && sha256sum portal-provisioner-bundle-*.zip > SHA256SUMS)
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/portal-provisioner-bundle-*.tar.gz dist/portal-provisioner-bundle-*.zip dist/SHA256SUMS \
+            dist/portal-provisioner-bundle-*.zip dist/SHA256SUMS \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
