@@ -1,10 +1,17 @@
 name: Release
 
-# Tag-driven: pushing a tag like v1.0.0 builds every target's
-# binaries from a clean checkout and publishes them as a GitHub
-# release with SHA-256 checksums. The tag must match
-# PROVISIONER_VERSION in tools/provision_portal.py (with the leading
-# "v"); a "-dev" version can never be released.
+# Tag-driven: pushing a tag like v0.9.0 builds every target's
+# payload plus the model-independent APK set into ONE prebuilt
+# bundle with a SHA-256 hash manifest, signs the manifest with the
+# project release signing key (CI secret RELEASE_SIGNING_KEY_PEM_B64;
+# the certificate is committed as release-signing-cert.pem and its
+# fingerprint is pinned in tools/prebuilt_bundle.py), and publishes
+# the bundle as a GitHub release. A provisioner run with --bundle
+# verifies the manifest against the device's target and installs the
+# artifacts in place of a local build, so a user needs only Python
+# and adb. The tag must match PROVISIONER_VERSION in
+# tools/provision_portal.py (with the leading "v"); a "-dev" version
+# can never be released.
 on:
   push:
     tags: ["v*"]
@@ -48,70 +55,33 @@ jobs:
         run: |
           sdkmanager "ndk;28.2.13676358" "build-tools;37.0.0" "platforms;android-36"
 
-      # The helper Makefiles sign APKs with the standard debug
-      # keystore, exactly as a local from-source build does today.
-      - name: Create debug keystore for APK signing
+      # The bundle script builds through the provisioner's own
+      # build(), so CI produces exactly what a local run produces:
+      # every target, every optional component on. APKs are signed
+      # with the committed project debug keystore (the build
+      # enforces its fingerprint), so bundle APKs install as updates
+      # on devices provisioned from source.
+      - name: Build and sign the prebuilt bundle
+        env:
+          RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.RELEASE_SIGNING_KEY_PEM_B64 }}
         run: |
-          mkdir -p "$HOME/.android"
-          keytool -genkeypair -v \
-            -keystore "$HOME/.android/debug.keystore" \
-            -storepass android -keypass android \
-            -alias androiddebugkey -keyalg RSA -keysize 2048 \
-            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-
-      # Build through the provisioner's own build() so CI produces
-      # exactly what a local run produces: every target, every
-      # optional component on.
-      - name: Build all targets and helpers
-        run: |
-          python3 - <<'PYEOF'
-          import sys
-          sys.path.insert(0, "tools")
-          from portal_targets import TARGETS
-          from provision_portal import build
-
-          seen = set()
-          for target in TARGETS:
-              if target.key in seen:
-                  continue
-              seen.add(target.key)
-              build(
-                  target,
-                  build_audio=True,
-                  build_account=True,
-                  build_components=True,
-                  build_shizuku=True,
-                  build_autoroot=True,
-                  build_presence=True,
-                  build_uid1000=True,
-                  build_sentinel=True,
-                  build_daemon=True,
-              )
-          print(f"built {len(seen)} targets")
-          PYEOF
-
-      - name: Package binaries with SHA-256 checksums
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          DIST="portal-root-provisioner-${VERSION}"
-          mkdir -p "dist/${DIST}"
-          # All build outputs (exploit libraries, helper APKs, the
-          # root daemon) land in per-component build/ directories.
-          find . -path ./dist -prune -o -type d -name build -print |
-          while read -r dir; do
-            mkdir -p "dist/${DIST}/${dir}"
-            cp -r "${dir}/." "dist/${DIST}/${dir}/"
-          done
-          cp -r tools dist/"${DIST}"/tools
-          cp README.md FORK.md CHANGELOG.md LICENSE NOTICE dist/"${DIST}"/
-          tar -czf "dist/${DIST}-binaries.tar.gz" -C dist "${DIST}"
-          (cd dist && sha256sum "${DIST}-binaries.tar.gz" > SHA256SUMS)
+          if [ -z "${RELEASE_SIGNING_KEY_PEM_B64}" ]; then
+            echo "RELEASE_SIGNING_KEY_PEM_B64 secret is not set" >&2
+            exit 1
+          fi
+          KEY_FILE="${RUNNER_TEMP}/release-signing-key.pem"
+          printf '%s' "${RELEASE_SIGNING_KEY_PEM_B64}" | base64 -d > "${KEY_FILE}"
+          chmod 600 "${KEY_FILE}"
+          python3 tools/build_release_bundle.py \
+            --output dist --sign-key "${KEY_FILE}" --tarball
+          rm -f "${KEY_FILE}"
+          (cd dist && sha256sum portal-provisioner-bundle-*.tar.gz > SHA256SUMS)
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/*-binaries.tar.gz dist/SHA256SUMS \
+            dist/portal-provisioner-bundle-*.tar.gz dist/SHA256SUMS \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

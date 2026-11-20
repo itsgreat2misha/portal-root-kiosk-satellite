@@ -14,6 +14,20 @@ the fork diverged from upstream:
 
 ### Added
 
+- Prebuilt release bundle (Phase E): release CI builds all five
+  target payloads plus the model-independent APK set into one bundle
+  with a SHA-256 hash manifest (`tools/build_release_bundle.py`),
+  and a new `--bundle PATH` flag runs the provisioner from it — the
+  manifest is verified against the device's selected target
+  (fingerprint match, per-file hashes, fail-closed on a missing or
+  mismatched payload) and the artifacts are installed in place of
+  the local build, so a bundle run needs only Python and adb on the
+  host. Release bundles carry a detached signature over the manifest
+  made with the new project release signing key (private key in CI
+  secrets only; the certificate is committed as
+  `release-signing-cert.pem` and its fingerprint is pinned in
+  `tools/prebuilt_bundle.py`). The version line moves to 0.9.x for
+  the fork's preview releases.
 - Per-boot recorded-state drift pass (Phase C3-A): after autoroot
   recovers root, the helper (1.12, versionCode 13) compares the
   live device against the end state recorded in `autoroot.conf`

@@ -200,6 +200,7 @@ class CliDefaultsTest(unittest.TestCase):
                 "audio": True,
                 "restore_audio": False,
                 "skip_build": False,
+                "bundle": None,
                 "force": False,
                 "shizuku": False,
                 "remove_shizuku": False,
@@ -609,6 +610,7 @@ class MainConfigMappingTest(unittest.TestCase):
                 "backup_path": pathlib.Path("/tmp/backup.tar.gz"),
                 "recover": False,
                 "skip_build": True,
+                "bundle": None,
                 "force": False,
                 "persistent_wireless_adb": True,
                 # Implied by --persistent-wireless-adb in parse_args.
@@ -754,6 +756,7 @@ class ConstructorConfigMappingTest(unittest.TestCase):
                 "backup_path": pathlib.Path("/tmp/b"),
                 "recover": True,
                 "skip_build": True,
+                "bundle": None,
                 "restore_adb_auth_timeout": True,
                 "wireless_adb_only": True,
                 "adb_framework_only": True,
