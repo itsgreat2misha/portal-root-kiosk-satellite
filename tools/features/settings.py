@@ -83,6 +83,16 @@ META_AUTHENTICATOR_COMPONENTS = (
     "com.facebook.aloha.system.alohausers.services2."
     "PrivOwnerAccountsAuthenticatorService",
 )
+#: The package the authenticator components live in. The tuple
+#: above is class-only because the component backup and the
+#: disabled-state reads key on class names, but PortalComponentCtl
+#: validates each actions-file entry against
+#: ComponentName.flattenToString() and rejects a bare class name
+#: ("invalid component"), so the actions writer must emit the
+#: flattened package/class form every other component list in
+#: this codebase already uses. The backup records the package per
+#: component; this is the fallback when it holds no record.
+META_AUTHENTICATOR_PACKAGE = "com.facebook.alohaservices.alohausers"
 META_HARDWARE_AUTHENTICATOR = (
     "com.facebook.alohaservices.alohausers/"
     "com.facebook.aloha.system.alohausers.services2.HWAuthenticatorService"
@@ -892,13 +902,15 @@ class SettingsFeature:
                 # the components --remove-meta-accounts disabled.)
                 recorded = self._read_component_backup(required=False)
                 for component in META_AUTHENTICATOR_COMPONENTS:
+                    package = META_AUTHENTICATOR_PACKAGE
                     state = "enabled"
                     if recorded is not None and component in recorded:
-                        _, state = recorded[component]
+                        package, state = recorded[component]
                     if state == "absent":
                         continue
                     actions.append(
-                        f"{restore_component_action(state)}\t{component}\n"
+                        f"{restore_component_action(state)}"
+                        f"\t{package}/{component}\n"
                     )
                 modes.append("meta-authenticators-restore")
             self._push_text_atomic(

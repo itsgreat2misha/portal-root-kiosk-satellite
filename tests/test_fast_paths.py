@@ -729,6 +729,13 @@ class ComponentDevice:
         )
         self.permission_dialog = False
         self.taps: list[str] = []
+        # The executor's on-device capture: when a capture is
+        # scripted (single value or a pop-list), the jar run's
+        # transport result is the real rish shape — empty stdout,
+        # exit 0 — and only the capture file carries the jar's
+        # own output and exit code.
+        self.ctl_capture: str | None = None
+        self.ctl_captures: list = []
 
     def adb_run(self, arguments, timeout=None, check=False):
         del timeout, check
@@ -773,7 +780,19 @@ class ComponentDevice:
                 stdout, returncode = self.rish_probe_results.pop(0)
                 return completed(arguments, stdout, returncode)
             return completed(arguments, "uid=0(root) gid=0(root)\n", 0)
+        if "cat /data/local/tmp/portal-component-ctl/last-run.out" in (
+            command
+        ):
+            if self.ctl_captures:
+                return completed(arguments, self.ctl_captures.pop(0), 0)
+            if self.ctl_capture is not None:
+                return completed(arguments, self.ctl_capture, 0)
+            return completed(arguments, "", 1)
         if "PortalComponentCtl" in command:
+            if self.ctl_captures or self.ctl_capture is not None:
+                # The real transport shape: the jar's output went
+                # to the capture file; rish itself returns nothing.
+                return completed(arguments, "", 0)
             if self.rish_results:
                 stdout, returncode = self.rish_results.pop(0)
                 return completed(arguments, stdout, returncode)
@@ -803,7 +822,19 @@ class ChannelComponentExecutionTest(unittest.TestCase):
     manager and shell for deviceidle, persists the grant in
     the server config, and probes the transport — tapping the
     dialog's Allow or starting the manager by failure shape —
-    before the jar runs."""
+    before the jar runs.
+
+    The transport also cannot carry the jar's result (session
+    15): it returns only the remote command's stdout and exit
+    0 whatever the command's real exit code, and stderr never
+    arrives, while the jar sends every failure to stderr with
+    exit 1 — a failed run therefore presented as exit=0 with
+    empty output. The executor captures the jar's output and
+    exit code to a file on the device and reads it back; the
+    staged actions must also name components in the flattened
+    package/class form the jar validates (the meta-authenticator
+    restore wrote bare class names and the jar rejected the
+    first line, invisibly, in session 15)."""
 
     def _executor_provisioner(self, temporary: str, device, **kwargs):
         import provision_portal as pp_module
@@ -875,6 +906,112 @@ class ChannelComponentExecutionTest(unittest.TestCase):
                 "/data/local/tmp/portal-debloat-components-actions-v1.tsv "
                 "none",
                 run_command,
+            )
+
+    def test_component_ctl_command_shape_is_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.ctl_capture = (
+                "PORTAL_COMPONENT_CTL_OK changed=3\n"
+                "PORTAL_COMPONENT_CTL_RC=0\n"
+            )
+            provisioner = self._executor_provisioner(temporary, device)
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(io.StringIO()):
+                provisioner.execute_component_actions()
+            run = next(
+                command
+                for command in device.commands
+                if "PortalComponentCtl" in command
+                and "rish" in command
+            )
+            self.assertEqual(
+                run,
+                "shell sh /data/local/tmp/rish -c "
+                "'CLASSPATH=/data/local/tmp/portal-component-ctl.jar "
+                "/system/bin/app_process64 /system/bin PortalComponentCtl "
+                "/data/local/tmp/portal-debloat-components-actions-v1.tsv "
+                "none "
+                "> /data/local/tmp/portal-component-ctl/last-run.out "
+                "2>&1; "
+                "echo PORTAL_COMPONENT_CTL_RC=$? "
+                ">> /data/local/tmp/portal-component-ctl/last-run.out'",
+            )
+            cat = next(
+                index
+                for index, command in enumerate(device.commands)
+                if "cat /data/local/tmp/portal-component-ctl/last-run.out"
+                in command
+            )
+            self.assertLess(device.commands.index(run), cat)
+
+    def test_component_ctl_capture_drives_success(self) -> None:
+        # The transport returns empty stdout and exit 0 (the fake
+        # models the real rish shape once a capture is scripted);
+        # only the captured jar output can prove the run.
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.ctl_capture = (
+                "PORTAL_COMPONENT_CTL_OK changed=3\n"
+                "PORTAL_COMPONENT_CTL_RC=0\n"
+            )
+            provisioner = self._executor_provisioner(temporary, device)
+            stdout = io.StringIO()
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(stdout):
+                provisioner.execute_component_actions()
+            self.assertIn(
+                "COMPONENT_CTL_EXECUTED transport=shizuku-root "
+                "PORTAL_COMPONENT_CTL_OK changed=3",
+                stdout.getvalue(),
+            )
+
+    def test_component_ctl_failure_surfaces_captured_error(self) -> None:
+        import provision_portal as pp_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.ctl_capture = (
+                "PORTAL_COMPONENT_CTL_ERROR changed=0 "
+                "error=java.lang.IllegalArgumentException: "
+                "invalid component: com.example.Nope\n"
+                "PORTAL_COMPONENT_CTL_RC=1\n"
+            )
+            provisioner = self._executor_provisioner(temporary, device)
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(io.StringIO()):
+                with self.assertRaises(pp_module.ProvisionError) as raised:
+                    provisioner.execute_component_actions()
+            message = str(raised.exception)
+            self.assertIn("exit=1", message)
+            self.assertIn("invalid component: com.example.Nope", message)
+
+    def test_component_ctl_retries_on_captured_127(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            device = ComponentDevice()
+            device.ctl_captures = [
+                "PORTAL_COMPONENT_CTL_RC=127\n",
+                "PORTAL_COMPONENT_CTL_OK changed=3\n"
+                "PORTAL_COMPONENT_CTL_RC=0\n",
+            ]
+            provisioner = self._executor_provisioner(temporary, device)
+            with unittest.mock.patch(
+                "time.sleep", lambda seconds: None
+            ), redirect_stdout(io.StringIO()):
+                provisioner.execute_component_actions()
+            runs = [
+                command
+                for command in device.commands
+                if "PortalComponentCtl" in command and "rish" in command
+            ]
+            self.assertEqual(len(runs), 2)
+            self.assertIn("/system/bin/app_process64", runs[0])
+            self.assertIn(
+                "/system/bin/app_process /system/bin PortalComponentCtl",
+                runs[1],
             )
 
     def test_rish_transport_prep_whitelists_grants_and_probes(self) -> None:
