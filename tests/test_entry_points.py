@@ -137,7 +137,9 @@ class MainEntryTest(unittest.TestCase):
                 ["--serial", "192.0.2.1:5555", "--status"], tree=tree
             )
         self.assertEqual(result, 0)
-        self.assertEqual(constructed[0][1]["bundle"], tree)
+        # main() resolves the tree root (macOS /var -> /private/var,
+        # Windows short names), so compare resolved forms.
+        self.assertEqual(constructed[0][1]["bundle"], tree.resolve())
         self.assertIn("release bundle", stderr)
 
     def test_no_manifest_no_bundle_default(self) -> None:
