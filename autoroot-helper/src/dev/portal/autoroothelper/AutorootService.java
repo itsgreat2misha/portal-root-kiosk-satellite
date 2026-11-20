@@ -1208,11 +1208,42 @@ public final class AutorootService extends Service {
     // ---- root daemon --------------------------------------------------
 
     private boolean daemonServingRoot() {
-        try {
-            String response = daemonRequest("ID\n", 1);
-            return response != null && response.startsWith("ID uid=0");
-        } catch (Exception ignored) {
-            return false;
+        // Retry briefly: the daemon may still be binding when the
+        // attempt's verdict is read. Log the failure reason so a
+        // "daemon absent" report is actionable (port state, exception).
+        String lastReason = "no-attempt";
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                String response = daemonRequest("ID\n", 1);
+                if (response != null && response.startsWith("ID uid=0")) {
+                    return true;
+                }
+                lastReason = "unexpected-response="
+                        + (response == null ? "null" : response.trim());
+            } catch (Exception e) {
+                lastReason = "exception=" + e.getClass().getSimpleName()
+                        + ":" + e.getMessage();
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        logFile("daemon check failed reason=" + lastReason
+                + " port=" + daemonPortState());
+        return false;
+    }
+
+    /** TCP reachability of the daemon port, for diagnostics only. */
+    private String daemonPortState() {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(
+                    InetAddress.getByName("127.0.0.1"), DAEMON_PORT), 500);
+            return "listening";
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + ":" + e.getMessage();
         }
     }
 

@@ -39,6 +39,15 @@ now sweeps on the win-stall schedule; the daemon-absent fail
 still cuts, and genuine fail verdicts still read as failures
 in the attempt-scoped tail (both pinned below).
 
+Daemon check evidence (2026-11-20, ported from PR #49): the
+daemon-presence check behind those decisions
+(daemonServingRoot) probed once and swallowed every failure,
+so "daemon absent" carried no evidence and a daemon still
+binding could read as absent. It now retries the ID probe
+up to three times and logs the failure reason plus a TCP
+reachability probe of the daemon port before reporting
+absent; the retry and the evidence log are pinned below.
+
 The policy itself is pure Java (AttemptWatchdog). When a JDK is
 available these tests compile and execute the real decision
 table; the source-shape tests always run and pin the wiring:
@@ -332,6 +341,34 @@ class WatchdogWiringTest(unittest.TestCase):
             self.service.index("// ---- failure budget")
         ]
         self.assertEqual(method.count("client.close()"), 1)
+
+    def test_daemon_check_retries_and_logs_evidence(self) -> None:
+        # The daemon check behind the post-verdict cut and the
+        # fail-stall sweep: it must not be the old single-shot
+        # probe that swallowed its exception and reported
+        # "absent" with no evidence. It retries the ID probe
+        # (the daemon may still be binding when the verdict is
+        # read) and, on giving up, logs the failure reason and
+        # the daemon port's reachability.
+        method = self.service[
+            self.service.index("private boolean daemonServingRoot()") :
+            self.service.index("private boolean shizukuServingRoot()")
+        ]
+        self.assertIn("for (int attempt = 0; attempt < 3; attempt++)", method)
+        self.assertIn('daemonRequest("ID\\n", 1)', method)
+        self.assertIn("Thread.sleep(500)", method)
+        self.assertIn("daemon check failed reason=", method)
+        self.assertIn("daemonPortState()", method)
+        self.assertNotIn("catch (Exception ignored)", method)
+        # The port probe is diagnostics only: a 500 ms TCP
+        # connect to the daemon port on loopback, reporting
+        # "listening" or the exception it hit.
+        probe = self.service[
+            self.service.index("private String daemonPortState()") :
+            self.service.index("private boolean shizukuServingRoot()")
+        ]
+        self.assertIn("DAEMON_PORT), 500)", probe)
+        self.assertIn('"listening"', probe)
 
     def test_attempt_timeout_and_provision_path_unchanged(self) -> None:
         # The 600 s runner timeout stays; the watchdog only stops
