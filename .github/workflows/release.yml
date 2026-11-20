@@ -56,8 +56,10 @@ jobs:
       # cmdline-tools distributions.
       - name: Install pinned Android SDK components
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "ndk;28.2.13676358" "build-tools;37.0.0" "platforms;android-36"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;28.2.13676358" "build-tools;37.0.0" "platforms;android-36"
 
       # The bundle script builds through the provisioner's own
       # build(), so CI produces exactly what a local run produces:
