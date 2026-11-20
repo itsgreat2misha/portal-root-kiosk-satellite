@@ -38,6 +38,27 @@ jobs:
             exit 1
           fi
       - name: Run unit tests
+        if: runner.os != 'Windows'
         run: python -m unittest discover -s tests -v
+      # DIAGNOSTIC (temporary, not for merge): per-group steps on
+      # Windows so the failing modules are visible from job results.
+      - name: Win tests group 1
+        if: runner.os == 'Windows'
+        run: python -m unittest tests.test_adbkey_rotation tests.test_autoroot_failure_budget tests.test_autoroot_flows tests.test_autoroot_guard
+      - name: Win tests group 2
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_autoroot_orphan_sweep tests.test_autoroot_watchdog tests.test_boot_flush_guard tests.test_c3a_drift_pass
+      - name: Win tests group 3
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_collect_diagnostics tests.test_cross_platform tests.test_deferred_failures tests.test_device_session
+      - name: Win tests group 4
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths tests.test_flag_consolidation tests.test_m0_characterization
+      - name: Win tests group 5
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_mha_tuning tests.test_ota_nodemon tests.test_portal_targets tests.test_prebuilt_bundle
+      - name: Win tests group 6
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_provision_portal_cli tests.test_watch_result_evidence tests.test_wifi_flush_guard
       - name: Byte-compile all Python sources
         run: python -m compileall -q tools tests
