@@ -181,6 +181,12 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The release workflow's Android SDK setup: the setup-android
+  action's internal sdkmanager call for the legacy `tools`
+  package fails on current cmdline-tools distributions, so the
+  workflow now installs the pinned SDK components directly from
+  the runner image's SDK (first exercised by the v0.9.0 tag run,
+  Nov 20, 2026).
 - A won autoroot race whose verdict line a late post-root
   action failure flipped to FAIL wedged the on-device cycle
   until the 600 s runner timeout (Defect N, Phase D closure

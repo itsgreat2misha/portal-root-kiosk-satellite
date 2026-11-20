@@ -49,10 +49,14 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
+      # The runner image ships an Android SDK (ANDROID_SDK_ROOT is
+      # set); install the pinned components directly. The
+      # setup-android action is not used: its internal sdkmanager
+      # call for the legacy 'tools' package fails on current
+      # cmdline-tools distributions.
       - name: Install pinned Android SDK components
         run: |
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "ndk;28.2.13676358" "build-tools;37.0.0" "platforms;android-36"
 
       # The bundle script builds through the provisioner's own
