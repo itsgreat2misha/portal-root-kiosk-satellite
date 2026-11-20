@@ -231,6 +231,11 @@ python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" \
 To apply only some features, drop `--full` and combine the individual
 flags you want; each is explained under [Feature flags](#feature-flags).
 
+A smaller preset, `--strip-meta`, applies just the Meta-control
+removal set (`--block-remote-wipe --debloat --disable-updates`): no
+root, and it does not remove Meta accounts — that stays a separate,
+explicit `--remove-meta-accounts` step.
+
 The Portal reboots several times and ends with `PROVISION_OK` plus the
 verification boot ID (two different boot IDs with `--verify-boots 2`).
 
