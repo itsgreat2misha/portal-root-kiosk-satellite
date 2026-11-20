@@ -14,6 +14,19 @@ the fork diverged from upstream:
 
 ### Added
 
+- First-run ergonomics: a plain-language pre-flight summary of
+  what a run will do (naming the one-way Meta account removal
+  when it is in the run, and debloat's contents in plain words),
+  with an interactive Continue? prompt on a terminal before the
+  first change; `--serial` accepts a bare IP address (`:5555` is
+  added) and falls back to the only connected device, with
+  errors listing what `adb devices` sees; a missing `adb` is a
+  human preflight error instead of a raw errno; the first
+  connect wait explains what is wrong while it waits
+  (unauthorized → tap Allow, refused → ADB not enabled, silence
+  → address/network check) and the final error says what to do;
+  running from inside an extracted release bundle defaults to
+  that bundle.
 - `--strip-meta`, a preset for the Meta-control removal set:
   `--block-remote-wipe --debloat --disable-updates` in one run.
   No root, and it deliberately does not remove Meta accounts;

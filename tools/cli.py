@@ -21,6 +21,9 @@ import argparse
 import dataclasses
 import datetime as dt
 import pathlib
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -120,8 +123,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         "--serial",
         default=None,
         help=(
-            "adb serial of the target Portal (required), e.g. "
-            "192.0.2.1:5555 for wireless adb or a USB serial"
+            "adb serial of the target Portal, e.g. 192.0.2.1:5555 for "
+            "wireless adb or a USB serial; a bare IP address gets "
+            ":5555 added, and with no --serial the only connected "
+            "device is used"
         ),
     )
     parser.add_argument("--attempts", type=int, default=12)
@@ -572,17 +577,86 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     return args
 
 
+_IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _adb_devices() -> list[tuple[str, str]]:
+    """(serial, state) pairs `adb devices` reports; empty when adb
+    is missing or the listing fails."""
+    adb = shutil.which("adb")
+    if adb is None:
+        return []
+    try:
+        result = subprocess.run(
+            [adb, "devices"], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pairs = []
+    for line in result.stdout.splitlines():
+        serial, separator, state = line.partition("\t")
+        if separator and state.strip():
+            pairs.append((serial.strip(), state.strip()))
+    return pairs
+
+
+def _resolve_serial(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Resolve the target serial: (serial, None) or (None, error).
+
+    A bare IPv4 address gains the default wireless-ADB port. With
+    no --serial, the only connected device is used; anything else
+    is an error that lists what adb currently sees.
+    """
+    serial = (args.serial or "").strip()
+    if serial:
+        if _IPV4_PATTERN.match(serial):
+            serial = f"{serial}:5555"
+        return serial, None
+    devices = _adb_devices()
+    usable = [item for item, state in devices if state == "device"]
+    if len(usable) == 1:
+        print(
+            f"Using the only connected Portal: {usable[0]}",
+            file=sys.stderr,
+        )
+        return usable[0], None
+    seen = ", ".join(f"{item} ({state})" for item, state in devices) or "none"
+    return None, (
+        "--serial is required; pass the target Portal's adb serial "
+        f"(e.g. --serial 192.0.2.1:5555). adb currently sees: {seen}"
+    )
+
+
 def main(
     config: CliConfig, provisioner_factory: Callable[..., Any]
 ) -> int:
     args = parse_args(config)
-    if not args.serial:
+    serial, serial_error = _resolve_serial(args)
+    if serial is None:
+        print(f"PROVISION_ERROR: {serial_error}", file=sys.stderr)
+        return 2
+    if shutil.which("adb") is None:
         print(
-            "PROVISION_ERROR: --serial is required; pass the target Portal's "
-            "adb serial (e.g. --serial 192.0.2.1:5555)",
+            "PROVISION_ERROR: adb was not found on your PATH. Install "
+            "the Android platform-tools (they provide adb), make sure "
+            "adb is on your PATH, and run this again.",
             file=sys.stderr,
         )
         return 2
+    bundle = args.bundle
+    if bundle is None:
+        # Running from inside an extracted release bundle: default
+        # to that bundle instead of falling into the source-build
+        # path, which would demand a toolchain the bundle user
+        # does not have.
+        tree_root = pathlib.Path(__file__).resolve().parent.parent
+        if (tree_root / "bundle-manifest.json").is_file():
+            bundle = tree_root
+            print(
+                f"Using the release bundle in {tree_root} "
+                "(bundle-manifest.json found next to the tool)",
+                file=sys.stderr,
+            )
     print(config.banner, file=sys.stderr, flush=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = args.log_dir or (
@@ -591,7 +665,7 @@ def main(
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
         provisioner_factory(
-            args.serial,
+            serial,
             args.attempts,
             log_dir,
             audio=args.audio,
@@ -628,7 +702,7 @@ def main(
             backup_path=args.backup,
             recover=args.recover,
             skip_build=args.skip_build,
-            bundle=args.bundle,
+            bundle=bundle,
             force=args.force,
             persistent_wireless_adb=args.persistent_wireless_adb,
             disable_adb_auth_timeout=args.disable_adb_auth_timeout,
