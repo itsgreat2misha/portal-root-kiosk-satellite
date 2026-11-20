@@ -52,6 +52,30 @@ package dev.portal.autoroothelper;
  * one grace period apart - instead of holding the handoff until
  * the timeout edge. The 600 s timeout remains the backstop.
  *
+ * Fail-stall sweep (2026-11-19, Phase D closure session 19):
+ * the native verdict line reports the whole post-root action
+ * chain, not just the race - one line per attempt, written
+ * after the actions run - so a late non-race action failure
+ * flips a WON race's only verdict line to FAIL. Observed on
+ * two consecutive host-free boots of a freshly restaged set:
+ * the segment's last line was WATCH_CFI_OK=0 STEP=151
+ * (audio persistence; ERRNO=111, then ERRNO=30) printed AFTER
+ * PORTAL_LOCK_REPAIR_OK, OTA_NODEMON_SET and
+ * PORTAL_CUSTOM_PAYLOAD_STARTED, with the root daemon up.
+ * The watchdog latched FAIL, correctly refused to cut (daemon
+ * present), and then had nothing to do: the win-stall sweep
+ * requires a WIN verdict, so the leftover tree held the
+ * foreground call to its 600 s socket timeout and the
+ * Shizuku handoff waited with it (on one boot the device
+ * rebooted first, leaving the budget mark open for the next
+ * boot to recover - as a clean loss). A FAIL verdict with
+ * the daemon serving is therefore swept on the same schedule
+ * and bound as a win stall: the verdict is in, the daemon's
+ * presence proves the attempt's real work completed, and
+ * the tree is debris by the OrphanSweep argument. The
+ * daemon-absent fail still cuts instead, exactly as before,
+ * and the verdict and its accounting are untouched.
+ *
  * Pure logic, no Android dependencies, so the policy is unit
  * testable off-device.
  */
@@ -60,6 +84,7 @@ final class AttemptWatchdog {
     static final long FAIL_GRACE_MS = 30_000L;
     static final long WIN_SWEEP_GRACE_MS = 120_000L;
     static final int WIN_SWEEP_MAX = 2;
+    static final int FAIL_SWEEP_MAX = 2;
     static final String VERDICT_MARKER = "WATCH_CFI_OK=";
 
     static final int VERDICT_NONE = -1;
@@ -108,6 +133,35 @@ final class AttemptWatchdog {
             return false;
         }
         return sinceWinVerdictMs >= WIN_SWEEP_GRACE_MS * (sweepsDone + 1);
+    }
+
+    /**
+     * True when a fail-verdict attempt whose root daemon IS
+     * serving should have its leftover process tree swept from
+     * the watchdog thread: the win-stall schedule and bound,
+     * plus the daemon-present condition. The verdict line
+     * reports the whole post-root action chain, so a late
+     * non-race action failure flips a won race's only verdict
+     * line to FAIL (see the class comment); with the daemon
+     * serving, the attempt's real work demonstrably completed
+     * and the tree is debris, but the attempt is never cut -
+     * without the sweep it holds the foreground call, and
+     * with it the Shizuku handoff, to the 600 s socket
+     * timeout. Never true without a fail verdict, never true
+     * while the daemon is absent (that attempt is cut
+     * instead), and never once the call has returned. This
+     * is not a cut: the verdict and its accounting are
+     * untouched, only the orphaned tree is collected early.
+     */
+    static boolean shouldSweepFailStall(int verdict, boolean daemonPresent,
+            long sinceFailVerdictMs, int sweepsDone, boolean callReturned) {
+        if (verdict != VERDICT_FAIL || !daemonPresent || callReturned) {
+            return false;
+        }
+        if (sweepsDone < 0 || sweepsDone >= FAIL_SWEEP_MAX) {
+            return false;
+        }
+        return sinceFailVerdictMs >= WIN_SWEEP_GRACE_MS * (sweepsDone + 1);
     }
 
     /** True when the given attempt.log tail contains a race verdict. */

@@ -27,6 +27,18 @@ WIN verdict is 120 s old and the call is still outstanding,
 and once more 120 s later; a win is still never cut, and the
 sweep outcome is logged whether or not anything was killed.
 
+Fail-stall sweep (Defect N, 2026-11-19): the native verdict
+line reports the whole post-root action chain, so on two
+consecutive host-free boots a won race's only verdict line
+read FAIL - WATCH_CFI_OK=0 STEP=151 (audio persistence)
+printed after the payload started, with the root daemon up.
+The watchdog latched FAIL, never cut (daemon present), and
+had no sweep to run, so the handoff waited out the full
+600 s socket timeout. A fail verdict with the daemon serving
+now sweeps on the win-stall schedule; the daemon-absent fail
+still cuts, and genuine fail verdicts still read as failures
+in the attempt-scoped tail (both pinned below).
+
 The policy itself is pure Java (AttemptWatchdog). When a JDK is
 available these tests compile and execute the real decision
 table; the source-shape tests always run and pin the wiring:
@@ -134,6 +146,63 @@ public final class WatchdogHarness {
         check(AttemptWatchdog.WIN_SWEEP_GRACE_MS == 120_000L,
                 "win sweep grace is not 120 s");
         check(AttemptWatchdog.WIN_SWEEP_MAX == 2, "win sweep max is not 2");
+        // Scoped verdict reads (the session-19 misread shape):
+        // attempt.log accumulates every attempt's segment, and
+        // the service reads only the current attempt's segment
+        // (the tail from the offset recorded at its start).
+        // Model the accumulated log: an earlier attempt's fail
+        // segment ahead of the current attempt's segment. An
+        // unscoped read of the whole log returns the earlier
+        // attempt's fail while the current attempt has written
+        // no verdict yet; the scoped tail reads NONE, then the
+        // current attempt's own win once it lands, and a
+        // genuine fail segment still reads FAIL.
+        String earlierFail = "AUTOROOT_ATTEMPT attempt=1\\n"
+                + "WATCH_CFI_OK=0 STEP=151 ERRNO=111 ROOT=0\\n";
+        String currentPending = "AUTOROOT_ATTEMPT attempt=2\\n";
+        check(AttemptWatchdog.verdictValue(earlierFail + currentPending) == 0,
+                "unscoped read should expose the stale fail");
+        check(AttemptWatchdog.verdictValue(currentPending) == -1,
+                "scoped tail without a verdict should be NONE");
+        check(AttemptWatchdog.verdictValue("AUTOROOT_ATTEMPT attempt=2\\n"
+                + "PORTAL_CUSTOM_PAYLOAD_STARTED ok=1\\n"
+                + "WATCH_CFI_OK=1 STEP=0 ERRNO=0 ROOT=1\\n") == 1,
+                "scoped tail should read the current attempt's win");
+        check(AttemptWatchdog.verdictValue("AUTOROOT_ATTEMPT attempt=2\\n"
+                + "WATCH_CFI_OK=0 STEP=151 ERRNO=111 ROOT=0\\n") == 0,
+                "scoped tail should still read a genuine fail");
+        // Fail-stall sweep: a fail verdict WITH the root daemon
+        // serving is a won race whose verdict line a late
+        // post-root action failure flipped; its leftover tree
+        // is swept on the win-stall schedule (120 s, 240 s,
+        // never a third). Daemon absent never sweeps (that
+        // attempt is cut instead); no fail verdict never
+        // sweeps; a returned call never sweeps.
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 0L, 0, false),
+                "fail sweep at the verdict instant");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 119_999L, 0, false),
+                "fail sweep inside the first grace");
+        check(AttemptWatchdog.shouldSweepFailStall(0, true, 120_000L, 0, false),
+                "no first fail sweep at grace end");
+        check(AttemptWatchdog.shouldSweepFailStall(0, true, 200_000L, 0, false),
+                "no first fail sweep when polled late");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 120_000L, 1, false),
+                "second fail sweep at the first grace");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 239_999L, 1, false),
+                "second fail sweep inside the second grace");
+        check(AttemptWatchdog.shouldSweepFailStall(0, true, 240_000L, 1, false),
+                "no second fail sweep at the second grace end");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 600_000L, 2, false),
+                "third fail sweep at the timeout edge");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, false, 600_000L, 0, false),
+                "fail sweep with daemon absent");
+        check(!AttemptWatchdog.shouldSweepFailStall(1, true, 600_000L, 0, false),
+                "fail sweep on a win verdict");
+        check(!AttemptWatchdog.shouldSweepFailStall(-1, true, 600_000L, 0, false),
+                "fail sweep with no verdict");
+        check(!AttemptWatchdog.shouldSweepFailStall(0, true, 600_000L, 0, true),
+                "fail sweep after the call returned");
+        check(AttemptWatchdog.FAIL_SWEEP_MAX == 2, "fail sweep max is not 2");
         System.out.println("WATCHDOG_HARNESS_OK");
     }
 }
@@ -232,6 +301,32 @@ class WatchdogWiringTest(unittest.TestCase):
         # The win-stall branch never closes the tracked client:
         # inside runAttemptWithWatchdog the only client.close()
         # is still the cut path's.
+        method = self.service[
+            self.service.index("private void runAttemptWithWatchdog") :
+            self.service.index("// ---- failure budget")
+        ]
+        self.assertEqual(method.count("client.close()"), 1)
+
+    def test_fail_stall_sweep_policy_shape(self) -> None:
+        # The fail-stall sweep: two sweeps, one 120 s grace
+        # apart, gated on a FAIL verdict AND the root daemon
+        # serving (the daemonPresent flag the post-verdict
+        # branch already maintains). The service consults the
+        # policy from the watchdog loop, sweeps through the
+        # existing sweepAttemptOrphans seam, and logs the
+        # outcome unconditionally, mirroring the win-stall
+        # wiring.
+        self.assertIn("FAIL_SWEEP_MAX = 2", self.watchdog)
+        self.assertIn(
+            "verdict != VERDICT_FAIL || !daemonPresent || callReturned",
+            self.watchdog)
+        self.assertIn("AttemptWatchdog.shouldSweepFailStall", self.service)
+        self.assertIn('"fail-stall-" + failSweepsDone', self.service)
+        self.assertIn("fail-stall sweep attempt=", self.service)
+        self.assertIn("fail-stall outcome attempt=", self.service)
+        # The fail-stall branch never closes the tracked
+        # client either: inside runAttemptWithWatchdog the
+        # only client.close() is still the cut path's.
         method = self.service[
             self.service.index("private void runAttemptWithWatchdog") :
             self.service.index("// ---- failure budget")

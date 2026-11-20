@@ -450,9 +450,14 @@ public final class AutorootService extends Service {
      * process tree itself (at most twice, 120 s apart): the
      * post-attempt sweep cannot reach a wedged winning tree until
      * the call returns at its 600 s socket timeout, so without
-     * this the stall always lasts to the timeout edge. Otherwise
-     * the launch rides to its own completion or the 600 s shell
-     * timeout, exactly as the pre-watchdog code did.
+     * this the stall always lasts to the timeout edge. A FAIL
+     * verdict with the root daemon serving gets the same sweep
+     * treatment (the verdict line reports the whole post-root
+     * action chain, so a late action failure can flip a won
+     * race's line to FAIL; see AttemptWatchdog's fail-stall
+     * policy). Otherwise the launch rides to its own completion
+     * or the 600 s shell timeout, exactly as the pre-watchdog
+     * code did.
      */
     private void runAttemptWithWatchdog(String kaslr, String memstart,
             int attempts, long attemptLogOffset) {
@@ -471,6 +476,7 @@ public final class AutorootService extends Service {
         long failVerdictAtMs = 0;
         long winVerdictAtMs = 0;
         int winSweepsDone = 0;
+        int failSweepsDone = 0;
         boolean daemonPresent = false;
         while (launch.isAlive()) {
             if (stopRequested) {
@@ -507,6 +513,33 @@ public final class AutorootService extends Service {
                         + " sweep=" + winSweepsDone + " killed=" + killed);
                 logFile("win-stall sweep attempt=" + attempts
                         + " sweep=" + winSweepsDone
+                        + " killed=" + (killed == null ? "error" : killed));
+            }
+            if (verdict == AttemptWatchdog.VERDICT_FAIL && daemonPresent
+                    && AttemptWatchdog.shouldSweepFailStall(verdict,
+                            daemonPresent, nowMs - failVerdictAtMs,
+                            failSweepsDone, !launch.isAlive())) {
+                // Fail-stall sweep: the verdict is FAIL but the
+                // root daemon is serving, so the race itself was
+                // won and the verdict line is reporting a late
+                // post-root action's failure instead (see
+                // AttemptWatchdog). The attempt is never cut,
+                // but its leftover tree is debris by the same
+                // argument as the win-stall sweep, and it holds
+                // this foreground call - and with it the
+                // handoff - to the 600 s socket timeout. Sweep
+                // from here; the post-attempt path then finds
+                // the daemon up and proceeds as for a win. The
+                // verdict and its accounting are untouched; the
+                // outcome is logged whether or not anything was
+                // killed.
+                failSweepsDone++;
+                List<Integer> killed = sweepAttemptOrphans(
+                        "fail-stall-" + failSweepsDone);
+                Log.w(TAG, "fail-stall sweep attempt=" + attempts
+                        + " sweep=" + failSweepsDone + " killed=" + killed);
+                logFile("fail-stall sweep attempt=" + attempts
+                        + " sweep=" + failSweepsDone
                         + " killed=" + (killed == null ? "error" : killed));
             }
             boolean cut = false;
@@ -563,6 +596,11 @@ public final class AutorootService extends Service {
         if (winSweepsDone > 0) {
             logFile("win-stall outcome attempt=" + attempts
                     + " sweeps=" + winSweepsDone
+                    + " callReturned=" + !launch.isAlive());
+        }
+        if (failSweepsDone > 0) {
+            logFile("fail-stall outcome attempt=" + attempts
+                    + " sweeps=" + failSweepsDone
                     + " callReturned=" + !launch.isAlive());
         }
         try {
