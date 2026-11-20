@@ -75,18 +75,33 @@ remains the universal undo for everything else.
 
 With a prebuilt release bundle (see step 5 below), the host needs only:
 
+- Windows, macOS or Linux
 - Python 3.9 or newer and Android Debug Bridge (`adb`)
 - A USB data cable for initial stock-device setup
 
+Releases ship the bundle as both `.zip` and `.tar.gz`; on Windows
+download the `.zip`. Run the provisioner with `python` on Windows
+and `python3` on macOS/Linux (the examples in this document use
+`python3`).
+
 Building from source instead requires:
 
-- Linux x86_64 with Git, GNU Make, Python 3.9 or newer and Android Debug Bridge (`adb`)
+- Linux or macOS with Git, GNU Make, Python 3.9 or newer and Android Debug Bridge (`adb`). Source builds are not supported under native Windows Python (the build drives GNU Make and POSIX shell recipes); on Windows use the prebuilt bundle, or run the source build inside WSL2
 - Android NDK r28.2 (`28.2.13676358`)
 - A JDK plus Android SDK Platform 36 and Build Tools containing `aapt`, `zipalign`, `apksigner` and `d8`
 - A USB data cable for initial stock-device setup
 - Internet access when the pinned Shizuku APK must be downloaded
 
-The provisioner uses only the Python standard library.
+The provisioner uses only the Python standard library. It finds an
+SDK at the standard per-user locations (`$HOME/Android/Sdk`,
+`$HOME/Library/Android/sdk` on macOS, `%LOCALAPPDATA%\Android\Sdk`
+on Windows, `$HOME/android-sdk`); set `ANDROID_SDK_ROOT` for an SDK
+installed anywhere else.
+
+One platform difference: the provisioner marks its local state file
+and backup bundles owner-only (mode 0600). Windows filesystems do
+not enforce POSIX modes, so on a Windows host those files are
+protected only by the user profile's normal access controls.
 
 ### Portal
 
@@ -151,7 +166,8 @@ adb shell uname -a
 
 Install the tools listed under [Requirements](#requirements), then clone the
 repository. The provisioner automatically finds an SDK installed at
-`$HOME/Android/Sdk` or `$HOME/android-sdk`.
+the standard per-user locations listed under
+[Requirements](#requirements).
 
 ```sh
 git clone https://github.com/itsgreat2misha/portal-root-kiosk-satellite.git
@@ -223,8 +239,9 @@ python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full
 ```
 
 To run without the Android toolchain, download the prebuilt bundle
-(`portal-provisioner-bundle-<version>.tar.gz`) from the project's
-releases and pass it with `--bundle`:
+(`portal-provisioner-bundle-<version>.tar.gz`, or the `.zip` of the
+same name on Windows) from the project's releases and pass it with
+`--bundle`:
 
 ```sh
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full \

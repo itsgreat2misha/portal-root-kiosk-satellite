@@ -822,7 +822,7 @@ class ConstructorConfigMappingTest(unittest.TestCase):
                 "privacy_dns": "dns.example.com",
                 "presence_fps_cap": 4,
                 "system_theme_control": "light",
-                "custom_payload": "/tmp/p.bin",
+                "custom_payload": str(pathlib.Path("/tmp/p.bin")),
             },
         )
         self.assertEqual(
@@ -926,12 +926,13 @@ class ProvisionStateRoundTripTest(unittest.TestCase):
                 (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode(),
             )
             self.assertEqual(remote.files[STATE_REMOTE].encode(), local_bytes)
-            self.assertEqual(
-                stat.S_IMODE(
-                    (provisioner.log_dir / "portal-provision-state-v1.json").stat().st_mode
-                ),
-                0o600,
-            )
+            if sys.platform != "win32":
+                self.assertEqual(
+                    stat.S_IMODE(
+                        (provisioner.log_dir / "portal-provision-state-v1.json").stat().st_mode
+                    ),
+                    0o600,
+                )
             # Atomic publish: push to STATE_REMOTE + ".tmp", then a
             # single chmod 0600 && mv shell step.
             push_call = next(
@@ -1025,7 +1026,8 @@ class BackupBundleFormatTest(unittest.TestCase):
 
             self.assertEqual(result, destination)
             self.assertIn(f"BACKUP_OK path={destination}", stdout.getvalue().splitlines())
-            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
             with tarfile.open(destination, "r:gz") as archive:
                 members = {
                     member.name: archive.extractfile(member).read()
@@ -1883,7 +1885,8 @@ class ShizukuMarkersTest(unittest.TestCase):
             )
             key_file = provisioner.log_dir / "portal-shizuku-adbkey.pub"
             self.assertEqual(key_file.read_text(), "AAAAB3NzaC1 user@portal\n")
-            self.assertEqual(stat.S_IMODE(key_file.stat().st_mode), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(key_file.stat().st_mode), 0o600)
 
     def test_shizuku_root_ok_marker(self) -> None:
         # Same fake-device shape as ShizukuRootStartTest in
@@ -2263,7 +2266,10 @@ class FailureBeforeRebootTest(unittest.TestCase):
             reboot = mock.Mock(name="reboot")
             write_state = mock.Mock(name="write_state")
             with (
-                mock.patch.dict(os.environ, {"HOME": temporary}),
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": temporary, "USERPROFILE": temporary},
+                ),
                 mock.patch.object(provisioner, "connect"),
                 mock.patch.object(
                     provisioner,
@@ -2310,7 +2316,10 @@ class FailureBeforeRebootTest(unittest.TestCase):
             reboot = mock.Mock(name="reboot")
             write_state = mock.Mock(name="write_state")
             with (
-                mock.patch.dict(os.environ, {"HOME": temporary}),
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": temporary, "USERPROFILE": temporary},
+                ),
                 mock.patch.object(provisioner, "connect"),
                 mock.patch.object(
                     provisioner,

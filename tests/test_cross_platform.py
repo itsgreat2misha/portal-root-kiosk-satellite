@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -202,6 +203,56 @@ class MakefilePlatformTest(unittest.TestCase):
                 makefile.read_text(encoding="utf-8"),
                 f"{makefile} still uses GNU-only stat -c",
             )
+
+
+class SuitePortabilityTest(unittest.TestCase):
+    """D5/D6: the suite itself must run on all three host OSes, and
+    CI must actually run it there."""
+
+    def test_no_test_spawns_a_posix_shell(self) -> None:
+        own = pathlib.Path(__file__).resolve()
+        for test_file in (ROOT / "tests").glob("test_*.py"):
+            if test_file.resolve() == own:
+                continue  # this pin names the literal it scans for
+            self.assertNotIn(
+                '"/bin/sh"',
+                test_file.read_text(encoding="utf-8"),
+                f"{test_file.name} still spawns a POSIX shell",
+            )
+
+    def test_artifact_hash_keys_are_posix(self) -> None:
+        # A state manifest recorded on one host OS must verify on
+        # another: artifact keys are repo-relative POSIX paths.
+        sys.path.insert(0, str(ROOT / "tools"))
+        import run_state
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            artifact = root / "tools" / "thing.py"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"x")
+            state = run_state.RunState(
+                root,
+                run=lambda *a, **k: None,
+                adb_run=lambda *a, **k: None,
+                serial="serial",
+                log_dir=root,
+            )
+            self.assertEqual(list(state.artifact_hashes([artifact])), ["tools/thing.py"])
+
+    def test_byte_pinned_writers_do_not_translate_newlines(self) -> None:
+        # The provision state file and the bundle manifest are compared
+        # byte-for-byte (and the manifest is signed); their writers must
+        # not let the host text mode turn LF into CRLF.
+        run_state_source = (ROOT / "tools" / "run_state.py").read_text()
+        self.assertIn('newline=""', run_state_source)
+        bundle_source = (ROOT / "tools" / "build_release_bundle.py").read_text()
+        self.assertIn('newline=""', bundle_source)
+
+    def test_ci_matrix_covers_three_host_oses(self) -> None:
+        ci = _source(".github/workflows/ci.yml")
+        for os_name in ("ubuntu", "macos", "windows"):
+            self.assertIn(os_name, ci)
 
 
 class CheckoutAndManifestShapeTest(unittest.TestCase):

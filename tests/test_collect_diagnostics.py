@@ -275,13 +275,17 @@ class CollectDiagnosticsCliTest(unittest.TestCase):
 
 
 def _exploit_with_process(
-    provisioner: PortalProvisioner, command: str, output: io.StringIO
+    provisioner: PortalProvisioner, script: str, output: io.StringIO
 ) -> bool:
+    """Run exploit() against a child process running a Python script.
+
+    The child is sys.executable, not /bin/sh, so the suite exercises
+    the attempt loop on hosts without a POSIX shell (Windows)."""
     real_popen = subprocess.Popen
 
     def fake_popen(*args: object, **kwargs: object):
         return real_popen(
-            ["/bin/sh", "-c", command],
+            [sys.executable, "-c", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
@@ -320,8 +324,9 @@ class ExploitAttemptClassificationTest(unittest.TestCase):
             output = io.StringIO()
             result = _exploit_with_process(
                 provisioner,
-                "printf 'KernelSnitch mm_struct leak failed\\n'; "
-                "sleep 30",
+                "import time; "
+                "print('KernelSnitch mm_struct leak failed', flush=True); "
+                "time.sleep(30)",
                 output,
             )
 
@@ -340,7 +345,8 @@ class ExploitAttemptClassificationTest(unittest.TestCase):
             output = io.StringIO()
             result = _exploit_with_process(
                 provisioner,
-                "printf 'attempt output\\n'; exit 3",
+                "import sys; print('attempt output', flush=True); "
+                "sys.exit(3)",
                 output,
             )
 
@@ -373,7 +379,7 @@ class ExploitAttemptClassificationTest(unittest.TestCase):
 
             def fake_popen(*args: object, **kwargs: object):
                 return real_popen(
-                    ["/bin/sh", "-c", "sleep 30"],
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=0,

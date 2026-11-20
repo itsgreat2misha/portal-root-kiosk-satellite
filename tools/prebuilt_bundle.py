@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 from device_session import ProvisionError
 from portal_targets import PortalTarget
@@ -104,21 +105,35 @@ def _find_manifest_root(directory: pathlib.Path) -> pathlib.Path:
 
 
 def load_bundle(path: pathlib.Path) -> Bundle:
-    """Load a bundle from a directory or a .tar.gz archive."""
+    """Load a bundle from a directory, a .tar.gz archive, or a .zip
+    archive (the zip is the same bundle, packaged for hosts whose
+    stock tooling has no tar)."""
     path = path.expanduser()
     if path.is_file():
-        if not (path.name.endswith(".tar.gz") or path.name.endswith(".tgz")):
+        is_tarball = path.name.endswith(".tar.gz") or path.name.endswith(
+            ".tgz"
+        )
+        is_zip = path.name.endswith(".zip")
+        if not (is_tarball or is_zip):
             raise ProvisionError(
-                f"bundle file must be a .tar.gz archive: {path}"
+                f"bundle file must be a .tar.gz or .zip archive: {path}"
             )
         extract_dir = pathlib.Path(
             tempfile.mkdtemp(prefix="portal-bundle-")
         )
-        with tarfile.open(path, "r:gz") as archive:
-            try:
-                archive.extractall(extract_dir, filter="data")
-            except TypeError:  # older Python without PEP 706 filters
+        if is_zip:
+            # zipfile.extractall strips absolute paths and ".."
+            # components from member names; the manifest hash
+            # verification in verify_files() is the integrity gate
+            # for whatever was extracted.
+            with zipfile.ZipFile(path) as archive:
                 archive.extractall(extract_dir)
+        else:
+            with tarfile.open(path, "r:gz") as archive:
+                try:
+                    archive.extractall(extract_dir, filter="data")
+                except TypeError:  # older Python without PEP 706 filters
+                    archive.extractall(extract_dir)
         root = _find_manifest_root(extract_dir)
     elif path.is_dir():
         root = _find_manifest_root(path)

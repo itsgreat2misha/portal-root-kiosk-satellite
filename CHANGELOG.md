@@ -35,6 +35,23 @@ the fork diverged from upstream:
   the dry-run report probes the running interpreter instead of a
   `python3` PATH entry, and backup/diagnostics bundle manifests
   record POSIX path keys on every host.
+- Cross-platform host support, second half (Phase F): CI now runs
+  the test suite on Ubuntu, macOS and Windows runners, so the
+  per-platform requirements the README states are the ones CI
+  proves. The suite's fake attempt processes are `sys.executable`
+  children instead of `/bin/sh` scripts, so the suite itself runs
+  on Windows. Releases ship the bundle as a `.zip` alongside the
+  `.tar.gz` (same signed manifest and hashes), and `--bundle`
+  accepts the `.zip` directly, for hosts whose stock tooling has
+  no tar. The README's host requirements are stated per platform,
+  including the Windows difference that POSIX file modes (0600 on
+  the local state file and backup bundles) are not enforced there.
+  The matrix then found and fixed a second byte-fidelity class the
+  audit missed: the provision state file, backup/diagnostics
+  records and the signed bundle manifest are written with LF
+  pinned (they are compared or verified byte-for-byte), and the
+  state manifest's artifact hash keys are POSIX paths so a manifest
+  recorded on one host OS verifies on another.
 - Prebuilt release bundle (Phase E): release CI builds all five
   target payloads plus the model-independent APK set into one bundle
   with a SHA-256 hash manifest (`tools/build_release_bundle.py`),

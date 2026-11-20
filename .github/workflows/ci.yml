@@ -10,22 +10,34 @@ permissions:
 
 jobs:
   tests:
-    runs-on: ubuntu-24.04
+    # Phase F: the suite runs on all three supported host OSes. The
+    # prebuilt bundle is the primary user path on Windows and macOS
+    # hosts, so a Linux-only signal is not evidence it works there.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       # The suite is hermetic by contract: it must pass with no adb
-      # binary present. GitHub runners ship none, so this job is the
-      # guard against tests leaking to a real device tool.
+      # binary present. GitHub's Linux runners ship none, so that
+      # leg is the guard against tests leaking to a real device
+      # tool. The macOS and Windows images ship an Android SDK, so
+      # the guard is not asserted there; the suite's device
+      # addresses are TEST-NET and unroutable either way.
       - name: Confirm adb is absent (hermetic-suite guard)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           if command -v adb; then
             echo "adb unexpectedly present; the hermetic check would be meaningless" >&2
             exit 1
           fi
       - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests
       - name: Byte-compile all Python sources
-        run: python3 -m compileall -q tools tests
+        run: python -m compileall -q tools tests
