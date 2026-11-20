@@ -267,8 +267,10 @@ class ShizukuFeature:
                 key = pathlib.Path(temp) / "adbkey"
                 public_path = pathlib.Path(str(key) + ".pub")
                 if seeded is not None:
-                    key.write_text(seeded[0], encoding="utf-8")
-                    public_path.write_text(seeded[1] + "\n", encoding="utf-8")
+                    key.write_text(seeded[0], encoding="utf-8", newline="")
+                    public_path.write_text(
+                        seeded[1] + "\n", encoding="utf-8", newline=""
+                    )
                     self.shizuku_key_source = "autoroot-seed"
                 else:
                     self._run(
@@ -298,7 +300,9 @@ class ShizukuFeature:
             raise ProvisionError("Portal Shizuku helper returned an invalid ADB public key")
         self._log_dir().mkdir(parents=True, exist_ok=True)
         self.shizuku_public_key = self._log_dir() / "portal-shizuku-adbkey.pub"
-        self.shizuku_public_key.write_text(public + "\n", encoding="ascii")
+        self.shizuku_public_key.write_text(
+            public + "\n", encoding="ascii", newline=""
+        )
         self.shizuku_public_key.chmod(0o600)
         print(
             f"SHIZUKU_PAYLOAD_OK version={SHIZUKU_VERSION} "

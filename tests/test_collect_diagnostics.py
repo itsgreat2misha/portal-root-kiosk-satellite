@@ -389,10 +389,6 @@ class ExploitAttemptClassificationTest(unittest.TestCase):
                     "provision_portal.subprocess.Popen",
                     side_effect=fake_popen,
                 ),
-                mock.patch(
-                    "provision_portal.select.select",
-                    return_value=([], [], []),
-                ),
                 mock.patch.object(
                     provision_portal_module, "time", AdvancingClock()
                 ),

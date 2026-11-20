@@ -8,7 +8,7 @@
 include ../android-env.mk
 
 API ?= 28
-CC := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$(API)-clang
+CC := $(NDK)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG)/bin/aarch64-linux-android$(API)-clang
 
 CFLAGS := -O2 -Wall -Wextra -Werror -fPIE -pie -std=c11 -D_GNU_SOURCE
 

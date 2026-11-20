@@ -22,6 +22,7 @@ import dataclasses
 import datetime as dt
 import pathlib
 import sys
+import tempfile
 import zipfile
 from typing import Any, Callable
 
@@ -589,7 +590,9 @@ def main(
         return 2
     print(config.banner, file=sys.stderr, flush=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = args.log_dir or pathlib.Path(f"/tmp/portal-provision-{stamp}")
+    log_dir = args.log_dir or (
+        pathlib.Path(tempfile.gettempdir()) / f"portal-provision-{stamp}"
+    )
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
         provisioner_factory(
