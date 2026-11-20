@@ -42,6 +42,7 @@ from meta_debloat_components import (
     DEBLOAT_COMPONENT_NAMES,
 )
 from portal_targets import PortalTarget, find_sibling_target, find_target
+import prebuilt_bundle
 from device_session import DeviceSession, ProvisionError, run_command
 from run_state import STATE_REMOTE, RunState
 from cli import CliConfig, main as _cli_main, parse_args as _cli_parse_args
@@ -138,8 +139,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # Single source of truth for the provisioner version. Release tags must
 # read "v" + this string (the release workflow enforces the match).
 # The "-dev" suffix marks an untagged development state; it is dropped
-# in the commit that cuts a release.
-PROVISIONER_VERSION = "1.0.0-dev"
+# in the commit that cuts a release. This fork ships preview releases
+# on the 0.9.x line until the 1.0.0 relaunch.
+PROVISIONER_VERSION = "0.9.0"
 PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
@@ -459,6 +461,7 @@ class PortalProvisioner:
         backup_path: pathlib.Path | None = None,
         recover: bool = False,
         skip_build: bool = False,
+        bundle: pathlib.Path | None = None,
         force: bool = False,
         persistent_wireless_adb: bool = False,
         disable_adb_auth_timeout: bool = False,
@@ -819,6 +822,8 @@ class PortalProvisioner:
         self.backup_path = backup_path
         self.recover = recover
         self.skip_build = skip_build
+        self.bundle = bundle
+        self.bundle_root: pathlib.Path | None = None
         self.force = force
         self.persistent_wireless_adb = persistent_wireless_adb
         self.disable_adb_auth_timeout = (
@@ -1158,6 +1163,43 @@ class PortalProvisioner:
                 f"model={product_model} device={device} fingerprint={fingerprint}"
             )
         return target
+
+    def _activate_prebuilt_bundle(self) -> None:
+        """Verify the --bundle release bundle against the selected
+        target and install its artifacts in place of a local build.
+
+        Runs after verify_target() and before every fast path, build
+        and artifact read: the manifest's target entry must match
+        the device-selected target (key, fingerprint, preload),
+        every listed file must hash to its recorded value, and a
+        release signature, when present, must verify against the
+        pinned release certificate. Any failure raises before the
+        run changes anything on the device. On success the run
+        proceeds with skip_build set: the bundle's artifacts are
+        byte-identical to what the local build would produce, and
+        every later artifact-hash gate reads them as usual.
+        """
+        if self.target is None:
+            raise ProvisionError("target must be selected before bundle use")
+        bundle = prebuilt_bundle.load_bundle(self.bundle)
+        signed = prebuilt_bundle.verify_signature(bundle, ROOT)
+        entry = prebuilt_bundle.select_target_entry(bundle, self.target)
+        prebuilt_bundle.verify_files(bundle)
+        installed = prebuilt_bundle.install_artifacts(bundle, ROOT)
+        self.bundle_root = bundle.root
+        self.skip_build = True
+        if self.shizuku and self.shizuku_apk is None:
+            apk = prebuilt_bundle.bundled_shizuku_apk(bundle, SHIZUKU_APK_NAME)
+            if apk is not None:
+                self.shizuku_apk = apk
+                self.shizuku_feature.shizuku_apk = apk
+        print(
+            f"PREBUILT_BUNDLE_OK target={entry['key']} "
+            f"version={bundle.manifest.get('provisioner_version')} "
+            f"files={len(installed)} signed={int(signed)} "
+            f"root={bundle.root}",
+            flush=True,
+        )
 
     def stage(self) -> None:
         if self.target is None:
@@ -5647,8 +5689,14 @@ class PortalProvisioner:
 
         The candidate search KASLR discovery has always used: NDK
         roots from the environment first, then NDKs installed under
-        the SDK roots and the default SDK locations.
+        the SDK roots and the default SDK locations. In bundle mode
+        the bundle's own copy (the same NDK binary, hash-verified
+        with the rest of the bundle) wins: a bundle host has no NDK.
         """
+        if self.bundle_root is not None:
+            bundled = self.bundle_root / prebuilt_bundle.SIMPLEPERF_BUNDLE_PATH
+            if bundled.is_file():
+                return bundled
         roots = []
         for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
             value = os.environ.get(name)
@@ -8318,6 +8366,13 @@ class PortalProvisioner:
                 self.create_backup_bundle(self.backup_path)
             return
         self.verify_target()
+        if self.bundle is not None:
+            # Verify and install the prebuilt bundle before any fast
+            # path, build-environment check or artifact read: in
+            # bundle mode there is no Android toolchain on the host,
+            # and a bundle that does not match this device must
+            # refuse the run before anything changes.
+            self._activate_prebuilt_bundle()
         # Observe the alohausers package state before any phase of
         # this run can change it: the desired-state recording rule
         # (C3-A) keys off the state the run STARTED from.

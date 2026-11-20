@@ -73,6 +73,13 @@ remains the universal undo for everything else.
 
 ### Host computer
 
+With a prebuilt release bundle (see step 5 below), the host needs only:
+
+- Python 3.9 or newer and Android Debug Bridge (`adb`)
+- A USB data cable for initial stock-device setup
+
+Building from source instead requires:
+
 - Linux x86_64 with Git, GNU Make, Python 3.9 or newer and Android Debug Bridge (`adb`)
 - Android NDK r28.2 (`28.2.13676358`)
 - A JDK plus Android SDK Platform 36 and Build Tools containing `aapt`, `zipalign`, `apksigner` and `d8`
@@ -214,6 +221,25 @@ A full setup combining the core system features is one flag:
 ```sh
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full
 ```
+
+To run without the Android toolchain, download the prebuilt bundle
+(`portal-provisioner-bundle-<version>.tar.gz`) from the project's
+releases and pass it with `--bundle`:
+
+```sh
+python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" --full \
+  --bundle portal-provisioner-bundle-0.9.0.tar.gz
+```
+
+The bundle carries one payload per supported model plus the shared
+helper APKs, each listed with a SHA-256 hash in its manifest. Before
+anything changes on the Portal, the provisioner checks the manifest
+against the device's exact target and verifies every file's hash
+(release bundles also carry a signature over the manifest, checked
+against the project's pinned release certificate); a bundle that
+does not carry the device's build, or whose files do not verify,
+refuses the run and the device is left untouched. A model the bundle
+does not cover still provisions from a source build.
 
 `--full` is a preset, not a separate mode: it expands to the
 documented full-setup line plus `--autoroot`:

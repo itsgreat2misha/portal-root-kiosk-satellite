@@ -169,6 +169,18 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         "--skip-build", action="store_true", help="use existing build outputs"
     )
     parser.add_argument(
+        "--bundle",
+        type=pathlib.Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "use a prebuilt release bundle (directory or .tar.gz) instead "
+            "of building: the bundle's hash manifest is verified against "
+            "the device's target and its artifacts are installed in place "
+            "of the local build, so the host needs only Python and adb"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -618,6 +630,7 @@ def main(
             backup_path=args.backup,
             recover=args.recover,
             skip_build=args.skip_build,
+            bundle=args.bundle,
             force=args.force,
             persistent_wireless_adb=args.persistent_wireless_adb,
             disable_adb_auth_timeout=args.disable_adb_auth_timeout,

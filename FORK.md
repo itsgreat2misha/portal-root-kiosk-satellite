@@ -560,3 +560,37 @@ only — the race path's verification is byte-for-byte unchanged:
   active camera client, CAMERA appop, analysis/ROI frame markers,
   pose metrics, frame processor). Same guarantee: the profile is
   the applied one and the pipeline is live with it now.
+
+## 17. Prebuilt release bundle: --bundle (2026-11-20, Phase E)
+
+A run no longer needs the Android toolchain on the host. Release CI
+(`tools/build_release_bundle.py`, driven by the tag workflow) builds
+every target with every component on and assembles ONE bundle: the
+five target payloads, the model-independent APK set, the ctl jars,
+the uid1000 artifacts, the root daemon, a hash-verified copy of the
+pinned Shizuku APK, and the NDK arm64 simpleperf binary, plus a
+`bundle-manifest.json` listing every file's SHA-256 and the target
+table (key, fingerprint, preload per target).
+
+`--bundle PATH` (a bundle directory or its .tar.gz) activates it
+after target verification and before every fast path, build check
+and artifact read: the manifest entry must match the device-selected
+target's key, fingerprint and preload, every listed file must hash
+to its recorded value, and the artifacts are then installed into the
+standard build-output locations and the run proceeds with the build
+skipped. Any mismatch refuses the run before a device change; a
+target the bundle does not carry falls back to nothing — the user
+builds from source instead. In bundle mode the simpleperf staging
+uses the bundle's copy, and the Shizuku install uses the bundle's
+pinned APK when the user did not pass --shizuku-apk.
+
+Release signing starts here: bundles built by the release workflow
+carry a detached openssl signature over the manifest, made with the
+project release signing key. The private key exists only as a CI
+secret (plus the owner's vault backup); the certificate is committed
+as `release-signing-cert.pem` and `tools/prebuilt_bundle.py` pins
+its SHA-256 fingerprint — a signature from any other key is refused.
+An unsigned (locally built) bundle is accepted on its hashes alone.
+The APKs inside the bundle are still signed with the committed
+project debug key, so they install as updates on devices provisioned
+from source. Preview releases run on the 0.9.x version line.
