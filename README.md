@@ -18,9 +18,9 @@ normal boot by default (`--verify-boots 2` verifies across two boots
 instead).
 
 Root access itself is not persistent. It lasts only for the provisioning
-window unless you deliberately enable one of the two opt-in root modes:
-a root daemon that runs for the rest of the boot (`--custom-payload`), or
-automatic re-rooting after every reboot (`--autoroot`).
+window unless you enable automatic re-rooting after every reboot
+(`--autoroot`), which restores the root daemon and root-mode Shizuku on
+each boot with no host involved.
 
 > [!WARNING]
 > I have tried to make the provisioner as safe and guarded as possible, but
@@ -258,8 +258,7 @@ verification boot ID (two different boot IDs with `--verify-boots 2`).
 - `--dns HOSTNAME` — use a specific Private DNS resolver (DNS-over-TLS) instead of the network-provided server.
 - `--system-theme-control light|dark` — enable live light/dark theme control on locked Android 10 Portals and set the theme.
 - `--shizuku` — install Shizuku and start it automatically after every boot. `--shizuku-apk PATH` uses a specific Shizuku APK; `--remove-shizuku` removes Shizuku again.
-- `--custom-payload [PATH]` — leave a small root daemon running on loopback (127.0.0.1:37373) for the rest of the boot, and restart Shizuku as root (UID 0) through it. A bare flag builds and uses this repository's reference daemon. **Warning:** the daemon has no authentication — any app on the Portal that can open a loopback connection can run commands as UID 0. It lives for one boot only, and with root-mode Shizuku enabled it is stopped once Shizuku is verified as root; `--skip-shizuku-root` keeps Shizuku as the shell user and leaves the daemon running.
-- `--autoroot` — re-run the exploit automatically after every reboot and restore the root daemon and root-mode Shizuku with no host involved. Implies `--shizuku` and `--custom-payload`. A session allows up to 8 attempts in a 60-minute window. Attempts that start but never finish count against a failure budget: After 10 such boots in a row, the on-device helper turns autoroot off by itself and posts a notification instead of crash-looping the Portal. Open the helper from the notification to re-enable it; the budget re-arms, so a fault that is still there turns autoroot off again after 10 more bad boots. The helper app also shows the session state and offers stop, disable/enable and run-now controls. Validated end-to-end on the Portal+ (`aloha`) build; other supported models have not been validated for this mode.
+- `--autoroot` — re-run the exploit automatically after every reboot and restore the root daemon and root-mode Shizuku with no host involved. Implies `--shizuku` and the root-daemon step. During each boot's root window the root daemon listens on loopback (127.0.0.1:37373) with no authentication — any app on the Portal that can open a loopback connection can run commands as UID 0 while it is up; it is stopped once root-mode Shizuku is verified, and it never survives the boot on its own. A session allows up to 8 attempts in a 60-minute window. Attempts that start but never finish count against a failure budget: After 10 such boots in a row, the on-device helper turns autoroot off by itself and posts a notification instead of crash-looping the Portal. Open the helper from the notification to re-enable it; the budget re-arms, so a fault that is still there turns autoroot off again after 10 more bad boots. The helper app also shows the session state and offers stop, disable/enable and run-now controls. Validated end-to-end on the Portal+ (`aloha`) build; other supported models have not been validated for this mode.
 
 ### Run controls
 
@@ -378,7 +377,7 @@ dedicated helpers with only the privileges they need, and the requested
 state is verified on a following normal boot (two boots with
 `--verify-boots 2`).
 
-The `--custom-payload` mode is the deliberate exception: it starts the
+The root-payload step is the deliberate exception: it starts the
 root daemon inside the privileged window instead of returning straight
 to a normal boot. Because the race leaves the kernel's `proc_uid` lock
 waiter tree damaged — the reason the stock flow reboots immediately —
@@ -442,7 +441,7 @@ and have not changed. Every root-backed action requires both the selected
 exploit library and `exploit-sentinel/build/portal-exploit-sentinel.apk`;
 the provisioner installs that no-permission package temporarily, confirms
 that `run-as` accepts it, and removes it automatically. The reference root
-daemon used by `--custom-payload` is built with `make -C root-daemon`.
+daemon is built with `make -C root-daemon`.
 
 ## License
 

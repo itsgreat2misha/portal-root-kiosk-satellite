@@ -7204,9 +7204,9 @@ class PortalProvisioner:
         return success
 
     def apply_custom_payload(self) -> None:
-        """Start a caller-supplied binary inside one privileged window.
+        """Start the root daemon inside one privileged window.
 
-        The binary named by --custom-payload is staged like every other
+        The in-repo root daemon is staged like every other
         payload; the native action installs it under /data/portal-root
         and starts it detached. Unlike the install flow the device is
         NOT rebooted after a successful attempt: the payload is expected

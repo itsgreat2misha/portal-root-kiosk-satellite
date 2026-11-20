@@ -54,8 +54,6 @@ class AutorootCliTest(unittest.TestCase):
                 "provision_portal.py",
                 "--shizuku",
                 "--autoroot",
-                "--custom-payload",
-                "daemon.bin",
             ],
         ):
             arguments = parse_args()

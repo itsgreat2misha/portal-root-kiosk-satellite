@@ -215,27 +215,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--custom-payload",
-        type=pathlib.Path,
-        nargs="?",
-        const=config.default_custom_payload,
-        default=None,
-        metavar="PATH",
-        help=(
-            "start a prebuilt binary inside one privileged window: it "
-            "is installed under /data/portal-root, started detached as "
-            "root, and verified over its loopback socket for the rest "
-            "of the current boot (no post-run reboot). The PATH is "
-            "optional: a bare --custom-payload builds and uses this "
-            "repository's root daemon (root-daemon/portal-root-daemon); "
-            "pass an explicit PATH to use a different binary instead"
-        ),
-    )
-    parser.add_argument(
         "--skip-shizuku-root",
         action="store_true",
         help=(
-            "with --shizuku and --custom-payload, leave shizuku_server "
+            "with --shizuku, leave shizuku_server "
             "running with shell privileges instead of restarting it as "
             "uid 0 through the root payload"
         ),
@@ -247,9 +230,8 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "stage the on-device autoroot runner and boot helper so "
             "the root payload returns by itself after later reboots, "
             "with no host watcher (the exploit sentinel app stays "
-            "installed). Implies --shizuku and --custom-payload (a "
-            "bare --custom-payload, i.e. the in-repo root daemon, "
-            "unless one was given explicitly)"
+            "installed). Implies --shizuku and the root-payload step "
+            "(the in-repo root daemon)"
         ),
     )
     parser.add_argument(
@@ -396,6 +378,12 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         setattr(args, RESTORE_FLAG_MAP[name], True)
     args.privacy_dns = None
     args.dhcp_dns = False
+    # Internal, not a user option: the root-payload step always uses
+    # the in-repo root daemon. Only the autoroot implication below
+    # arms it; there is deliberately no flag (and no PATH override)
+    # for it -- forking the repo is the supported way to change the
+    # daemon.
+    args.custom_payload = None
     # --full expands to exactly the documented full-setup line.
     if args.full:
         for attribute, value in FULL_PRESET.items():
@@ -494,16 +482,14 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         if args.remove_shizuku:
             parser.error("--autoroot cannot be combined with --remove-shizuku")
         # Autoroot's boot helper reuses the Shizuku loopback-ADB key
-        # and its runner replays the custom payload, so both steps are
+        # and its runner replays the root payload, so both steps are
         # prerequisites. Imply them instead of silently staging an
         # autoroot setup that can never run (the previous behaviour
         # when either was forgotten).
         args.shizuku = True
-        if args.custom_payload is None:
-            args.custom_payload = config.default_custom_payload
+        args.custom_payload = config.default_custom_payload
     selected = any(
         (
-            args.custom_payload is not None,
             args.autoroot,
             args.persistent_wireless_adb,
             args.disable_adb_auth_timeout,

@@ -320,12 +320,21 @@ class CliSingleFlagMappingTest(unittest.TestCase):
                 self.assertEqual(getattr(arguments, attribute), expected)
                 self.assertEqual(arguments.audio, audio, "default-audio rule")
 
-    def test_custom_payload_bare_and_explicit(self) -> None:
-        bare = parse(["--custom-payload"])
-        self.assertEqual(bare.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
-        self.assertFalse(bare.audio)
-        explicit = parse(["--custom-payload", "/tmp/daemon.bin"])
-        self.assertEqual(explicit.custom_payload, pathlib.Path("/tmp/daemon.bin"))
+    def test_custom_payload_is_internal_only(self) -> None:
+        # No user flag arms the root payload: a plain parse leaves
+        # it unset, --autoroot implies the in-repo daemon, and the
+        # removed --custom-payload spelling is a clean break.
+        plain = parse([])
+        self.assertIsNone(plain.custom_payload)
+        implied = parse(["--autoroot"])
+        self.assertEqual(implied.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
+        self.assertIn(
+            "unrecognized arguments", parse_error(["--custom-payload"])
+        )
+        self.assertIn(
+            "unrecognized arguments",
+            parse_error(["--custom-payload", "/tmp/daemon.bin"]),
+        )
 
     def test_backup_alone_sets_backup_only_and_suppresses_default_audio(
         self,
@@ -553,7 +562,6 @@ class MainConfigMappingTest(unittest.TestCase):
                     "--skip-build",
                     "--shizuku",
                     "--shizuku-apk", "/tmp/shizuku.apk",
-                    "--custom-payload", "/tmp/daemon.bin",
                     "--skip-shizuku-root",
                     "--autoroot",
                     "--verify-boots", "2",
@@ -600,7 +608,7 @@ class MainConfigMappingTest(unittest.TestCase):
                 "restore_camera_light": False,
                 "system_theme_control": "dark",
                 "shizuku_apk": pathlib.Path("/tmp/shizuku.apk"),
-                "custom_payload": pathlib.Path("/tmp/daemon.bin"),
+                "custom_payload": DEFAULT_CUSTOM_PAYLOAD_LOCAL,
                 "skip_shizuku_root": True,
                 "autoroot": True,
                 "verify_boots": 2,

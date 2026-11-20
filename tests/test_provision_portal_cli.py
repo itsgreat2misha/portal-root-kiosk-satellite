@@ -376,15 +376,35 @@ class CustomPayloadCliTest(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["provision_portal.py", *argv]):
             return parse_args()
 
-    def test_bare_custom_payload_uses_the_in_repo_daemon_build(self) -> None:
-        arguments = self.parse(["--custom-payload"])
+    def parse_error(self, argv):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["provision_portal.py", *argv]),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        return stderr.getvalue()
 
-        self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
-        self.assertEqual(
-            arguments.custom_payload, ROOT / "root-daemon" / "portal-root-daemon"
-        )
-        self.assertFalse(arguments.shizuku)
-        self.assertFalse(arguments.autoroot)
+    def test_custom_payload_flag_is_a_clean_break(self) -> None:
+        # The root-payload step is internal: it always uses the
+        # in-repo root daemon and is armed only by --autoroot.
+        # The old --custom-payload flag (bare or with a PATH) is
+        # gone; forking the repo is the way to change the daemon.
+        for argv in (
+            ["--custom-payload"],
+            ["--custom-payload", "/tmp/other-daemon"],
+            ["--autoroot", "--custom-payload", "/tmp/other"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn(
+                    "unrecognized arguments", self.parse_error(argv)
+                )
+
+    def test_no_flag_run_leaves_custom_payload_unset(self) -> None:
+        arguments = self.parse([])
+
+        self.assertIsNone(arguments.custom_payload)
 
     def test_serial_has_no_default(self) -> None:
         arguments = self.parse([])
@@ -399,16 +419,6 @@ class CustomPayloadCliTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("--serial is required", stderr.getvalue())
 
-    def test_bare_custom_payload_does_not_enable_default_audio(self) -> None:
-        arguments = self.parse(["--custom-payload"])
-
-        self.assertFalse(arguments.audio)
-
-    def test_explicit_custom_payload_path_is_an_override(self) -> None:
-        arguments = self.parse(["--custom-payload", "/tmp/other-daemon"])
-
-        self.assertEqual(arguments.custom_payload, pathlib.Path("/tmp/other-daemon"))
-
     def test_autoroot_implies_shizuku_and_bare_custom_payload(self) -> None:
         arguments = self.parse(["--autoroot"])
 
@@ -417,11 +427,13 @@ class CustomPayloadCliTest(unittest.TestCase):
         self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
         self.assertFalse(arguments.audio)
 
-    def test_autoroot_keeps_an_explicit_custom_payload_override(self) -> None:
-        arguments = self.parse(["--autoroot", "--custom-payload", "/tmp/other"])
+    def test_autoroot_implies_shizuku_and_the_in_repo_daemon(self) -> None:
+        arguments = self.parse(["--autoroot"])
 
+        self.assertTrue(arguments.autoroot)
         self.assertTrue(arguments.shizuku)
-        self.assertEqual(arguments.custom_payload, pathlib.Path("/tmp/other"))
+        self.assertEqual(arguments.custom_payload, DEFAULT_CUSTOM_PAYLOAD_LOCAL)
+        self.assertFalse(arguments.audio)
 
     def test_autoroot_implied_shizuku_satisfies_shizuku_apk(self) -> None:
         arguments = self.parse(["--autoroot", "--shizuku-apk", "/tmp/shizuku.apk"])
@@ -2068,7 +2080,6 @@ class DeKioskScrubTest(unittest.TestCase):
             "--disable-adb-auth-timeout",
             "--verify-boots", "1",
             "--shizuku",
-            "--custom-payload",
             "--autoroot",
         ]
         with mock.patch.object(sys, "argv", argv):
