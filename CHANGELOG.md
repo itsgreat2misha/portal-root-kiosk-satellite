@@ -162,6 +162,12 @@ the fork diverged from upstream:
 
 ### Changed
 
+- README rewritten to be shorter and more direct: the step-by-step
+  installation now covers only the prebuilt-bundle path (download,
+  extract, run the provisioner), building from source moved to an
+  advanced section at the end, the per-feature reference compressed
+  into a summary table and short flag notes, and low-value asides
+  removed. No behavior, flag or target changes.
 - CLI flag consolidation (Phase D), a clean break with no aliases
   for the old spellings: `--full` is now a preset expanding to the
   documented full-setup line plus `--autoroot`; DNS is one flag,
