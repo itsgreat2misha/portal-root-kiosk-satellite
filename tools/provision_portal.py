@@ -216,6 +216,10 @@ SHIZUKU_FLAG_DENIED = 4
 APP_VERIFIER_BACKUP_REMOTE = "/data/local/tmp/portal-package-verifier-before-v1"
 APP_VERIFIER_PACKAGE = "com.facebook.appverifier"
 ADB_ENABLED_SETTING = "adb_enabled"
+#: The TCP port wireless ADB persistence installs and the
+#: wireless-ADB restore removes; the verify paths compare the
+#: persisted property against this value throughout.
+WIRELESS_ADB_PORT = "5555"
 #: The manifest action keys that record a Private DNS end state.
 #: A completed record must carry at most one of them: the readers
 #: resolve the family in this order (dhcp first), so a record
@@ -8168,6 +8172,52 @@ class PortalProvisioner:
                 self.uninstall_uid1000_runtime_payload(best_effort=True)
         raise ProvisionError(f"provisioning failed after {self.attempts} attempts")
 
+    def _connected_via_wireless_adb(self) -> bool:
+        """Whether this run's adb connection is the device's
+        wireless ADB endpoint: a host:port serial on the persisted
+        wireless port. A USB serial never carries a port, so it
+        never matches — over USB the host survives the restore's
+        reboot because USB ADB does not depend on the persisted
+        wireless port."""
+        host, sep, port = self.serial.rpartition(":")
+        return bool(sep and host) and port == WIRELESS_ADB_PORT
+
+    def _refuse_wireless_adb_restore_on_wireless(self) -> None:
+        """Defect L: the wireless-ADB restore removes the very
+        transport a wireless run is connected through. Closure
+        session 16, Nov 19, 2026: the restore executed fully
+        on-device, the post-attempt reboot brought the unit up
+        with wireless ADB gone, and the host-side verify could
+        never run — the run failed waiting for ADB and left the
+        autoroot guard flag set. Host verification and run
+        completion both require the transport the restore
+        removes, so the combination is refused before any state
+        change. Callers: provision() before the guard engages
+        (covers every CLI-requested run — the no-op gate, the
+        channel gate, the subset exits and the stages all sit
+        downstream in _provision_stages) and _provision_stages
+        itself after --recover adopts the restore from a pending
+        manifest's recorded actions."""
+        if not self.restore_wireless_adb:
+            return
+        if not self._connected_via_wireless_adb():
+            return
+        print(
+            "PROVISION_REFUSED "
+            "reason=wireless-adb-restore-over-wireless "
+            f"serial={self.serial}",
+            flush=True,
+        )
+        raise ProvisionError(
+            "refusing to restore wireless ADB over the wireless "
+            "ADB connection itself: the restore clears the "
+            "persisted wireless ADB port, so the reboot that "
+            "follows strands this run mid-flight (the restore "
+            "would complete on-device but could not be verified "
+            "or recorded). Connect the Portal by USB and re-run "
+            "the same command."
+        )
+
     def provision(self) -> None:
         self.connect(wait_seconds=30)
         if self.status_only:
@@ -8185,6 +8235,10 @@ class PortalProvisioner:
             self.verify_target(require_supported=False)
             self.collect_diagnostics_bundle()
             return
+        # Before the guard engages and before _provision_stages
+        # can stage, race, or route anywhere: a run that would
+        # remove its own transport is refused outright (Defect L).
+        self._refuse_wireless_adb_restore_on_wireless()
         self._engage_autoroot_guard()
         try:
             self._provision_stages()
@@ -8223,6 +8277,15 @@ class PortalProvisioner:
                 return
             self.recover = False
             resumed_pending = True
+        # --recover may have adopted the wireless-ADB restore
+        # from the pending manifest's recorded actions, after
+        # provision()'s up-front refusal already passed; the
+        # same refusal applies here, before any phase can stage
+        # or execute it (Defect L). On this path the guard is
+        # engaged, and raising returns through provision()'s
+        # guard release while the device is still reachable, so
+        # no flag is left behind either.
+        self._refuse_wireless_adb_restore_on_wireless()
         if self.dry_run:
             self.verify_target(require_supported=False)
             status = self.print_status()

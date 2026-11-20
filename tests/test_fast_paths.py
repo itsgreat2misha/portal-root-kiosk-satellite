@@ -3388,5 +3388,120 @@ class ShutterAwarePresenceTest(unittest.TestCase):
             self.assertIsNone(provisioner._noop_blocker(state))
 
 
+class WirelessAdbRestoreTransportGateTest(unittest.TestCase):
+    """Defect L: --restore wireless-adb removes the very
+    transport a wireless run is connected through. Closure
+    session 16, Nov 19, 2026: the restore executed fully
+    on-device, the post-attempt reboot brought the unit up with
+    wireless ADB gone, and the host-side verify could never run
+    — the run failed waiting for ADB and left the autoroot
+    guard flag set. The combination is refused up front, before
+    the guard engages and before anything is staged; over USB
+    the restore proceeds exactly as before."""
+
+    def test_wireless_serial_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cases = (
+                ("192.0.2.1:5555", True),
+                ("portal.lan:5555", True),
+                ("192.0.2.1:5556", False),
+                ("0A1B2C3D4E5F", False),
+                ("emulator-5554", False),
+            )
+            for serial, expected in cases:
+                with self.subTest(serial=serial):
+                    provisioner = PortalProvisioner(
+                        serial, 12, pathlib.Path(temporary)
+                    )
+                    self.assertEqual(
+                        provisioner._connected_via_wireless_adb(),
+                        expected,
+                    )
+
+    def test_refused_over_wireless_before_any_state_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(
+                temporary, restore_wireless_adb=True
+            )
+            calls: list = []
+            provisioner.connect = lambda **kwargs: calls.append(
+                "connect"
+            )
+            provisioner._engage_autoroot_guard = lambda: calls.append(
+                "guard"
+            )
+            provisioner._provision_stages = lambda: calls.append(
+                "stages"
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                with self.assertRaises(ProvisionError) as raised:
+                    provisioner.provision()
+            self.assertIn("Connect the Portal by USB", str(raised.exception))
+            # The connection probe is the only step that ran: no
+            # guard flag, no staging, no stages, nothing that
+            # could change device state or be left behind.
+            self.assertEqual(calls, ["connect"])
+            self.assertIn(
+                "PROVISION_REFUSED "
+                "reason=wireless-adb-restore-over-wireless",
+                stdout.getvalue(),
+            )
+
+    def test_usb_serial_passes_the_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "0A1B2C3D4E5F",
+                12,
+                pathlib.Path(temporary),
+                restore_wireless_adb=True,
+            )
+            calls: list = []
+            provisioner.connect = lambda **kwargs: calls.append(
+                "connect"
+            )
+            provisioner._engage_autoroot_guard = lambda: calls.append(
+                "guard"
+            )
+            provisioner._provision_stages = lambda: calls.append(
+                "stages"
+            )
+            provisioner._release_autoroot_guard = (
+                lambda succeeded: calls.append(("release", succeeded))
+            )
+            provisioner._ensure_sentinel_for_staged_autoroot = (
+                lambda: calls.append("sentinel")
+            )
+            provisioner.provision()
+            self.assertEqual(
+                calls,
+                ["connect", "guard", "stages", "sentinel", ("release", True)],
+            )
+
+    def test_recover_adopted_restore_is_refused_too(self) -> None:
+        """The gate coverage point for the second call site: a
+        --recover run adopts the restore from the pending
+        manifest's recorded actions inside _provision_stages,
+        after provision()'s up-front check has passed with the
+        flag unset, so _provision_stages re-checks before any
+        phase can stage or execute it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, recover=True)
+            self.assertFalse(provisioner.restore_wireless_adb)
+            provisioner.read_state = lambda: None
+            provisioner.verify_target = lambda **kwargs: None
+
+            def adopt_restore() -> bool:
+                provisioner.restore_wireless_adb = True
+                return True
+
+            provisioner.recover_actions = adopt_restore
+            with self.assertRaises(ProvisionError) as raised:
+                provisioner._provision_stages()
+            self.assertIn("Connect the Portal by USB", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -167,6 +167,32 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A `--restore wireless-adb` run connected over wireless ADB
+  itself stranded the device mid-run (Defect L, Phase D
+  closure session 16, Nov 19, 2026): the restore executed
+  fully on-device, the runner's post-attempt reboot brought
+  the unit up with the persisted wireless port cleared, and
+  the host-side verify could never run — the run failed
+  waiting for ADB and left the autoroot guard flag set. The
+  provisioner now refuses the combination before any state
+  change: when a run requests the wireless-ADB restore and
+  the current serial is the wireless endpoint the restore
+  removes (a host:port serial on the persisted wireless
+  port), it prints a refusal line and errors, telling the
+  user to connect the Portal by USB and re-run. The refusal
+  sits in `provision()` before the autoroot guard engages,
+  so every path that could reach the restore (the no-op
+  gate, the channel gate, the subset exits, the stages) is
+  downstream of it, and `_provision_stages` re-checks after
+  `--recover` adopts the restore from a pending manifest's
+  recorded actions. Over USB the restore is unchanged: USB
+  ADB does not depend on the persisted wireless port, so
+  the host survives the reboot. A sweep of the other
+  actions found no second instance: the payload's
+  `restore_wireless_adb()` is the only code that clears an
+  adb tcp port property, `adb_enabled` is only ever written
+  `1` (by the ADB-framework ensure), and no action performs
+  a wipe or reset.
 - The channel PortalComponentCtl execution still failed with
   the rish transport working (Phase D closure session 15,
   Nov 19, 2026): the run reported exit=0 with empty output and
