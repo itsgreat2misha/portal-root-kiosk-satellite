@@ -91,7 +91,6 @@ FULL_PRESET = {
     "optimize_presence": True,
     "allow_app_updates": True,
     "disable_adb_auth_timeout": True,
-    "dhcp_dns": True,
     "autoroot": True,
 }
 
@@ -124,7 +123,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "apply the full documented setup in one run: audio, "
             "disable-updates, block-remote-wipe, debloat, "
             "remove-meta-accounts, optimize-presence, allow-app-updates, "
-            "disable-adb-auth-timeout, DHCP DNS (Private DNS off), and "
+            "disable-adb-auth-timeout, and "
             "autoroot. Exactly the long flag line it replaces; the "
             "granular flags below remain for partial setups"
         ),
@@ -292,7 +291,9 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         action="store_true",
         help=(
             "persistently disable the conservative Meta app/telemetry "
-            "profile and save each package's original state"
+            "profile and save each package's original state; also "
+            "turns Android Private DNS off so the Portal uses the "
+            "network's own DNS"
         ),
     )
     parser.add_argument(
@@ -319,16 +320,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         help=(
             "cap only AIService's presence-analysis rate (1-10 FPS); "
             "camera capture keeps its configured frame rate"
-        ),
-    )
-    parser.add_argument(
-        "--dns",
-        metavar="off|HOSTNAME",
-        help=(
-            "set Android Private DNS: 'off' uses the DNS servers supplied "
-            "by the connected network (DHCP); any other value is a "
-            "DNS-over-TLS resolver hostname, and that resolver controls "
-            "the actual domain block list"
         ),
     )
     mode_group = parser.add_mutually_exclusive_group()
@@ -388,23 +379,15 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     if args.full:
         for attribute, value in FULL_PRESET.items():
             setattr(args, attribute, value)
-    # --dns replaces --dhcp-dns / --privacy-dns: "off" is the DHCP
-    # mode, anything else is the resolver hostname. An explicit
-    # --dns also replaces the --full preset's DNS component: the
-    # pair is reset before the value is applied, so a composed
-    # config never carries two contradictory DNS intents (the
-    # applies, the verify, the manifest recording and the
-    # recorded-state readers all key off this pair and cannot
-    # agree on one that holds both).
-    if args.dns is not None:
-        args.privacy_dns = None
-        args.dhcp_dns = False
-        if args.dns.lower() == "off":
-            args.dhcp_dns = True
-        elif args.dns.strip():
-            args.privacy_dns = args.dns
-        else:
-            parser.error("--dns needs 'off' or a resolver hostname")
+    # Debloat carries the DNS change with it: a debloated Portal
+    # uses the network's own DNS, so turning Android Private DNS
+    # off is part of the debloat action set. There is no separate
+    # --dns flag anymore and no resolver-hostname form. The
+    # internal dhcp_dns attribute set here is what the apply, the
+    # verify, the manifest recording and the recorded-state
+    # readers all key off, exactly as before.
+    if args.debloat:
+        args.dhcp_dns = True
     # Apply/restore pairs for one feature stay mutually exclusive,
     # as they were when each pair had its own flag group.
     for apply_attribute, restore_name, apply_label in (
@@ -437,7 +420,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "--restore presence-fps"
         )
     if (args.privacy_dns or args.dhcp_dns) and "dns" in args.restore:
-        parser.error("--dns cannot be combined with --restore dns")
+        parser.error("--debloat cannot be combined with --restore dns")
     if args.persistent_wireless_adb and "wireless-adb" in args.restore:
         parser.error(
             "--persistent-wireless-adb cannot be combined with "

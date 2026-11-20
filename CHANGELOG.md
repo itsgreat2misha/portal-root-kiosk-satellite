@@ -999,6 +999,12 @@ the fork diverged from upstream:
 
 ### Removed
 
+- The `--dns` option, including its resolver-hostname form.
+  Turning Android Private DNS off is now part of `--debloat`
+  (and therefore of `--full`): a debloated Portal uses the
+  network's own DNS. The recorded-state machinery, the per-boot
+  drift enforcement and `--restore dns` are unchanged; they are
+  driven by the debloat action now instead of a separate flag.
 - The `--custom-payload` option. The root-payload step is internal
   now: it always uses the in-repo root daemon and is armed only by
   `--autoroot` (which implies it, as before). There is no longer a

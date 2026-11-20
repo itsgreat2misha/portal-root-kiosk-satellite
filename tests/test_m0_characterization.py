@@ -223,7 +223,6 @@ class CliDefaultsTest(unittest.TestCase):
                 "remove_meta_accounts": False,
                 "optimize_presence": False,
                 "presence_fps_cap": None,
-                "dns": None,
                 "privacy_dns": None,
                 "dhcp_dns": False,
                 "restore_privacy_dns": False,
@@ -293,8 +292,6 @@ class CliSingleFlagMappingTest(unittest.TestCase):
         (["--optimize-presence"], "optimize_presence", True, False),
         (["--restore", "presence"], "restore_presence_profile", True, False),
         (["--restore", "presence-fps"], "restore_presence_fps", True, False),
-        (["--dns", "dns.example.com"], "privacy_dns", "dns.example.com", False),
-        (["--dns", "off"], "dhcp_dns", True, False),
         (["--restore", "dns"], "restore_privacy_dns", True, False),
         (["--restore", "autoroot"], "restore_autoroot", True, False),
         (["--restore", "wireless-adb"], "restore_wireless_adb", True, False),
@@ -433,12 +430,8 @@ class CliValidationTest(unittest.TestCase):
             "--restore presence-fps",
         ),
         (
-            ["--dns", "dns.example.com", "--restore", "dns"],
-            "--dns cannot be combined with --restore dns",
-        ),
-        (
-            ["--dns", "off", "--restore", "dns"],
-            "--dns cannot be combined with --restore dns",
+            ["--debloat", "--restore", "dns"],
+            "--debloat cannot be combined with --restore dns",
         ),
     )
 
@@ -572,7 +565,6 @@ class MainConfigMappingTest(unittest.TestCase):
                     "--debloat",
                     "--remove-meta-accounts",
                     "--presence-fps-cap", "4",
-                    "--dns", "dns.example.com",
                     "--dry-run",
                     "--backup", "/tmp/backup.tar.gz",
                 ]
@@ -597,8 +589,8 @@ class MainConfigMappingTest(unittest.TestCase):
                 "restore_presence_profile": False,
                 "presence_fps_cap": 4,
                 "restore_presence_fps": False,
-                "privacy_dns": "dns.example.com",
-                "dhcp_dns": False,
+                "privacy_dns": None,
+                "dhcp_dns": True,
                 "restore_privacy_dns": False,
                 "allow_app_updates": True,
                 "restore_app_verifier": False,

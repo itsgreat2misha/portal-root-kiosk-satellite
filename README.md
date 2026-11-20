@@ -225,7 +225,7 @@ full-setup line plus `--autoroot`:
 python3 tools/provision_portal.py --serial "$PORTAL_IP:5555" \
   --audio --disable-updates --block-remote-wipe --debloat \
   --remove-meta-accounts --optimize-presence --allow-app-updates \
-  --disable-adb-auth-timeout --dns off --autoroot
+  --disable-adb-auth-timeout --autoroot
 ```
 
 To apply only some features, drop `--full` and combine the individual
@@ -241,12 +241,11 @@ verification boot ID (two different boot IDs with `--verify-boots 2`).
 - `--audio` — disable hardware echo cancellation and noise suppression, so the microphone is not suppressed while the speaker plays.
 - `--disable-updates` — block automatic Meta firmware updates.
 - `--block-remote-wipe` — disable Meta's known remote factory-reset receivers; local recovery stays available.
-- `--debloat` — disable unused Meta apps, cloud clients and diagnostics. The list depends on the model: up to 196 components on most models, 39 on the Portal+ (1st generation) and 14 on Portal TV.
+- `--debloat` — disable unused Meta apps, cloud clients and diagnostics. The list depends on the model: up to 196 components on most models, 39 on the Portal+ (1st generation) and 14 on Portal TV. It also turns Android Private DNS off, so the Portal uses the DNS server supplied by the local network, including private LAN hostnames.
 - `--remove-meta-accounts` — remove local Meta accounts. **One-way** (see [What can't be undone](#what-cant-be-undone)).
 - `--optimize-presence` — reduce AIService CPU use while preserving full-view, LED-free person detection.
 - `--allow-app-updates` — let correctly signed third-party and other non-Meta APKs update normally.
 - `--disable-adb-auth-timeout` — keep already-approved ADB computers authorized indefinitely. A new computer must still be approved on the Portal; this does not disable ADB authentication.
-- `--dns off` — use the DNS server supplied by the local network, including private LAN hostnames.
 
 ### Standalone
 
@@ -255,7 +254,6 @@ verification boot ID (two different boot IDs with `--verify-boots 2`).
 ### Optional add-ons
 
 - `--presence-fps-cap N` — cap Meta's presence-analysis frame rate (with `--optimize-presence`) without limiting the camera's capture rate.
-- `--dns HOSTNAME` — use a specific Private DNS resolver (DNS-over-TLS) instead of the network-provided server.
 - `--system-theme-control light|dark` — enable live light/dark theme control on locked Android 10 Portals and set the theme.
 - `--shizuku` — install Shizuku and start it automatically after every boot. `--shizuku-apk PATH` uses a specific Shizuku APK; `--remove-shizuku` removes Shizuku again.
 - `--autoroot` — re-run the exploit automatically after every reboot and restore the root daemon and root-mode Shizuku with no host involved. Implies `--shizuku` and the root-daemon step. During each boot's root window the root daemon listens on loopback (127.0.0.1:37373) with no authentication — any app on the Portal that can open a loopback connection can run commands as UID 0 while it is up; it is stopped once root-mode Shizuku is verified, and it never survives the boot on its own. A session allows up to 8 attempts in a 60-minute window. Attempts that start but never finish count against a failure budget: After 10 such boots in a row, the on-device helper turns autoroot off by itself and posts a notification instead of crash-looping the Portal. Open the helper from the notification to re-enable it; the budget re-arms, so a fault that is still there turns autoroot off again after 10 more bad boots. The helper app also shows the session state and offers stop, disable/enable and run-now controls. Validated end-to-end on the Portal+ (`aloha`) build; other supported models have not been validated for this mode.
