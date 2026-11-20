@@ -4,8 +4,8 @@
 # Part of the Meta Portal Root Provisioner fork; see LICENSE and NOTICE.
 #
 # Phase D flag-consolidation pins: the --full preset expands to
-# exactly the documented full-setup action set, --dns replaces the
-# two DNS flags, --restore <name> replaces the nine restore flags
+# exactly the documented full-setup action set, --restore <name>
+# replaces the nine restore flags
 # and --enable-updates (old spellings are a clean break), internal
 # action ids stay byte-stable, and the restore-completeness gaps
 # (OTA package recorded states, system-theme original, Meta
@@ -81,7 +81,8 @@ class FullPresetTest(unittest.TestCase):
         # The preset is exactly the documented line: audio,
         # disable-updates, block-remote-wipe, debloat,
         # remove-meta-accounts, optimize-presence, allow-app-updates,
-        # disable-adb-auth-timeout, DHCP DNS, autoroot.
+        # disable-adb-auth-timeout, autoroot. (Debloat carries the
+        # Private-DNS-off change with it; see DebloatDnsTest.)
         self.assertEqual(
             set(cli_module.FULL_PRESET),
             {
@@ -93,10 +94,12 @@ class FullPresetTest(unittest.TestCase):
                 "optimize_presence",
                 "allow_app_updates",
                 "disable_adb_auth_timeout",
-                "dhcp_dns",
                 "autoroot",
             },
         )
+        # The full run still turns Private DNS off, via debloat.
+        self.assertTrue(arguments.dhcp_dns)
+        self.assertIsNone(arguments.privacy_dns)
         # Taste opt-ins stay out of the bundle.
         self.assertIsNone(arguments.presence_fps_cap)
         self.assertIsNone(arguments.system_theme_control)
@@ -112,15 +115,26 @@ class FullPresetTest(unittest.TestCase):
 
 
 class DnsMergeTest(unittest.TestCase):
-    def test_dns_off_is_the_dhcp_mode(self) -> None:
-        arguments = parse(["--dns", "off"])
+    def test_debloat_turns_private_dns_off(self) -> None:
+        arguments = parse(["--debloat"])
         self.assertTrue(arguments.dhcp_dns)
         self.assertIsNone(arguments.privacy_dns)
 
-    def test_dns_hostname_is_the_private_dns_mode(self) -> None:
-        arguments = parse(["--dns", "one.one.one.one"])
-        self.assertEqual(arguments.privacy_dns, "one.one.one.one")
+    def test_no_debloat_no_dns_intent(self) -> None:
+        arguments = parse(["--audio"])
         self.assertFalse(arguments.dhcp_dns)
+        self.assertIsNone(arguments.privacy_dns)
+
+    def test_dns_flag_is_a_clean_break(self) -> None:
+        for argv in (["--dns", "off"], ["--dns", "one.one.one.one"]):
+            with self.subTest(argv=argv):
+                self.assertIn("unrecognized arguments", parse_error(argv))
+
+    def test_debloat_rejects_a_dns_restore(self) -> None:
+        self.assertIn(
+            "--debloat cannot be combined with --restore dns",
+            parse_error(["--debloat", "--restore", "dns"]),
+        )
 
     def test_old_dns_spellings_are_a_clean_break(self) -> None:
         for argv in (
@@ -165,15 +179,14 @@ class FakeDnsStore:
         return completed()
 
 
-class FullDnsOverrideTest(unittest.TestCase):
-    """An explicit --dns replaces the --full preset's DNS
-    component: the composed config carries exactly one DNS
-    intent, and the shared apply + verify sequence (the DNS
-    block of the shell-level apply, then the end-of-run verify)
-    completes against a fake store. Before the fix, --full
-    --dns HOSTNAME composed dhcp_dns=True AND privacy_dns=HOST:
-    the hostname apply persisted, then the dhcp-first verify
-    expectation failed the run (Defect A)."""
+class DebloatDnsTest(unittest.TestCase):
+    """Debloat carries exactly one DNS intent — Private DNS off —
+    and the shared apply + verify sequence (the DNS block of the
+    shell-level apply, then the end-of-run verify) completes
+    against a fake store. There is no --dns flag anymore: the
+    hostname form went away with it, so a composed config can
+    never again carry two contradictory DNS intents (the old
+    Defect A shape)."""
 
     def compose_and_run(self, argv, store):
         arguments = parse(argv)
@@ -190,34 +203,20 @@ class FullDnsOverrideTest(unittest.TestCase):
         )
         feature = make_settings_feature(config, adb_run=store.adb_run)
         with contextlib.redirect_stdout(io.StringIO()):
-            if config.privacy_dns:
-                feature.apply_privacy_dns()
             if config.dhcp_dns:
                 feature.apply_dhcp_dns()
-            if config.restore_privacy_dns:
-                feature.restore_private_dns()
             feature.verify_privacy_dns()
         return arguments
 
-    def test_full_dns_hostname_yields_the_hostname_intent(self) -> None:
-        store = FakeDnsStore(mode="off", specifier="null")
-        arguments = self.compose_and_run(
-            ["--full", "--dns", "one.one.one.one"], store
-        )
-        self.assertEqual(arguments.privacy_dns, "one.one.one.one")
-        self.assertFalse(arguments.dhcp_dns)
-        self.assertEqual(store.mode, "hostname")
-        self.assertEqual(store.specifier, "one.one.one.one")
-
-    def test_full_dns_off_yields_the_dhcp_intent(self) -> None:
+    def test_debloat_yields_the_dhcp_intent(self) -> None:
         store = FakeDnsStore(mode="hostname", specifier="one.one.one.one")
-        arguments = self.compose_and_run(["--full", "--dns", "off"], store)
+        arguments = self.compose_and_run(["--debloat"], store)
         self.assertTrue(arguments.dhcp_dns)
         self.assertIsNone(arguments.privacy_dns)
         self.assertEqual(store.mode, "off")
         self.assertEqual(store.specifier, "null")
 
-    def test_full_alone_keeps_the_preset_dns_intent(self) -> None:
+    def test_full_yields_the_dhcp_intent_via_debloat(self) -> None:
         store = FakeDnsStore(mode="hostname", specifier="one.one.one.one")
         arguments = self.compose_and_run(["--full"], store)
         self.assertTrue(arguments.dhcp_dns)
