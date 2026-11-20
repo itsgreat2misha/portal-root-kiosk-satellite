@@ -999,6 +999,11 @@ the fork diverged from upstream:
 
 ### Removed
 
+- The `--custom-payload` option. The root-payload step is internal
+  now: it always uses the in-repo root daemon and is armed only by
+  `--autoroot` (which implies it, as before). There is no longer a
+  way to substitute a different daemon binary from the command line;
+  forking the repo is the supported route for that.
 - The de-Kiosk scrub: all Kiosk Satellite profile/home/device-owner
   flags and their backing code. Kiosk setup now lives in the
   operator's own bootstrap tooling, not in this provisioner.
