@@ -465,6 +465,14 @@ class CustomPayloadCliTest(unittest.TestCase):
 
 
 class AndroidBuildEnvironmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests pin the POSIX host's SDK/NDK resolution semantics
+        # (the fake trees are laid out for it). The native-Windows gate
+        # itself is pinned in test_cross_platform.
+        patcher = mock.patch.object(sys, "platform", "linux")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_build_files_do_not_contain_an_author_home_path(self) -> None:
         build_files = [ROOT / "android-env.mk", *ROOT.glob("*/Makefile")]
         for path in build_files:

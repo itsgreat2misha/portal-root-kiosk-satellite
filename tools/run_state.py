@@ -90,9 +90,9 @@ class RunState:
         for path in candidates:
             if path.is_file():
                 try:
-                    name = str(path.relative_to(self._root))
+                    name = path.relative_to(self._root).as_posix()
                 except ValueError:
-                    name = str(path)
+                    name = path.as_posix()
                 hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         self._artifact_hashes_cache = dict(hashes)
         self._artifact_hashes_key = cache_key
@@ -157,7 +157,9 @@ class RunState:
             state["desired_state"] = desired_state
         self._log_dir.mkdir(parents=True, exist_ok=True)
         local = self._log_dir / "portal-provision-state-v1.json"
-        local.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        local.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", newline=""
+        )
         local.chmod(0o600)
         remote_tmp = STATE_REMOTE + ".tmp"
         self._adb_run(["push", str(local), remote_tmp], timeout=15, check=True)

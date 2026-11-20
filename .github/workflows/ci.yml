@@ -109,9 +109,9 @@ jobs:
           python -m unittest discover -s tests > suite-output.txt 2>&1 || true
           git config user.email diag@localhost
           git config user.name diag
-          git checkout -B diag/ci-logs
+          git checkout -B diag/ci-${{ runner.os }}
           git add -f suite-output.txt
           git commit -m "diag suite output ${{ runner.os }}"
-          git push -f origin diag/ci-logs
+          git push -f origin diag/ci-${{ runner.os }}
       - name: Byte-compile all Python sources
         run: python -m compileall -q tools tests

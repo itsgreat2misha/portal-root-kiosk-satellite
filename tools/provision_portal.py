@@ -4232,7 +4232,7 @@ class PortalProvisioner:
         rendered = json.dumps(status, indent=2, sort_keys=True)
         print(rendered)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        (self.log_dir / "status.json").write_text(rendered + "\n")
+        (self.log_dir / "status.json").write_text(rendered + "\n", newline="")
         return status
 
     def privileged_requested(self) -> bool:
@@ -4387,7 +4387,8 @@ class PortalProvisioner:
             root.mkdir()
             status = self.collect_status()
             (root / "status.json").write_text(
-                json.dumps(status, indent=2, sort_keys=True) + "\n"
+                json.dumps(status, indent=2, sort_keys=True) + "\n",
+                newline="",
             )
             commands = {
                 "getprop.txt": ["shell", "getprop"],
@@ -4399,7 +4400,9 @@ class PortalProvisioner:
             }
             for filename, arguments in commands.items():
                 result = self.adb_run(arguments, timeout=30)
-                (root / filename).write_text(result.stdout, errors="replace")
+                (root / filename).write_text(
+                    result.stdout, errors="replace", newline=""
+                )
             device_files = root / "device-files"
             device_files.mkdir()
             for remote in (
@@ -4436,7 +4439,8 @@ class PortalProvisioner:
                         path.read_bytes()
                     ).hexdigest()
             (root / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                newline="",
             )
             with tarfile.open(destination, "w:gz") as archive:
                 archive.add(root, arcname="portal-backup")
@@ -4491,7 +4495,7 @@ class PortalProvisioner:
                     record(name, "failed", str(exc)[:200])
                     return
                 (root / filename).write_text(
-                    result.stdout, errors="replace"
+                    result.stdout, errors="replace", newline=""
                 )
                 record(name, "collected")
 
@@ -4521,7 +4525,7 @@ class PortalProvisioner:
                 record("mobileconfig_backend", "failed", str(exc)[:200])
             else:
                 (root / "mobileconfig-backend.txt").write_text(
-                    backend + "\n"
+                    backend + "\n", newline=""
                 )
                 record(
                     "mobileconfig_backend",
@@ -4556,6 +4560,7 @@ class PortalProvisioner:
                 (root / filename).write_text(
                     "\n".join(lines) + ("\n" if lines else ""),
                     errors="replace",
+                    newline="",
                 )
                 record(name, "collected", f"{len(lines)} matching lines")
             try:
@@ -4584,7 +4589,8 @@ class PortalProvisioner:
                 "items": items,
             }
             (root / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                newline="",
             )
             self.log_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(
@@ -4681,7 +4687,9 @@ class PortalProvisioner:
             except (ProvisionError, OSError):
                 pass
         output = result.stdout + result.stderr
-        (root / "page-prep-diag.txt").write_text(output, errors="replace")
+        (root / "page-prep-diag.txt").write_text(
+            output, errors="replace", newline=""
+        )
         if "KernelSnitch mm_struct leak failed" in output:
             detail = "KernelSnitch mm_struct leak FAILED"
         else:
@@ -4748,7 +4756,7 @@ class PortalProvisioner:
             text = result.stdout
             if text.strip():
                 (root / "proc-kallsyms.txt").write_text(
-                    text, errors="replace"
+                    text, errors="replace", newline=""
                 )
                 zeroed = all(
                     line.startswith("0000000000000000") or not line.strip()
@@ -4987,7 +4995,7 @@ class PortalProvisioner:
     def write_app_verifier_backup(self, backup: dict[str, object]) -> None:
         with tempfile.TemporaryDirectory(prefix="portal-app-verifier-") as temp:
             local = pathlib.Path(temp) / "app-verifier.json"
-            local.write_text(json.dumps(backup, indent=2) + "\n")
+            local.write_text(json.dumps(backup, indent=2) + "\n", newline="")
             self.adb_run(
                 ["push", str(local), APP_VERIFIER_BACKUP_REMOTE],
                 timeout=15,

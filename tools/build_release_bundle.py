@@ -201,6 +201,7 @@ def assemble(output_dir: pathlib.Path, version: str) -> pathlib.Path:
     (bundle_dir / prebuilt_bundle.BUNDLE_MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=1, sort_keys=True) + "\n",
         encoding="utf-8",
+        newline="",
     )
     print(f"bundle assembled: {bundle_dir} ({len(files)} hashed files)")
     return bundle_dir
