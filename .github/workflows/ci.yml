@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
+        os: [ubuntu-24.04, macos-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,14 +51,26 @@ jobs:
       - name: Win tests group 3
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_collect_diagnostics tests.test_cross_platform tests.test_deferred_failures tests.test_device_session
-      - name: Win tests group 4
+      - name: Win tests group 4a fast_paths
         if: always() && runner.os == 'Windows'
-        run: python -m unittest tests.test_fast_paths tests.test_flag_consolidation tests.test_m0_characterization
+        run: python -m unittest tests.test_fast_paths
+      - name: Win tests group 4b flag_consolidation
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_flag_consolidation
+      - name: Win tests group 4c m0_characterization
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_m0_characterization
       - name: Win tests group 5
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_mha_tuning tests.test_ota_nodemon tests.test_portal_targets tests.test_prebuilt_bundle
-      - name: Win tests group 6
+      - name: Win tests group 6a provision_portal_cli
         if: always() && runner.os == 'Windows'
-        run: python -m unittest tests.test_provision_portal_cli tests.test_watch_result_evidence tests.test_wifi_flush_guard
+        run: python -m unittest tests.test_provision_portal_cli
+      - name: Win tests group 6b watch_result_evidence
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_watch_result_evidence
+      - name: Win tests group 6c wifi_flush_guard
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_wifi_flush_guard
       - name: Byte-compile all Python sources
         run: python -m compileall -q tools tests
