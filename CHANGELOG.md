@@ -181,6 +181,17 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- Two bundle-mode defects caught by the v0.9.0 live proof
+  (Nov 20, 2026) after the certificate fix: the bundle did not
+  ship `autoroot-helper/run.sh`, which the runtime stages
+  on-device from the tree, so the channel path fell back to a
+  full install; and the nested phase provisioners (OTA
+  bootstrap, OTA backend, presence, remote wipe, and the other
+  per-action phases) did not inherit `--bundle`, so their
+  address discovery lost the bundled simpleperf and demanded an
+  NDK on a host that by design has none. The builder now ships
+  run.sh (hash-listed like the other artifacts) and every nested
+  construction receives the parent run's bundle.
 - The release bundle now ships `release-signing-cert.pem`. The
   runtime looks for the pinned release certificate in the running
   tree, and a bundle run standalone is its own running tree, so a
