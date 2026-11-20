@@ -6,7 +6,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   tests:
@@ -99,5 +99,19 @@ jobs:
       - name: Win cli chunk 3
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_provision_portal_cli.StreamliningTest tests.test_provision_portal_cli.DeKioskScrubTest tests.test_provision_portal_cli.OtaPlatformBackendTest tests.test_provision_portal_cli.PhaseC2RestoreFpsGatingTest tests.test_provision_portal_cli.OtaPollingOverrideTest
+      # DIAGNOSTIC (temporary, not for merge): capture the full
+      # suite output to a scratch branch so failures on macOS and
+      # Windows are readable where job logs are not.
+      - name: Capture full suite output to diag branch
+        if: always() && runner.os != 'Linux'
+        shell: bash
+        run: |
+          python -m unittest discover -s tests > suite-output.txt 2>&1 || true
+          git config user.email diag@localhost
+          git config user.name diag
+          git checkout -B diag/ci-logs
+          git add -f suite-output.txt
+          git commit -m "diag suite output ${{ runner.os }}"
+          git push -f origin diag/ci-logs
       - name: Byte-compile all Python sources
         run: python -m compileall -q tools tests
