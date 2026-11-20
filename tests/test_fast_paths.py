@@ -1852,6 +1852,162 @@ class CombinedRunVerificationBootsTest(unittest.TestCase):
             self.assertEqual(calls, [("complete", "boot-1", "boot-2")])
 
 
+class VerificationGradeMergeTest(unittest.TestCase):
+    """Defect M: verification-grade facts merge monotonically —
+    a later run's completion write must not downgrade or erase
+    what an earlier run positively established. Closure session
+    18 (Nov 19, 2026): Leg R verified OTA directly (bootstrap
+    win, source=OVERRIDE) and two distinct boots; a later
+    channel run whose own end-of-run OTA judgment was
+    "unverified" — a win-less boot cannot read the posture's
+    per-boot nodemon property or stat the override file —
+    merged that weaker judgment over the recorded verified
+    value. And Leg R's own payload terminal write had already
+    dropped its verified boots: the run started from a pending
+    record, and the boots fill lived inside the merge the
+    pending start gates off."""
+
+    def _prior_record(self, temporary: str, ota_value=True) -> dict:
+        full = make_provisioner(temporary, **DOCUMENTED)
+        actions = dict(full.requested_actions())
+        actions["disable_updates"] = ota_value
+        return {
+            "schema": 1,
+            "status": "complete",
+            "target": ALOHA.key,
+            "fingerprint": ALOHA.fingerprint,
+            "tool_revision": "prior-revision",
+            "actions": actions,
+            "artifact_sha256": dict(full.selected_artifact_hashes()),
+            "autoroot_key_sha256": "prior-key-hash",
+            "desired_state": {"alohausers_package": "disabled"},
+            "verification": {
+                "first_boot": "boot-a",
+                "second_boot": "boot-b",
+            },
+        }
+
+    def _write(self, provisioner: PortalProvisioner) -> dict:
+        captured: dict = {}
+
+        def fake_write_state(status, **state_kwargs):
+            captured["status"] = status
+            captured.update(state_kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                provisioner,
+                "adb_run",
+                return_value=completed([], ALOHA.fingerprint + "\n"),
+            ),
+            unittest.mock.patch.object(
+                provisioner.run_state, "write_state", fake_write_state
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            provisioner.write_state("complete", merge_prior=True)
+        return captured
+
+    def test_channel_unverified_judgment_keeps_recorded_verified_ota(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run = make_provisioner(temporary, **DOCUMENTED)
+            run._start_state = self._prior_record(temporary)
+            run.ota_unverified = True
+            captured = self._write(run)
+            # The run's weaker judgment does not downgrade the
+            # recorded verified value, and the recorded boots
+            # carry over untouched.
+            self.assertIs(captured["actions"]["disable_updates"], True)
+            self.assertEqual(captured["first_boot"], "boot-a")
+            self.assertEqual(captured["second_boot"], "boot-b")
+
+    def test_unverified_records_as_before_without_a_verified_prior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run = make_provisioner(temporary, **DOCUMENTED)
+            run._start_state = self._prior_record(
+                temporary, ota_value="unverified"
+            )
+            run.ota_unverified = True
+            captured = self._write(run)
+            # No fabrication: with no verified value recorded,
+            # this run's unverified judgment records exactly as
+            # before (the honesty rule is untouched).
+            self.assertEqual(
+                captured["actions"]["disable_updates"], "unverified"
+            )
+
+    def test_verified_run_upgrades_an_unverified_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run = make_provisioner(temporary, **DOCUMENTED)
+            run._start_state = self._prior_record(
+                temporary, ota_value="unverified"
+            )
+            captured = self._write(run)
+            # A run that itself verifies still wins per key: the
+            # monotonic guard only blocks the downgrade.
+            self.assertIs(captured["actions"]["disable_updates"], True)
+
+    def test_combined_run_boots_survive_terminal_write_from_pending_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, **DOCUMENTED)
+            # The recovered-run shape: the start record is the
+            # pending stub an earlier failed run left, so the
+            # merge the terminal write asks for never engages.
+            provisioner._start_state = {
+                "schema": 1,
+                "status": "pending",
+                "target": ALOHA.key,
+                "fingerprint": ALOHA.fingerprint,
+                "tool_revision": "prior-revision",
+                "actions": {"restore_wireless_adb": True},
+                "artifact_sha256": {},
+                "verification": {
+                    "first_boot": None,
+                    "second_boot": None,
+                },
+            }
+            provisioner.verify_boots = 2
+            provisioner.adb_framework_boot_install_requested = (
+                lambda: False
+            )
+            provisioner.verify_requested_state = lambda: None
+            reboots = iter([("boot-0", "boot-1"), ("boot-1", "boot-2")])
+            provisioner.reboot = lambda: next(reboots)
+            writes: list = []
+
+            def fake_write_state(status, **state_kwargs):
+                writes.append((status, state_kwargs))
+
+            with (
+                unittest.mock.patch.object(
+                    provisioner,
+                    "adb_run",
+                    return_value=completed([], ALOHA.fingerprint + "\n"),
+                ),
+                unittest.mock.patch.object(
+                    provisioner.run_state, "write_state", fake_write_state
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                provisioner.verify_across_two_reboots()
+                install_write = writes[-1][1]
+                self.assertEqual(install_write["first_boot"], "boot-1")
+                self.assertEqual(install_write["second_boot"], "boot-2")
+                # The payload phase's terminal write supplies no
+                # boots; the run's own verified boots must
+                # survive it even though the merge never engaged.
+                provisioner.write_state("complete", merge_prior=True)
+            terminal_write = writes[-1][1]
+            self.assertEqual(terminal_write["first_boot"], "boot-1")
+            self.assertEqual(terminal_write["second_boot"], "boot-2")
+
+
 class VerifyRequestedStateAudioTest(unittest.TestCase):
     """The channel apply's final verification runs on the device's
     current boot, however old, so its audio check must use the

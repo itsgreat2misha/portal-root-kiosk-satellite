@@ -167,6 +167,40 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A later run's completion write could downgrade or erase
+  verification-grade facts an earlier run established
+  (Defect M, Phase D closure session 18, Nov 19, 2026). Two
+  losses, one root shape — the merged record trusted the
+  completing run's weaker view over the recorded one. (1) A
+  full run verified the OTA block directly and recorded it
+  done; a later channel run whose own end-of-run judgment
+  was "unverified" — a win-less boot cannot read the
+  posture's per-boot `otad.nodemon` property or stat the
+  override file, so the posture criteria were unobservable,
+  not failed — merged that weaker judgment over the verified
+  value, leaving the record claiming `unverified` for a
+  block that was positively verified. Verification-grade
+  values now merge monotonically: a run whose OTA judgment
+  is "unverified" no longer replaces a recorded verified
+  `disable_updates`; only a run that itself verifies
+  (records the action done) or positively refutes it (the
+  enable-updates restore, whose apply/restore pair hygiene
+  drops the key) changes the recorded value. Nothing
+  creates a verified value — with no verified prior,
+  "unverified" records exactly as before, and the
+  fast-path gates' recorded-posture trust is unchanged.
+  (2) The same full run's payload terminal write dropped
+  the two verification boots its install phase had just
+  recorded: the run had started from a pending record (a
+  recovered run), and the fill that supplies a run's own
+  verified boots to a write lived inside the manifest
+  merge, which a non-complete start record gates off — so
+  the terminal write replaced the verification write's
+  good record with null boots. The fill now happens for
+  every write, before the merge: the boots a run itself
+  established fill any the caller did not supply, explicit
+  caller boots still win, and the start record's block
+  still carries over where the run verified none.
 - A `--restore wireless-adb` run connected over wireless ADB
   itself stranded the device mid-run (Defect L, Phase D
   closure session 16, Nov 19, 2026): the restore executed
