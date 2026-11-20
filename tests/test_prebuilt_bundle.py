@@ -163,6 +163,20 @@ class PrebuiltBundleTest(unittest.TestCase):
         with self.assertRaises(ProvisionError):
             prebuilt_bundle.verify_files(bundle)
 
+    def test_builder_ships_the_release_signing_certificate(self) -> None:
+        # A bundle run standalone is its own running tree, and the
+        # runtime looks for the pinned release certificate there;
+        # if the builder stops shipping it, every signed bundle
+        # refuses to verify (the v0.9.0 live proof, Nov 20, 2026).
+        import build_release_bundle
+
+        self.assertIn(
+            prebuilt_bundle.RELEASE_CERT_NAME, build_release_bundle.ROOT_FILES
+        )
+        self.assertTrue(
+            (REPOSITORY / prebuilt_bundle.RELEASE_CERT_NAME).is_file()
+        )
+
     def test_unsigned_bundle_reports_no_signature(self) -> None:
         root = write_bundle(self.base / "bundle")
         bundle = self.load(root)

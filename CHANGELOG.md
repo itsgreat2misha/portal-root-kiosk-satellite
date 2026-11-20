@@ -181,6 +181,13 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The release bundle now ships `release-signing-cert.pem`. The
+  runtime looks for the pinned release certificate in the running
+  tree, and a bundle run standalone is its own running tree, so a
+  signed bundle used on its own refused to verify. Caught by the
+  v0.9.0 live bundle proof (Nov 20, 2026) before any device run;
+  the certificate is public material whose fingerprint is pinned
+  in code, so shipping it does not weaken the check.
 - The release workflow's Android SDK setup: the setup-android
   action's internal sdkmanager call for the legacy `tools`
   package fails on current cmdline-tools distributions, so the

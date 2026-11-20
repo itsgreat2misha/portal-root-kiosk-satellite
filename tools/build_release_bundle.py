@@ -22,7 +22,8 @@ assembles one bundle directory:
                                aloha targets stage for KASLR discovery
       tools/…                  the provisioner sources, so the bundle
                                alone is a runnable checkout
-      README.md / FORK.md / CHANGELOG.md / LICENSE / NOTICE
+      README.md / FORK.md / CHANGELOG.md / LICENSE / NOTICE /
+      release-signing-cert.pem
 
 Usage:
     python3 tools/build_release_bundle.py --output dist
@@ -51,6 +52,22 @@ from features.shizuku import SHIZUKU_APK_NAME, SHIZUKU_APK_SHA256, SHIZUKU_APK_U
 from portal_targets import TARGETS
 import prebuilt_bundle
 import provision_portal
+
+
+# Root-level files copied into the bundle. The release signing
+# certificate must ride along: the runtime looks for it in the
+# running tree (its fingerprint is pinned in code), and a bundle
+# run standalone IS the running tree, so without the certificate
+# every signed bundle refuses to verify. Found by the v0.9.0 live
+# bundle proof, Nov 20, 2026.
+ROOT_FILES = (
+    "README.md",
+    "FORK.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    prebuilt_bundle.RELEASE_CERT_NAME,
+)
 
 
 def expected_artifact_relpaths() -> list[str]:
@@ -157,7 +174,7 @@ def assemble(output_dir: pathlib.Path, version: str) -> pathlib.Path:
         bundle_dir / "tools",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
-    for name in ("README.md", "FORK.md", "CHANGELOG.md", "LICENSE", "NOTICE"):
+    for name in ROOT_FILES:
         shutil.copyfile(ROOT / name, bundle_dir / name)
 
     manifest = {
