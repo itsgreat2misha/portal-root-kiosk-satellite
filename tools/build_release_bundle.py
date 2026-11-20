@@ -44,6 +44,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
+import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -228,6 +229,23 @@ def make_tarball(bundle_dir: pathlib.Path) -> pathlib.Path:
     return tarball
 
 
+def make_zip(bundle_dir: pathlib.Path) -> pathlib.Path:
+    """The same bundle as a .zip, for hosts whose stock tooling has
+    no tar (notably Windows Explorer / Expand-Archive)."""
+    archive_path = bundle_dir.parent / (bundle_dir.name + ".zip")
+    with zipfile.ZipFile(
+        archive_path, "w", zipfile.ZIP_DEFLATED
+    ) as archive:
+        for path in sorted(bundle_dir.rglob("*")):
+            if path.is_file():
+                archive.write(
+                    path,
+                    arcname=path.relative_to(bundle_dir.parent).as_posix(),
+                )
+    print(f"zip written: {archive_path}")
+    return archive_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -250,6 +268,10 @@ def main() -> int:
         "--tarball", action="store_true",
         help="also write the .tar.gz next to the bundle directory",
     )
+    parser.add_argument(
+        "--zip", action="store_true",
+        help="also write the .zip next to the bundle directory",
+    )
     args = parser.parse_args()
 
     if not args.skip_build:
@@ -259,6 +281,8 @@ def main() -> int:
         sign_bundle(bundle_dir, args.sign_key)
     if args.tarball:
         make_tarball(bundle_dir)
+    if args.zip:
+        make_zip(bundle_dir)
     return 0
 
 

@@ -204,6 +204,27 @@ class MakefilePlatformTest(unittest.TestCase):
             )
 
 
+class SuitePortabilityTest(unittest.TestCase):
+    """D5/D6: the suite itself must run on all three host OSes, and
+    CI must actually run it there."""
+
+    def test_no_test_spawns_a_posix_shell(self) -> None:
+        own = pathlib.Path(__file__).resolve()
+        for test_file in (ROOT / "tests").glob("test_*.py"):
+            if test_file.resolve() == own:
+                continue  # this pin names the literal it scans for
+            self.assertNotIn(
+                '"/bin/sh"',
+                test_file.read_text(encoding="utf-8"),
+                f"{test_file.name} still spawns a POSIX shell",
+            )
+
+    def test_ci_matrix_covers_three_host_oses(self) -> None:
+        ci = _source(".github/workflows/ci.yml")
+        for os_name in ("ubuntu", "macos", "windows"):
+            self.assertIn(os_name, ci)
+
+
 class CheckoutAndManifestShapeTest(unittest.TestCase):
     """B7 + D7: LF-pinned checkout files and POSIX manifest keys."""
 

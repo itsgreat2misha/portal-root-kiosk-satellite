@@ -68,14 +68,16 @@ class _EvidenceDevice:
 def _exploit_with_device(
     provisioner: PortalProvisioner,
     device: _EvidenceDevice,
-    command: str,
+    script: str,
     output: io.StringIO,
 ) -> bool:
+    """Run exploit() against a child process running a Python script
+    (sys.executable, not /bin/sh, so the suite runs on Windows too)."""
     real_popen = subprocess.Popen
 
     def fake_popen(*args: object, **kwargs: object):
         return real_popen(
-            ["/bin/sh", "-c", command],
+            [sys.executable, "-c", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
@@ -120,7 +122,8 @@ class WatchResultEvidenceTest(unittest.TestCase):
             result = _exploit_with_device(
                 provisioner,
                 device,
-                "printf 'attempt output\\n'; exit 3",
+                "import sys; print('attempt output', flush=True); "
+                "sys.exit(3)",
                 output,
             )
 
@@ -147,7 +150,8 @@ class WatchResultEvidenceTest(unittest.TestCase):
             result = _exploit_with_device(
                 provisioner,
                 device,
-                "printf 'attempt output\\n'; exit 3",
+                "import sys; print('attempt output', flush=True); "
+                "sys.exit(3)",
                 output,
             )
 
@@ -169,7 +173,8 @@ class WatchResultEvidenceTest(unittest.TestCase):
             result = _exploit_with_device(
                 provisioner,
                 device,
-                "printf 'attempt output\\n'; exit 3",
+                "import sys; print('attempt output', flush=True); "
+                "sys.exit(3)",
                 output,
             )
 
@@ -195,7 +200,7 @@ class WatchResultEvidenceTest(unittest.TestCase):
             result = _exploit_with_device(
                 provisioner,
                 device,
-                "printf 'provision actions complete ok=1\\n'",
+                "print('provision actions complete ok=1', flush=True)",
                 output,
             )
 

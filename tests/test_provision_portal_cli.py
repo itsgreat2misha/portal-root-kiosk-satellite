@@ -1371,13 +1371,17 @@ class RemoteWipeCliTest(unittest.TestCase):
             def action_process(
                 *args: object, **kwargs: object
             ) -> subprocess.Popen[bytes]:
+                # sys.executable child, not /bin/sh, so the suite
+                # runs on hosts without a POSIX shell (Windows).
                 process = real_popen(
                     [
-                        "/bin/sh",
+                        sys.executable,
                         "-c",
-                        "printf 'OTA block file install ok=1\\n"
-                        "component ctl child=123 status=00000000 ok=1 "
-                        "uid=0 euid=0\\n'; sleep 30",
+                        "import time; "
+                        "print('OTA block file install ok=1', flush=True); "
+                        "print('component ctl child=123 "
+                        "status=00000000 ok=1 uid=0 euid=0', flush=True); "
+                        "time.sleep(30)",
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

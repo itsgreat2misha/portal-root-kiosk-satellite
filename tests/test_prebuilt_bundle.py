@@ -19,6 +19,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
@@ -110,6 +111,21 @@ class PrebuiltBundleTest(unittest.TestCase):
         with tarfile.open(tarball, "w:gz") as archive:
             archive.add(root, arcname=root.name)
         bundle = self.load(tarball)
+        entry = prebuilt_bundle.select_target_entry(bundle, TARGET)
+        self.assertEqual(entry["key"], TARGET.key)
+        prebuilt_bundle.verify_files(bundle)
+
+    def test_zip_bundle_loads(self) -> None:
+        root = write_bundle(self.base / "portal-provisioner-bundle-test")
+        archive_path = self.base / "bundle.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    archive.write(
+                        path,
+                        arcname=path.relative_to(root.parent).as_posix(),
+                    )
+        bundle = self.load(archive_path)
         entry = prebuilt_bundle.select_target_entry(bundle, TARGET)
         self.assertEqual(entry["key"], TARGET.key)
         prebuilt_bundle.verify_files(bundle)
