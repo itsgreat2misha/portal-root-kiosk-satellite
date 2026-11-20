@@ -1,8 +1,10 @@
 # Fork notes — itsgreat2misha/portal-root-kiosk-satellite
 
 Fork of [jxlarrea/portal-root-kiosk-satellite](https://github.com/jxlarrea/portal-root-kiosk-satellite)
-(created Nov 2, 2026 from upstream `main` @ f941b57). Mikhail's `bootstrap.sh`
-points at this fork. All changes are in `tools/provision_portal.py`:
+(created Nov 2, 2026 from upstream `main` @ f941b57). The owner's `bootstrap.sh`
+points at this fork. All changes are in the `tools/` provisioner
+package (originally the single `tools/provision_portal.py`, since
+split into modules):
 
 1. **A failed bootstrap phase no longer starves the rest of the run.**
    Each dedicated bootstrap phase (audio, OTA, Meta accounts,
@@ -51,11 +53,10 @@ Boot flow: BOOT_COMPLETED starts AutorootService. If the payload already answers
 
 ## 7. Live-test findings (Nov 4, 2026)
 
-Validated end-to-end on the library Portal+ (build 1041515800015050):
+Validated end-to-end on a Portal+ (build 1041515800015050):
 a single fork provisioning run (Run 14) followed by two independent
 reboots, each recovering the root daemon (127.0.0.1:37373, uid 0) and
-root-mode Shizuku with no host involvement and the sandbox watcher
-stopped.
+root-mode Shizuku with no host involvement.
 
 Findings folded back into the code above:
 
@@ -149,7 +150,7 @@ Helper 1.2 (versionCode 3):
   toggled while idle it just sets the flag. The cancelled_boot state
   and the CANCELLED phase are gone; the terminal phase is STOPPED.
 
-Live test (library Portal, 2026-11-04): a real UI tap ~3 s into
+Live test (a Portal, 2026-11-04): a real UI tap ~3 s into
 attempt 1's race ran the full sequence (runner killed, flag set,
 "stop from UI: disabled, rebooting" logged) -- but the reboot itself
 wedged in the race's hot phase and the device hung until a smart-plug
@@ -191,14 +192,14 @@ at exactly that point:
   mid-handoff recovery path (provisioning boot, or a session interrupted
   between the win and the handoff).
 
-Side effect: the unexplained daemon death on the basement-couchassistant
+Side effect: the unexplained daemon death on one
 provisioning boot (section 7 era; still unexplained under the old code)
 becomes moot - under this lifecycle a daemon that exits after its
-handoff is expected, by design. The couchassistant still runs helper 1.2
+handoff is expected, by design. That unit still runs helper 1.2
 until its next bootstrap run; its on-device session continues under the
 old rules meanwhile.
 
-Live validation (library Portal+, 2026-11-04, helper 1.3 installed in
+Live validation (a Portal+, 2026-11-04, helper 1.3 installed in
 place over 1.2): reboot -> session attempts 1-3 missed (attempt 3 fast),
 attempt 4 won; the win's foreground call resolved at the 600 s timeout
 with the daemon already serving; 6 s later `shizuku root ok pid=13457`,
@@ -220,7 +221,7 @@ name. Full plan: maintained with the goal workspace
 - Autoroot stays intentionally opt-in (--autoroot). Lock repair is
   not optional - it always runs in the payload path. Root adb is not
   optional either: establishing root means adbd runs as uid 0 too,
-  matching Shizuku. Mechanism (to be spiked first on the library
+  matching Shizuku. Mechanism (to be spiked first on a test
   unit): flip ro.debuggable in the shared property area from the
   uid-0 daemon and restart adbd - per-boot, since the property area
   is rebuilt every boot; RSA auth (ro.adb.secure=1) stays on.

@@ -219,6 +219,17 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- README verification claims corrected to the code: a run
+  verifies on one boot by default (`--verify-boots 1`), and the
+  feature table, the step-by-step ending line, and the
+  per-feature sections (audio, update blocking, remote wipe,
+  debloat, presence, app updates, Shizuku) no longer state
+  unconditional two-boot verification. The theme-control
+  example now shows the full `adb shell setprop` command, and
+  the bundle section notes the bundle is a runnable checkout
+  on its own. FORK.md lost the owner's first name, the
+  test-device room references, and the stale claim that all
+  changes live in `tools/provision_portal.py`.
 - The autoroot helper's root-daemon check ran a single probe
   and silently reported "daemon absent" on any failure. The
   verdict-time decisions that consume it (the post-verdict cut

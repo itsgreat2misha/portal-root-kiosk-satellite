@@ -53,7 +53,7 @@ Persistent features use focused configuration changes or small boot helpers.
 | [Private backup bundles](#backup-bundles) | Saves diagnostics and reversible settings in a private, checksummed archive. |
 | [Interrupted-run recovery](#interrupted-run-recovery) | Safely resumes a validated provisioning run after a host or power interruption. |
 | [Exact-build safeguards](#supported-models) | Refuses kernel changes unless the model and full firmware fingerprint match. |
-| [Automatic retry and verification](#running-and-troubleshooting) | Retries race-sensitive attempts and accepts changes only after two verified boots. |
+| [Automatic retry and verification](#running-and-troubleshooting) | Retries race-sensitive attempts and accepts changes only after verification on a following boot (two boots with `--verify-boots 2`). |
 
 <a id="what-cant-be-undone"></a>
 ## What can't be undone
@@ -256,7 +256,11 @@ against the device's exact target and verifies every file's hash
 against the project's pinned release certificate); a bundle that
 does not carry the device's build, or whose files do not verify,
 refuses the run and the device is left untouched. A model the bundle
-does not cover still provisions from a source build.
+does not cover still provisions from a source build. The bundle is
+also a complete runnable checkout: extract it and run
+`tools/provision_portal.py` from inside the extracted directory with
+`--bundle` naming that directory, and no clone or toolchain is
+needed.
 
 `--full` is a preset, not a separate mode: it expands to the
 documented full-setup line plus `--autoroot`:
@@ -281,8 +285,8 @@ want. Common add-ons:
 - `--autoroot` to re-establish root automatically after every reboot
   (it implies `--shizuku` and `--custom-payload`)
 
-The Portal reboots several times and ends with `PROVISION_OK` plus two
-different verification boot IDs.
+The Portal reboots several times and ends with `PROVISION_OK` plus the
+verification boot ID (two different boot IDs with `--verify-boots 2`).
 
 ## Provisioning feature reference
 
@@ -392,7 +396,7 @@ after AIService starts and repairs later firmware-side changes. On MHA devices,
 it reads the live hardware values and, if necessary, forces a temporary profile
 transition so the tuning manager reloads the patched regular-capture profile.
 It then verifies all nine suppression controls directly. The provisioner
-requires real DSP readbacks on two boots. A later
+requires real DSP readbacks on every verification boot. A later
 `--audio` run first checks the persistent
 installation marker and the running watchdog. If both are healthy, an
 audio-only command exits successfully without rebuilding, exploiting, or
@@ -458,8 +462,8 @@ re-asserts it after every boot for as long as updates stay
 disabled.
 
 The provisioner verifies the disabled packages and requires Meta's own service
-to report the value from the local override on two boots. It refuses to replace
-an unrelated existing override. The original file state is recorded under
+to report the value from the local override on every verification
+boot. It refuses to replace an unrelated existing override. The original file state is recorded under
 `/data/local/tmp/portal-ota-backup`.
 
 Restore that exact override state and re-enable both OTA packages with:
@@ -488,8 +492,8 @@ enabled, and hardware or recovery-menu factory resets remain available.
 
 The provisioner records the original state of each receiver, applies the
 change through Android's Package Manager, and verifies that both receivers
-remain disabled across two boots. It does not claim to block every possible
-privileged Android reset path; it blocks the two known Meta remote-wipe entry
+remain disabled on every verification boot. It does not claim to
+block every possible privileged Android reset path; it blocks the two known Meta remote-wipe entry
 points present in the supported firmware.
 
 Restore both receivers to their individually saved states with:
@@ -914,7 +918,7 @@ python3 tools/provision_portal.py \
 ```
 
 Both commands verify the retained camera, AIService, launcher, and WebView
-paths across two reboots.
+paths on every verification boot.
 
 </details>
 
@@ -1004,7 +1008,7 @@ processor, populated pose-estimator metrics, all five settings loaded as
 false, and hardware cropping absent from the active camera request on every
 verification boot. Those checks cover the same retained path
 that updates AIService's world model and emits `Notify people presence`, so the
-two-reboot verification can run unattended. An actual presence event is
+verification can run unattended. An actual presence event is
 reported as additional evidence when one occurs, but it is not required for a
 successful run. On the tested Portal Go, the original cropped optimization
 averaged 22.1% of one core but reduced the usable field of view. The corrected
@@ -1042,7 +1046,7 @@ including correctly signed third-party releases, with
 setting and verifier-package state, sets `package_verifier_enable=0`, and
 disables Meta's verifier package for user 0. The package state is the durable
 control if Meta later rewrites the Android setting. The provisioner verifies
-both states on two separate boots.
+both states on every verification boot.
 
 This action is independent of Shizuku. It allows updates installed through the
 normal Android confirmation screen, a Device Owner app, the optional
@@ -1096,8 +1100,8 @@ Camera2 capture and encoder path, so it remains free to stream at its configured
 frame rate. A live Portal Go test decoded 56 RTSP frames over 9.98 seconds,
 about 5.5 FPS from the configured roughly 6 FPS stream, while Meta analysis
 remained at 2 FPS. The provisioner verifies the applied analysis rate, full
-field of view, camera request, pose pipeline, and helper activation on two
-boots.
+field of view, camera request, pose pipeline, and helper activation on every
+verification boot.
 
 Remove only the cap and helper while keeping the full-scene optimization:
 
@@ -1179,8 +1183,8 @@ values `light` and `dark`; each maps to a hardcoded `cmd uimode night no` or
 Set the props from ADB like this:
 
 ```sh
-setprop debug.portal.system_theme dark
-setprop debug.portal.system_theme light
+adb -s "$PORTAL_IP:5555" shell setprop debug.portal.system_theme dark
+adb -s "$PORTAL_IP:5555" shell setprop debug.portal.system_theme light
 ```
 
 
@@ -1229,8 +1233,8 @@ Shizuku runs as Android user `shell` (UID 2000), which is the normal Shizuku
 ADB privilege level; it is not a persistent UID-0 root service. Once
 installation completes, no host computer or network connection is needed for
 startup. Wireless ADB must remain enabled locally because the helper uses its
-loopback listener. The two-boot verifier requires `shizuku_server` to run as
-`shell` after both ordinary reboots.
+loopback listener. The verifier requires `shizuku_server` to run as
+`shell` after every verification reboot.
 
 To use a Shizuku APK you downloaded yourself, run:
 
