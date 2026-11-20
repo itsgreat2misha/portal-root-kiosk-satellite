@@ -46,6 +46,12 @@ the fork diverged from upstream:
   no tar. The README's host requirements are stated per platform,
   including the Windows difference that POSIX file modes (0600 on
   the local state file and backup bundles) are not enforced there.
+  The matrix then found and fixed a second byte-fidelity class the
+  audit missed: the provision state file, backup/diagnostics
+  records and the signed bundle manifest are written with LF
+  pinned (they are compared or verified byte-for-byte), and the
+  state manifest's artifact hash keys are POSIX paths so a manifest
+  recorded on one host OS verifies on another.
 - Prebuilt release bundle (Phase E): release CI builds all five
   target payloads plus the model-independent APK set into one bundle
   with a SHA-256 hash manifest (`tools/build_release_bundle.py`),
