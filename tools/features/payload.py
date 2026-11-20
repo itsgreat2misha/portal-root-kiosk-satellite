@@ -810,7 +810,9 @@ class PayloadFeature:
                     for key, value in sorted(environment.items())
                 )
                 local = pathlib.Path(temp) / name
-                local.write_text(rendered, encoding="utf-8")
+                # newline="": the device shell sources this file, and
+                # a Windows host's default text mode would write CRLF.
+                local.write_text(rendered, encoding="utf-8", newline="")
                 remote = f"{AUTOROOT_REMOTE_DIR}/{name}"
                 self._adb_run(["push", str(local), remote], timeout=15, check=True)
                 self._adb_run(
@@ -833,7 +835,7 @@ class PayloadFeature:
             if self._alohausers_disabled_desired():
                 conf += "ALOHAUSERS_DISABLED=1\n"
             local_conf = pathlib.Path(temp) / "autoroot.conf"
-            local_conf.write_text(conf, encoding="utf-8")
+            local_conf.write_text(conf, encoding="utf-8", newline="")
             self._adb_run(
                 ["push", str(local_conf), AUTOROOT_CONF_REMOTE],
                 timeout=15,

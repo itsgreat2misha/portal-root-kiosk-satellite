@@ -679,7 +679,9 @@ class PresenceFeature:
             raise ProvisionError("Portal presence helper returned an invalid ADB public key")
         self._log_dir().mkdir(parents=True, exist_ok=True)
         self.presence_public_key = self._log_dir() / "portal-presence-adbkey.pub"
-        self.presence_public_key.write_text(public + "\n", encoding="ascii")
+        self.presence_public_key.write_text(
+            public + "\n", encoding="ascii", newline=""
+        )
         self.presence_public_key.chmod(0o600)
         print(
             f"PRESENCE_HELPER_PAYLOAD_OK package={PRESENCE_HELPER_PACKAGE} "

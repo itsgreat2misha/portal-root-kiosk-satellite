@@ -1,6 +1,6 @@
 include ../android-env.mk
 
-TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG)
 CXX := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang++
 CC := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang
 OBJCOPY := $(TOOLCHAIN)/bin/llvm-objcopy
@@ -38,7 +38,7 @@ $(HOOK_OBJECT): native/boot_hook.S
 
 $(HOOK): $(HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 316
+	test "$$(wc -c < $@ | tr -d ' ')" -le 316
 
 $(ALOHA_LIBRARY): native/portal_camera_led_watch.cpp native/portal_camera_led_jni.cpp
 	mkdir -p $(BUILD)
@@ -66,7 +66,7 @@ $(ALOHA_HOOK_OBJECT): native/boot_hook_runtime.S
 
 $(ALOHA_HOOK): $(ALOHA_HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 32768
+	test "$$(wc -c < $@ | tr -d ' ')" -le 32768
 
 $(ALOHA_APK): AndroidManifest.xml $(ALOHA_LIBRARY) $(ALOHA_BOOTSTRAP) $(KEYSTORE)
 	rm -rf $(ALOHA_APK_STAGE) $(ALOHA_APK_UNSIGNED) $(ALOHA_APK_ALIGNED) $@

@@ -1,6 +1,6 @@
 include ../android-env.mk
 
-TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG)
 NATIVE_CC := $(TOOLCHAIN)/bin/armv7a-linux-androideabi29-clang
 NATIVE_CC_API28 := $(TOOLCHAIN)/bin/armv7a-linux-androideabi28-clang
 BUILD := build

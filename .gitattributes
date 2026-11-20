@@ -1,0 +1,9 @@
+# Device-bound and build files must keep LF line endings on every
+# host: autoroot-helper/run.sh is pushed verbatim to the device and
+# sourced by its shell, and the Makefiles are read by GNU make. A
+# Windows checkout with core.autocrlf=true would otherwise convert
+# them to CRLF and break both.
+*.sh text eol=lf
+*.py text eol=lf
+*.mk text eol=lf
+Makefile text eol=lf

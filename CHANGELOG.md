@@ -14,6 +14,27 @@ the fork diverged from upstream:
 
 ### Added
 
+- Cross-platform host support, first half (Phase F): the exploit
+  attempt runner streams process output through a reader thread and
+  a queue instead of `select()` on a pipe (Windows accepts sockets
+  only, so provisioning could not run at all on a Windows host).
+  Every file written for the device (autoroot env/conf, staged
+  state, account and debloat backups, helper keypairs) is now
+  written with LF line endings pinned, so a Windows host no longer
+  stages CRLF files the device shell cannot parse; a new
+  `.gitattributes` pins LF for shell scripts, Python sources and
+  Makefiles in every checkout. The build environment resolves the
+  NDK host tag (linux/darwin/windows), the Windows build-tools
+  program names (`.exe`/`.bat`), and the standard macOS/Windows SDK
+  locations; the Makefiles take the NDK host tag from
+  `android-env.mk` and the uid1000 size gates use a portable
+  `wc -c` check instead of GNU `stat -c`. Native Windows Python
+  gets an honest up-front answer for source builds (use the
+  prebuilt bundle, or WSL2) instead of a mid-build make failure.
+  The default run log directory uses the platform temp directory,
+  the dry-run report probes the running interpreter instead of a
+  `python3` PATH entry, and backup/diagnostics bundle manifests
+  record POSIX path keys on every host.
 - Prebuilt release bundle (Phase E): release CI builds all five
   target payloads plus the model-independent APK set into one bundle
   with a SHA-256 hash manifest (`tools/build_release_bundle.py`),

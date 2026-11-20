@@ -16,8 +16,8 @@ import hashlib
 import json
 import os
 import pathlib
+import queue
 import re
-import select
 import shlex
 import shutil
 import socket
@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
@@ -4356,8 +4357,15 @@ class PortalProvisioner:
                 else 2
             ),
             "host_tools": {
-                name: shutil.which(name) is not None
-                for name in ("adb", "git", "make", "python3")
+                **{
+                    name: shutil.which(name) is not None
+                    for name in ("adb", "git", "make")
+                },
+                # The interpreter running this process, not a PATH
+                # probe: stock Windows provides python.exe/py.exe but
+                # no python3 (the Microsoft Store python3.exe is a
+                # stub), so a PATH probe misreports both ways.
+                "python3": bool(sys.executable),
             },
             "build_outputs": {
                 path: pathlib.Path(path).is_file() for path in required_outputs
@@ -4424,7 +4432,7 @@ class PortalProvisioner:
             assert isinstance(hashes, dict)
             for path in sorted(root.rglob("*")):
                 if path.is_file():
-                    hashes[str(path.relative_to(root))] = hashlib.sha256(
+                    hashes[path.relative_to(root).as_posix()] = hashlib.sha256(
                         path.read_bytes()
                     ).hexdigest()
             (root / "manifest.json").write_text(
@@ -4585,7 +4593,7 @@ class PortalProvisioner:
                 for path in sorted(root.rglob("*")):
                     if path.is_file():
                         archive.write(
-                            path, arcname=path.relative_to(root)
+                            path, arcname=path.relative_to(root).as_posix()
                         )
         bundle_path.chmod(0o600)
         print(f"DIAGNOSTICS_OK bundle={bundle_path}", flush=True)
@@ -5708,10 +5716,7 @@ class PortalProvisioner:
             if value:
                 roots.append(pathlib.Path(value) / "ndk")
         roots.extend(
-            (
-                pathlib.Path.home() / "android-sdk/ndk",
-                pathlib.Path.home() / "Android/Sdk/ndk",
-            )
+            candidate / "ndk" for candidate in default_sdk_candidates()
         )
         candidates: list[pathlib.Path] = []
         for root in roots:
@@ -6966,15 +6971,35 @@ class PortalProvisioner:
             # log says whether output ended by EOF, by the process
             # exiting, by a marker, or by the deadline expiring.
             attempt_end = "deadline"
+            # Stream the attempt output through a reader thread and a
+            # queue: select() on a pipe is POSIX-only (Windows accepts
+            # sockets only), while a blocking read in a thread is
+            # portable. The reader drains the pipe to EOF in order, so
+            # the line processing below sees exactly what the select
+            # loop saw.
+            output_queue: queue.Queue[bytes | None] = queue.Queue()
+
+            def _pump_attempt_output() -> None:
+                try:
+                    while True:
+                        chunk = os.read(process.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        output_queue.put(chunk)
+                except OSError:
+                    pass
+                output_queue.put(None)
+
+            threading.Thread(target=_pump_attempt_output, daemon=True).start()
             while time.monotonic() < deadline:
-                ready, _, _ = select.select([process.stdout], [], [], 1)
-                if not ready:
+                try:
+                    chunk = output_queue.get(timeout=1)
+                except queue.Empty:
                     if process.poll() is not None:
                         attempt_end = "process-exit"
                         break
                     continue
-                chunk = os.read(process.stdout.fileno(), 4096)
-                if not chunk:
+                if chunk is None:
                     attempt_end = "eof"
                     break
                 text = chunk.decode("utf-8", errors="replace")
@@ -7721,7 +7746,9 @@ class PortalProvisioner:
         remote_tmp = remote + ".tmp"
         with tempfile.TemporaryDirectory(prefix="portal-state-") as temporary:
             local = pathlib.Path(temporary) / "state.tsv"
-            local.write_text(contents, encoding="utf-8")
+            # newline="": the file is parsed on the device, and a
+            # Windows host's default text mode would write CRLF.
+            local.write_text(contents, encoding="utf-8", newline="")
             self.adb_run(["push", str(local), remote_tmp], timeout=20, check=True)
         mode = "0644" if remote == DEBLOAT_COMPONENT_ACTIONS_REMOTE else "0600"
         command = (
@@ -9161,12 +9188,71 @@ def keystore_certificate_sha256(keystore: pathlib.Path) -> str:
     return match.group(1).upper()
 
 
+def ndk_host_tag(platform: str | None = None) -> str:
+    """The NDK prebuilt toolchain directory tag for a host platform.
+
+    The NDK ships linux-x86_64, darwin-x86_64 and windows-x86_64
+    prebuilts; the tag is part of every toolchain path, so a hardcoded
+    linux tag made the build report its compilers missing on macOS
+    and Windows hosts."""
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        return "darwin-x86_64"
+    if platform.startswith("win") or platform in ("msys", "cygwin"):
+        return "windows-x86_64"
+    return "linux-x86_64"
+
+
+def build_tools_filename(name: str, platform: str | None = None) -> str:
+    """An Android SDK build-tools program name for a host platform.
+
+    Windows ships the native tools as .exe and the Java-based tools
+    (apksigner, d8) as .bat shims; POSIX hosts use the bare names."""
+    platform = sys.platform if platform is None else platform
+    if platform.startswith("win"):
+        return name + (".bat" if name in ("apksigner", "d8") else ".exe")
+    return name
+
+
+def default_sdk_candidates() -> tuple[pathlib.Path, ...]:
+    """Per-user Android SDK locations probed when no env var names one.
+
+    Includes the standard Android Studio locations for each host
+    platform (~/Library/Android/sdk on macOS, %LOCALAPPDATA% on
+    Windows), not only the Linux ones."""
+    home = pathlib.Path.home()
+    candidates = [
+        home / "Android/Sdk",
+        home / "Android/sdk",
+        home / "android-sdk",
+    ]
+    if sys.platform == "darwin":
+        candidates.append(home / "Library/Android/sdk")
+    elif sys.platform.startswith("win"):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(pathlib.Path(local_app_data) / "Android/Sdk")
+    return tuple(candidates)
+
+
 def android_build_environment(
     target: PortalTarget | None = None,
     *,
     require_simpleperf: bool = False,
 ) -> dict[str, str]:
     """Resolve and validate the per-user Android toolchain."""
+    if sys.platform == "win32":
+        # The build drives GNU make and POSIX shell recipes, which a
+        # native Windows Python cannot run. Gate honestly instead of
+        # failing at the first make invocation: the prebuilt bundle
+        # needs only Python + adb, and WSL2 provides a Linux
+        # environment where the source build works unchanged.
+        raise ProvisionError(
+            "source builds are not supported under native Windows "
+            "Python: the build requires GNU make and a POSIX shell. "
+            "Use a prebuilt release bundle (Python + adb only), or run "
+            "the source build inside WSL2."
+        )
     environment = dict(os.environ)
 
     sdk_value = environment.get("ANDROID_SDK_ROOT") or environment.get(
@@ -9175,11 +9261,7 @@ def android_build_environment(
     if sdk_value:
         sdk = pathlib.Path(sdk_value).expanduser()
     else:
-        sdk_candidates = (
-            pathlib.Path.home() / "Android/Sdk",
-            pathlib.Path.home() / "Android/sdk",
-            pathlib.Path.home() / "android-sdk",
-        )
+        sdk_candidates = default_sdk_candidates()
         sdk = next(
             (candidate for candidate in sdk_candidates if candidate.is_dir()),
             sdk_candidates[0],
@@ -9210,8 +9292,10 @@ def android_build_environment(
             str(sdk / "platforms" / ANDROID_PLATFORM_VERSION / "android.jar"),
         )
     ).expanduser()
-    d8 = pathlib.Path(environment.get("D8", str(build_tools / "d8"))).expanduser()
-    toolchain_bin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    d8 = pathlib.Path(
+        environment.get("D8", str(build_tools / build_tools_filename("d8")))
+    ).expanduser()
+    toolchain_bin = ndk / "toolchains/llvm/prebuilt" / ndk_host_tag() / "bin"
 
     required_paths = {
         "Android NDK arm64 compiler": (
@@ -9224,9 +9308,11 @@ def android_build_environment(
             toolchain_bin / "armv7a-linux-androideabi29-clang"
         ),
         "Android SDK Platform 36": android_jar,
-        "Android Build Tools aapt": build_tools / "aapt",
-        "Android Build Tools apksigner": build_tools / "apksigner",
-        "Android Build Tools zipalign": build_tools / "zipalign",
+        "Android Build Tools aapt": build_tools / build_tools_filename("aapt"),
+        "Android Build Tools apksigner": build_tools
+        / build_tools_filename("apksigner"),
+        "Android Build Tools zipalign": build_tools
+        / build_tools_filename("zipalign"),
         "Android Build Tools d8": d8,
     }
     if target and (target.bundled_simpleperf or require_simpleperf):

@@ -404,7 +404,7 @@ class SettingsFeature:
                 )
                 with tempfile.TemporaryDirectory(prefix="portal-meta-accounts-") as tmp:
                     local = pathlib.Path(tmp) / "accounts.tsv"
-                    local.write_text(contents, encoding="utf-8")
+                    local.write_text(contents, encoding="utf-8", newline="")
                     self._adb_run(
                         ["push", str(local), META_ACCOUNT_BACKUP_REMOTE],
                         timeout=15,
@@ -419,7 +419,7 @@ class SettingsFeature:
                 contents = existing.stdout
             host_backup = self._log_dir / "meta-accounts-before.tsv"
             if not host_backup.exists():
-                host_backup.write_text(contents, encoding="utf-8")
+                host_backup.write_text(contents, encoding="utf-8", newline="")
                 host_backup.chmod(0o600)
             print(
                 f"META_ACCOUNT_PREFLIGHT accounts={len(accounts)} "
@@ -704,7 +704,7 @@ class SettingsFeature:
             remote_tmp = DEBLOAT_BACKUP_REMOTE + ".tmp"
             with tempfile.TemporaryDirectory(prefix="portal-debloat-") as temporary:
                 local = pathlib.Path(temporary) / "backup.tsv"
-                local.write_text(contents, encoding="utf-8")
+                local.write_text(contents, encoding="utf-8", newline="")
                 self._adb_run(["push", str(local), remote_tmp], timeout=15, check=True)
             command = (
                 f"chmod 0600 {shlex.quote(remote_tmp)} && "
