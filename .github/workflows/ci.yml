@@ -24,13 +24,13 @@ jobs:
         with:
           python-version: "3.12"
       # The suite is hermetic by contract: it must pass with no adb
-      # binary present. GitHub's Linux/macOS runners ship none, so
-      # those legs are the guard against tests leaking to a real
-      # device tool. The Windows image ships an Android SDK, so the
-      # guard is not asserted there; the suite's device addresses
-      # are TEST-NET and unroutable either way.
+      # binary present. GitHub's Linux runners ship none, so that
+      # leg is the guard against tests leaking to a real device
+      # tool. The macOS and Windows images ship an Android SDK, so
+      # the guard is not asserted there; the suite's device
+      # addresses are TEST-NET and unroutable either way.
       - name: Confirm adb is absent (hermetic-suite guard)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           if command -v adb; then
@@ -51,26 +51,53 @@ jobs:
       - name: Win tests group 3
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_collect_diagnostics tests.test_cross_platform tests.test_deferred_failures tests.test_device_session
-      - name: Win tests group 4a fast_paths
-        if: always() && runner.os == 'Windows'
-        run: python -m unittest tests.test_fast_paths
       - name: Win tests group 4b flag_consolidation
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_flag_consolidation
-      - name: Win tests group 4c m0_characterization
-        if: always() && runner.os == 'Windows'
-        run: python -m unittest tests.test_m0_characterization
       - name: Win tests group 5
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_mha_tuning tests.test_ota_nodemon tests.test_portal_targets tests.test_prebuilt_bundle
-      - name: Win tests group 6a provision_portal_cli
-        if: always() && runner.os == 'Windows'
-        run: python -m unittest tests.test_provision_portal_cli
       - name: Win tests group 6b watch_result_evidence
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_watch_result_evidence
       - name: Win tests group 6c wifi_flush_guard
         if: always() && runner.os == 'Windows'
         run: python -m unittest tests.test_wifi_flush_guard
+      - name: Win fp chunk 1
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths.NoopBlockerTest tests.test_fast_paths.RootSetupBlockerTest tests.test_fast_paths.ChannelBlockerTest tests.test_fast_paths.AudioChannelPreflightTest tests.test_fast_paths.AudioRepairRoutingTest tests.test_fast_paths.ChannelApplyTest
+      - name: Win fp chunk 2
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths.ChannelComponentExecutionTest tests.test_fast_paths.ChannelManifestMergeTest tests.test_fast_paths.SubsetStagesManifestMergeTest tests.test_fast_paths.PayloadTerminalManifestMergeTest tests.test_fast_paths.CombinedRunVerificationBootsTest
+      - name: Win fp chunk 3
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths.VerificationGradeMergeTest tests.test_fast_paths.VerifyRequestedStateAudioTest tests.test_fast_paths.RunFastPathTest tests.test_fast_paths.RecordedDnsInvariantTest tests.test_fast_paths.RequestedDnsIntentGateTest
+      - name: Win fp chunk 4
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths.DnsRecordHygieneTest tests.test_fast_paths.RestoreGateTest tests.test_fast_paths.RestoreRecordHygieneTest tests.test_fast_paths.SharedApplySequenceTest tests.test_fast_paths.ForceTest
+      - name: Win fp chunk 5
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_fast_paths.VerifyShizukuChannelTest tests.test_fast_paths.VerifyPresenceChannelTest tests.test_fast_paths.ShutterAwarePresenceTest tests.test_fast_paths.WirelessAdbRestoreTransportGateTest
+      - name: Win m0 chunk 1
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_m0_characterization.CliDefaultsTest tests.test_m0_characterization.CliSingleFlagMappingTest tests.test_m0_characterization.CliValidationTest tests.test_m0_characterization.MainConfigMappingTest tests.test_m0_characterization.ConstructorConfigMappingTest tests.test_m0_characterization.ProvisionStateRoundTripTest
+      - name: Win m0 chunk 2
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_m0_characterization.BackupBundleFormatTest tests.test_m0_characterization.PrivateDnsBackupRoundTripTest tests.test_m0_characterization.PrivateDnsApplyTest tests.test_m0_characterization.AdbAuthTimeoutBackupRoundTripTest tests.test_m0_characterization.AppVerifierBackupRoundTripTest tests.test_m0_characterization.TsvBackupRoundTripTest
+      - name: Win m0 chunk 3
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_m0_characterization.TargetMarkerTest tests.test_m0_characterization.ProvisionOkMarkerTest tests.test_m0_characterization.VerifyMarkersTest tests.test_m0_characterization.ExploitUsersMarkerTest tests.test_m0_characterization.ShizukuMarkersTest tests.test_m0_characterization.CustomPayloadMarkerTest
+      - name: Win m0 chunk 4
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_m0_characterization.AutorootStagedMarkerTest tests.test_m0_characterization.RecoverMarkersTest tests.test_m0_characterization.DryRunReportTest tests.test_m0_characterization.FailureBeforeRebootTest
+      - name: Win cli chunk 1
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_provision_portal_cli.AudioWatchdogVerificationTest tests.test_provision_portal_cli.PersistentWirelessAdbCliTest tests.test_provision_portal_cli.SystemThemeControlCliTest tests.test_provision_portal_cli.CustomPayloadCliTest tests.test_provision_portal_cli.AndroidBuildEnvironmentTest tests.test_provision_portal_cli.AdbAuthorizationTimeoutCliTest
+      - name: Win cli chunk 2
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_provision_portal_cli.ShizukuCliTest tests.test_provision_portal_cli.RemoteWipeCliTest tests.test_provision_portal_cli.ApkInstallVerifierBaselineTest tests.test_provision_portal_cli.HelperSignatureMismatchInstallTest tests.test_provision_portal_cli.OwnPackageSignatureMismatchInstallTest
+      - name: Win cli chunk 3
+        if: always() && runner.os == 'Windows'
+        run: python -m unittest tests.test_provision_portal_cli.StreamliningTest tests.test_provision_portal_cli.DeKioskScrubTest tests.test_provision_portal_cli.OtaPlatformBackendTest tests.test_provision_portal_cli.PhaseC2RestoreFpsGatingTest tests.test_provision_portal_cli.OtaPollingOverrideTest
       - name: Byte-compile all Python sources
         run: python -m compileall -q tools tests
