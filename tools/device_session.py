@@ -50,6 +50,41 @@ def run_command(
     return result
 
 
+def _connect_hint(connect_output: str, state_output: str) -> str | None:
+    """Plain-language diagnosis for a failed connect attempt, from
+    what adb itself reported; None when nothing specific is known."""
+    text = f"{connect_output}\n{state_output}".lower()
+    if "unauthorized" in text:
+        return (
+            "The Portal is waiting for approval: look at its screen "
+            "and tap Allow for this computer."
+        )
+    if "connection refused" in text or "actively refused" in text:
+        return (
+            "The Portal refused the connection: wireless ADB is not "
+            "on. Enable ADB in the Portal's Debug menu, then run "
+            "`adb -d tcpip 5555` from a terminal while USB is "
+            "connected."
+        )
+    if "offline" in text:
+        return (
+            "The Portal's ADB is offline: turn ADB off and back on "
+            "in the Portal's Debug menu."
+        )
+    if (
+        "timed out" in text
+        or "no route to host" in text
+        or "cannot connect" in text
+        or "failed to connect" in text
+        or "network is unreachable" in text
+    ):
+        return (
+            "No answer from the Portal: check the address is right "
+            "and this computer is on the same Wi-Fi network."
+        )
+    return None
+
+
 class DeviceSession:
     """adb transport for a single device serial."""
 
@@ -80,19 +115,35 @@ class DeviceSession:
         except ProvisionError:
             pass
         deadline = time.monotonic() + wait_seconds
+        last_hint: str | None = None
+        printed_hint: str | None = None
         while time.monotonic() < deadline:
+            hint: str | None = None
             try:
-                self.run(["adb", "connect", self.serial], timeout=5)
+                connected = self.run(
+                    ["adb", "connect", self.serial], timeout=5
+                )
                 state = self.adb_run(["get-state"], timeout=5)
                 completed = self.adb_run(
                     ["shell", "getprop", "sys.boot_completed"], timeout=5
                 )
                 if state.returncode == 0 and completed.stdout.strip() == "1":
                     return
+                hint = _connect_hint(connected.stdout, state.stdout)
             except ProvisionError:
                 pass
+            if hint is not None:
+                last_hint = hint
+                if hint != printed_hint:
+                    print(hint, flush=True)
+                    printed_hint = hint
             time.sleep(3)
-        raise ProvisionError(f"{self.serial} did not reconnect after {wait_seconds}s")
+        message = (
+            f"could not connect to {self.serial} after {wait_seconds}s"
+        )
+        if last_hint:
+            message += f". {last_hint}"
+        raise ProvisionError(message)
 
     def reboot(self) -> tuple[str, str]:
         before = self.adb_run(

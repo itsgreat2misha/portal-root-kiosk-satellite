@@ -3362,6 +3362,120 @@ class PortalProvisioner:
             actions["custom_payload"] = str(self.custom_payload)
         return actions
 
+    #: Plain-language summary lines for the pre-flight confirmation,
+    #: keyed by requested_actions() names.
+    _PREFLIGHT_ACTION_LINES = {
+        "audio": "Tune the microphone for this Portal model",
+        "restore_audio": "Restore the stock microphone tuning",
+        "disable_updates": "Turn off Meta system updates",
+        "enable_updates": "Turn Meta system updates back on",
+        "block_remote_wipe": "Block Meta remote wipe and factory reset",
+        "restore_remote_wipe": "Allow Meta remote wipe again",
+        "debloat": (
+            "Disable unused Meta apps and diagnostics; this also "
+            "turns Android Private DNS off (the Portal uses your "
+            "network's DNS) and disables Meta's app verifier so "
+            "other apps can update"
+        ),
+        "restore_bloat": (
+            "Re-enable the apps debloat disabled, from the recorded "
+            "original states"
+        ),
+        "remove_meta_accounts": "Remove the Meta accounts from this Portal",
+        "optimize_presence": "Reduce presence-detection CPU use",
+        "restore_presence_profile": "Restore the stock presence profile",
+        "restore_presence_fps": "Restore the stock presence frame rate",
+        "presence_fps_cap": "Cap the presence-analysis frame rate",
+        "dhcp_dns": "Turn Android Private DNS off (use the network's DNS)",
+        "restore_privacy_dns": "Restore Private DNS to its recorded setting",
+        "allow_app_updates": (
+            "Disable Meta's app verifier so other apps can update"
+        ),
+        "restore_app_verifier": "Re-enable Meta's app verifier",
+        "shizuku": "Install and start Shizuku",
+        "remove_shizuku": "Remove Shizuku",
+        "disable_camera_light": "Disable the camera indicator light",
+        "restore_camera_light": "Restore the camera indicator light",
+        "disable_adb_auth_timeout": (
+            "Keep approved computers authorized for ADB indefinitely"
+        ),
+        "restore_adb_auth_timeout": (
+            "Restore the stock ADB authorization timeout"
+        ),
+        "persistent_wireless_adb": (
+            "Make wireless ADB stay on across reboots"
+        ),
+        "system_theme_control": "Set the system theme",
+        "custom_payload": "Install the root daemon payload",
+        "restore_autoroot": "Remove the on-device root persistence",
+        "restore_wireless_adb": "Remove persistent wireless ADB",
+        "restore_theme": "Restore the recorded system theme",
+        "restore_meta_authenticators": (
+            "Restore the Meta authenticator apps"
+        ),
+    }
+
+    def confirm_run_plan(self) -> None:
+        """Print what this run will do, in plain language, and — on
+        an interactive terminal — ask before anything changes.
+
+        Called from provision() at the point where every read-only
+        check and no-op early return is behind the run and the first
+        device change is ahead of it. Non-interactive runs (scripts,
+        tests) print the summary and proceed.
+        """
+        actions = self.requested_actions()
+        print("This run will:", flush=True)
+        if self.target is not None:
+            print(
+                f"  Target: {self.target.model} ({self.target.key}), "
+                f"serial {self.serial}",
+                flush=True,
+            )
+        if self.autoroot:
+            print(
+                "  - Root this Portal and install on-device root "
+                "persistence, so root comes back by itself after "
+                "every reboot",
+                flush=True,
+            )
+        for name in actions:
+            if name in ("dhcp_dns", "allow_app_updates") and (
+                "debloat" in actions
+            ):
+                continue  # folded into the debloat line
+            line = self._PREFLIGHT_ACTION_LINES.get(name)
+            if line is not None:
+                print(f"  - {line}", flush=True)
+        if self.remove_meta_accounts:
+            print(
+                "  One-way step: removing the Meta accounts cannot "
+                "be undone by this tool. The Portal would need the "
+                "accounts signed in again by hand.",
+                flush=True,
+            )
+        print(
+            "The Portal will reboot several times during the run, "
+            "and the run ends by checking it comes back on its own. "
+            "Nothing has been changed yet.",
+            flush=True,
+        )
+        try:
+            interactive = sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            interactive = False
+        if not interactive:
+            return
+        try:
+            answer = input("Continue? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            raise ProvisionError(
+                "cancelled at the pre-flight confirmation; "
+                "no changes were made"
+            )
+
     def tool_revision(self) -> str:
         return self.run_state.tool_revision()
 
@@ -8502,6 +8616,13 @@ class PortalProvisioner:
                 return
         if self.backup_path:
             self.create_backup_bundle(self.backup_path)
+        # Everything above this point is reads, host-side recording
+        # and no-op early returns; everything below changes the
+        # device. Show the plan (and ask, on a terminal) first.
+        # Sub-provisions (the wireless-ADB bootstrap child) skip it:
+        # the parent run already showed the plan.
+        if not self.wireless_adb_only and not self.adb_framework_only:
+            self.confirm_run_plan()
         persistent_property = (
             self.target.wireless_adb_file_property
             if self.target and self.target.wireless_adb_file_property

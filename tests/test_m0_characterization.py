@@ -537,6 +537,9 @@ class MainConfigMappingTest(unittest.TestCase):
             mock.patch.object(
                 provision_portal_module, "PortalProvisioner", FakeProvisioner
             ),
+            # The mapping tests are host-independent: stand in for a
+            # present adb so main()'s adb preflight does not fire.
+            mock.patch("shutil.which", return_value="/usr/bin/adb"),
             contextlib.redirect_stderr(stderr),
         ):
             result = provision_portal_module.main()
