@@ -37,6 +37,7 @@ from features.presence import (  # noqa: E402
 )
 from features.settings import (  # noqa: E402
     META_AUTHENTICATOR_COMPONENTS,
+    META_AUTHENTICATOR_PACKAGE,
     SettingsConfig,
     SettingsFeature,
 )
@@ -775,7 +776,14 @@ class MetaAuthenticatorsRestoreTest(unittest.TestCase):
         )
         contents = self.capture_actions(feature)
         for component in META_AUTHENTICATOR_COMPONENTS:
-            self.assertIn(f"enable\t{component}", contents)
+            # The jar validates each entry against
+            # ComponentName.flattenToString(), so the actions
+            # carry the flattened package/class form, not the
+            # bare class name the backup keys on.
+            self.assertIn(
+                f"enable\t{META_AUTHENTICATOR_PACKAGE}/{component}",
+                contents,
+            )
 
     def test_recorded_states_are_replayed(self) -> None:
         recorded = {
@@ -788,7 +796,11 @@ class MetaAuthenticatorsRestoreTest(unittest.TestCase):
         )
         contents = self.capture_actions(feature)
         for component in META_AUTHENTICATOR_COMPONENTS:
-            self.assertIn(f"default\t{component}", contents)
+            self.assertIn(
+                f"default\tcom.facebook.alohaservices.alohausers"
+                f"/{component}",
+                contents,
+            )
 
 
 if __name__ == "__main__":

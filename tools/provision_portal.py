@@ -178,6 +178,18 @@ ACCOUNT_CTL_LOCAL = ROOT / "exploit/build/portal-account-ctl.jar"
 ACCOUNT_CTL_REMOTE = "/data/local/tmp/portal-account-ctl.jar"
 COMPONENT_CTL_LOCAL = ROOT / "exploit/build/portal-component-ctl.jar"
 COMPONENT_CTL_REMOTE = "/data/local/tmp/portal-component-ctl.jar"
+#: Where the channel component executor captures the jar's own
+#: output and exit code (see _run_component_ctl_via_rish). The
+#: capture lives in a host-created subdirectory of /data/local/tmp
+#: because that directory itself is drwxrwx--x on the fleet
+#: firmware: the server-side shell runs as uid 0, which is neither
+#: the directory's owner nor in its group, so it can traverse the
+#: directory and read files by path but cannot create files
+#: directly in it. A host-created 0777 subdirectory is creatable
+#: and writable from both sides.
+COMPONENT_CTL_CAPTURE_DIR = "/data/local/tmp/portal-component-ctl"
+COMPONENT_CTL_CAPTURE_REMOTE = COMPONENT_CTL_CAPTURE_DIR + "/last-run.out"
+COMPONENT_CTL_RC_MARKER = "PORTAL_COMPONENT_CTL_RC="
 RISH_SCRIPT_REMOTE = "/data/local/tmp/rish"
 RISH_DEX_REMOTE = "/data/local/tmp/rish_shizuku.dex"
 #: The Shizuku manager activity the rish transport prep starts to
@@ -1905,18 +1917,69 @@ class PortalProvisioner:
     def _run_component_ctl_via_rish(
         self, app_process: str, presence_action: str
     ) -> subprocess.CompletedProcess[str]:
-        # Mirror fops.c's invocation exactly: CLASSPATH points at
-        # the jar, app_process loads PortalComponentCtl with the
-        # staged actions file and the presence action as arguments.
+        # Mirror fops.c's invocation: CLASSPATH points at the jar,
+        # app_process loads PortalComponentCtl with the staged
+        # actions file and the presence action as arguments.
+        #
+        # The result, though, cannot come back over the rish
+        # transport itself: measured live (closure session 15
+        # follow-up, Nov 19, 2026), the transport returns only the
+        # remote command's stdout and reports exit 0 regardless of
+        # the command's real exit code (`false` and `exit 3` both
+        # return 0), and stderr never arrives. The jar prints its
+        # success line to stdout but every failure goes to stderr
+        # with exit 1, so a failed jar run presented as exit=0 with
+        # empty output and the real error was invisible. The jar's
+        # output and exit code are therefore captured to a file on
+        # the device (COMPONENT_CTL_CAPTURE_REMOTE) and read back;
+        # the returned process carries the jar's own stdout/stderr
+        # and exit code. When no capture lands (the transport died
+        # before the command ran), the transport's own result
+        # stands, exactly as before.
+        self.adb_run(
+            ["shell", "mkdir", "-p", COMPONENT_CTL_CAPTURE_DIR],
+            timeout=10,
+        )
+        self.adb_run(
+            ["shell", "rm", "-f", COMPONENT_CTL_CAPTURE_REMOTE],
+            timeout=10,
+        )
         inner = (
             f"CLASSPATH={COMPONENT_CTL_REMOTE} "
             f"{app_process} /system/bin PortalComponentCtl "
-            f"{DEBLOAT_COMPONENT_ACTIONS_REMOTE} {presence_action}"
+            f"{DEBLOAT_COMPONENT_ACTIONS_REMOTE} {presence_action} "
+            f"> {COMPONENT_CTL_CAPTURE_REMOTE} 2>&1; "
+            f"echo {COMPONENT_CTL_RC_MARKER}$? "
+            f">> {COMPONENT_CTL_CAPTURE_REMOTE}"
         )
-        return self.adb_run(
+        transport = self.adb_run(
             ["shell", f"sh {RISH_SCRIPT_REMOTE} -c {shlex.quote(inner)}"],
             timeout=120,
         )
+        captured = self.adb_run(
+            ["shell", "cat", COMPONENT_CTL_CAPTURE_REMOTE],
+            timeout=10,
+        )
+        if captured.returncode == 0:
+            jar_output_lines = []
+            jar_returncode = None
+            for line in captured.stdout.splitlines():
+                if line.startswith(COMPONENT_CTL_RC_MARKER):
+                    try:
+                        jar_returncode = int(
+                            line[len(COMPONENT_CTL_RC_MARKER):].strip()
+                        )
+                    except ValueError:
+                        jar_returncode = None
+                else:
+                    jar_output_lines.append(line)
+            if jar_returncode is not None:
+                return subprocess.CompletedProcess(
+                    args=transport.args,
+                    returncode=jar_returncode,
+                    stdout="\n".join(jar_output_lines),
+                )
+        return transport
 
     def _prepare_rish_transport(self) -> None:
         """Make the rish transport answer before the jar runs.

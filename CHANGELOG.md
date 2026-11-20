@@ -167,6 +167,26 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- The channel PortalComponentCtl execution still failed with
+  the rish transport working (Phase D closure session 15,
+  Nov 19, 2026): the run reported exit=0 with empty output and
+  fell back to the race path. Two stacked causes, both proven
+  live. (1) The meta-authenticators restore staged its actions
+  with bare class names, but the jar validates each entry
+  against ComponentName.flattenToString() and rejects a bare
+  class name; the restore now writes the flattened
+  package/class form (the recorded package, or the alohausers
+  package by default) like every other component list. (2) The
+  rish transport returns only the remote command's stdout and
+  reports exit 0 whatever the command's real exit code, and
+  stderr never arrives — while the jar sends every failure to
+  stderr with exit 1 — so the rejection was invisible. The
+  executor now captures the jar's output and exit code to a
+  file on the device (in a host-created subdirectory of
+  /data/local/tmp, which is drwxrwx--x and not creatable-in by
+  the uid-0 server shell) and judges the run on that capture;
+  a failed jar run now surfaces its real error and exit code,
+  and the app_process fallback keys on the captured 127.
 - The root-channel PortalComponentCtl execution (Defect G's
   rish transport) timed out against the root-mode Shizuku
   server (Phase D closure sessions 9.5 and 14, Nov 19, 2026).
