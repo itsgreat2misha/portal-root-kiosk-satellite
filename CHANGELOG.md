@@ -999,6 +999,10 @@ the fork diverged from upstream:
 
 ### Removed
 
+- The `--allow-app-updates` option. Disabling Meta's app
+  verifier (its certificate allowlist) is now part of
+  `--debloat` (and therefore of `--full`); `--restore
+  app-verifier` is unchanged.
 - The `--dns` option, including its resolver-hostname form.
   Turning Android Private DNS off is now part of `--debloat`
   (and therefore of `--full`): a debloated Portal uses the

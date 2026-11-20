@@ -2076,7 +2076,6 @@ class DeKioskScrubTest(unittest.TestCase):
             "--debloat",
             "--remove-meta-accounts",
             "--optimize-presence",
-            "--allow-app-updates",
             "--disable-adb-auth-timeout",
             "--verify-boots", "1",
             "--shizuku",
