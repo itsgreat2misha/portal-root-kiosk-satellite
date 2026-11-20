@@ -22,7 +22,7 @@ assembles one bundle directory:
                                aloha targets stage for KASLR discovery
       tools/…                  the provisioner sources, so the bundle
                                alone is a runnable checkout
-      README.md / FORK.md / CHANGELOG.md / LICENSE / NOTICE /
+      README.md / LICENSE / NOTICE /
       release-signing-cert.pem
 
 Usage:
@@ -63,8 +63,6 @@ import provision_portal
 # bundle proof, Nov 20, 2026.
 ROOT_FILES = (
     "README.md",
-    "FORK.md",
-    "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
     prebuilt_bundle.RELEASE_CERT_NAME,
@@ -176,10 +174,15 @@ def assemble(output_dir: pathlib.Path, version: str) -> pathlib.Path:
 
     # The provisioner sources ride along (not hash-listed: they are
     # the code that verifies the manifest, not payload artifacts).
+    # Two tools files stay out: the bundle builder itself (it only
+    # runs in a source checkout) and the ion heap probe source
+    # (an unreferenced diagnostic).
     shutil.copytree(
         ROOT / "tools",
         bundle_dir / "tools",
-        ignore=shutil.ignore_patterns("__pycache__"),
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "ion-heap-probe.c", "build_release_bundle.py"
+        ),
     )
     for name in ROOT_FILES:
         shutil.copyfile(ROOT / name, bundle_dir / name)

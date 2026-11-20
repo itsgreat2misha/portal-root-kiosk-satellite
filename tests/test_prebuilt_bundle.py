@@ -193,6 +193,26 @@ class PrebuiltBundleTest(unittest.TestCase):
             (REPOSITORY / prebuilt_bundle.RELEASE_CERT_NAME).is_file()
         )
 
+    def test_builder_root_files_exclude_the_dead_weight(self) -> None:
+        # Owner decision, Nov 20, 2026: the bundle ships neither
+        # the fork journal nor the changelog.
+        import build_release_bundle
+
+        self.assertNotIn("FORK.md", build_release_bundle.ROOT_FILES)
+        self.assertNotIn("CHANGELOG.md", build_release_bundle.ROOT_FILES)
+        self.assertIn("README.md", build_release_bundle.ROOT_FILES)
+
+    def test_release_workflow_ships_the_zip_only(self) -> None:
+        # Owner decision, Nov 20, 2026: one archive format, the
+        # zip (Windows users cannot open .tar.gz without extra
+        # tools). No tarball build, asset or checksum entry.
+        workflow = (
+            REPOSITORY / ".github" / "workflows" / "release.yml"
+        ).read_text()
+        self.assertNotIn("--tarball", workflow)
+        self.assertNotIn(".tar.gz", workflow)
+        self.assertIn("portal-provisioner-bundle-*.zip", workflow)
+
     def test_builder_ships_the_autoroot_runner_script(self) -> None:
         # stage_autoroot_payload reads autoroot-helper/run.sh from
         # the tree at runtime; a bundle without it cannot stage
