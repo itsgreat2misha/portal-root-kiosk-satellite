@@ -167,6 +167,38 @@ the fork diverged from upstream:
 
 ### Fixed
 
+- A won autoroot race whose verdict line a late post-root
+  action failure flipped to FAIL wedged the on-device cycle
+  until the 600 s runner timeout (Defect N, Phase D closure
+  session 19, Nov 19, 2026). The native verdict line reports
+  the whole post-root action chain, not just the race: on
+  two consecutive host-free boots of a freshly restaged set,
+  the winning attempt's only verdict line was
+  `WATCH_CFI_OK=0 STEP=151` (audio persistence; ERRNO=111,
+  then ERRNO=30) printed after the lock repair succeeded,
+  the payload started, and the root daemon came up. The
+  watchdog latched FAIL and correctly refused to cut (the
+  daemon was present), but the win-stall sweep required a
+  WIN verdict, so the attempt's leftover process tree held
+  the foreground shell call to its socket timeout and the
+  Shizuku handoff, the drift pass, and the budget close all
+  waited with it; on one boot the device rebooted first and
+  the next boot recovered the mark as a clean loss. The
+  watchdog now sweeps a fail-verdict attempt's leftover
+  tree on the win-stall schedule (120 s, then 240 s, at
+  most two) once the root daemon is confirmed serving -
+  the daemon's presence is the attempt's own proof that
+  its real work completed, and the sweep spares the daemon
+  and the Shizuku server by construction. The verdict and
+  its accounting are untouched: the 300 s no-verdict
+  cutoff, the fail-plus-daemon-absent post-verdict cut,
+  and the win-stall sweep behave exactly as before, and
+  genuine failure verdicts still read as failures in the
+  attempt-scoped log tail. Helper 1.15 (versionCode 16)
+  so a restage picks the change up. Live validation is
+  the next host-free boot cycle on the test unit (the
+  coded path was verified by the executed Java decision
+  table and the unit suite).
 - A later run's completion write could downgrade or erase
   verification-grade facts an earlier run established
   (Defect M, Phase D closure session 18, Nov 19, 2026). Two
