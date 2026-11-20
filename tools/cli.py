@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from typing import Any, Callable
 
@@ -130,6 +131,19 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--attempts", type=int, default=12)
+    parser.add_argument(
+        "--connect",
+        action="store_true",
+        help=(
+            "guided connect: find the Portal plugged in by USB, "
+            "switch it to wireless ADB (adb tcpip 5555), read its "
+            "Wi-Fi address from the device and connect to it. With "
+            "action flags the run continues on the wireless "
+            "connection; on its own it just connects and prints the "
+            "serial to use. You still enable ADB in the Portal's "
+            "Debug menu and tap Allow on its screen"
+        ),
+    )
     parser.add_argument(
         "--full",
         action="store_true",
@@ -627,10 +641,185 @@ def _resolve_serial(args: argparse.Namespace) -> tuple[str | None, str | None]:
     )
 
 
+def _adb_command(
+    arguments: list[str], timeout: float = 15
+) -> subprocess.CompletedProcess:
+    adb = shutil.which("adb")
+    if adb is None:
+        raise ProvisionError("adb was not found on your PATH")
+    try:
+        return subprocess.run(
+            [adb, *arguments],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProvisionError(f"adb failed: {exc}") from exc
+
+
+_WIFI_IPV4 = re.compile(r"inet (\d{1,3}(?:\.\d{1,3}){3})/")
+_ROUTE_SRC = re.compile(r"\bsrc (\d{1,3}(?:\.\d{1,3}){3})")
+
+
+def _portal_wifi_ip(usb_serial: str) -> str | None:
+    """The Portal's Wi-Fi IPv4 address, read on the device over
+    USB: `ip addr show wlan0` first (verified live on aloha and
+    omni), the route source address as fallback."""
+    result = _adb_command(
+        ["-s", usb_serial, "shell", "ip", "addr", "show", "wlan0"]
+    )
+    match = _WIFI_IPV4.search(result.stdout)
+    if match:
+        return match.group(1)
+    result = _adb_command(["-s", usb_serial, "shell", "ip", "route"])
+    match = _ROUTE_SRC.search(result.stdout)
+    if match:
+        return match.group(1)
+    return None
+
+
+def guided_connect(wait_seconds: int = 180) -> str:
+    """Connect to a USB-attached Portal over Wi-Fi ADB and return
+    its wireless serial.
+
+    The user-side steps stay the user's: ADB must be enabled in
+    the Portal's Debug menu, and the Allow prompt must be tapped
+    on the Portal screen. This waits for both, saying what is
+    missing while it waits.
+    """
+    print(
+        "Guided connect: plug the Portal in by USB. If ADB is off, "
+        "open the Portal's Debug menu and turn ADB on.",
+        flush=True,
+    )
+    deadline = time.monotonic() + wait_seconds
+    usb_serial: str | None = None
+    said_allow = False
+    while time.monotonic() < deadline:
+        usb = [
+            (serial, state)
+            for serial, state in _adb_devices()
+            if ":" not in serial
+        ]
+        ready = [serial for serial, state in usb if state == "device"]
+        if len(ready) > 1:
+            raise ProvisionError(
+                "more than one USB device is connected "
+                f"({', '.join(ready)}); unplug the others and run "
+                "--connect again"
+            )
+        if ready:
+            usb_serial = ready[0]
+            break
+        if any(state == "unauthorized" for _, state in usb) and (
+            not said_allow
+        ):
+            print(
+                "The Portal is waiting for approval: look at its "
+                "screen and tap Allow for this computer.",
+                flush=True,
+            )
+            said_allow = True
+        time.sleep(3)
+    if usb_serial is None:
+        raise ProvisionError(
+            f"no USB Portal appeared after {wait_seconds}s; check "
+            "the cable, and that ADB is on in the Portal's Debug menu"
+        )
+    print(
+        f"Found the Portal on USB ({usb_serial}); reading its "
+        "Wi-Fi address...",
+        flush=True,
+    )
+    address = _portal_wifi_ip(usb_serial)
+    if address is None:
+        raise ProvisionError(
+            "could not read the Portal's Wi-Fi address; is the "
+            "Portal connected to Wi-Fi?"
+        )
+    _adb_command(["-s", usb_serial, "tcpip", "5555"])
+    serial = f"{address}:5555"
+    deadline = time.monotonic() + 60
+    said_allow = False
+    while time.monotonic() < deadline:
+        _adb_command(["connect", serial])
+        state = _adb_command(["-s", serial, "get-state"])
+        if state.returncode == 0:
+            print(f"Connected: {serial}", flush=True)
+            return serial
+        if "unauthorized" in (state.stdout + state.stderr) and (
+            not said_allow
+        ):
+            print(
+                "Look at the Portal screen and tap Allow for this "
+                "computer.",
+                flush=True,
+            )
+            said_allow = True
+        time.sleep(3)
+    raise ProvisionError(
+        f"the Portal did not answer at {serial}; check it is still "
+        "on the same Wi-Fi network and run --connect again"
+    )
+
+
+#: Attributes that make a run an action run (as opposed to a bare
+#: --connect). Run controls (--force, --attempts, --verify-boots,
+#: --log-dir, --bundle, --skip-build) are not actions, and neither
+#: is audio: it defaults on, so it cannot mark an explicit ask.
+_ACTION_ATTRIBUTES = (
+    "full",
+    "strip_meta",
+    "restore",
+    "status",
+    "dry_run",
+    "backup",
+    "recover",
+    "collect_diagnostics",
+    "disable_updates",
+    "block_remote_wipe",
+    "debloat",
+    "remove_meta_accounts",
+    "optimize_presence",
+    "presence_fps_cap",
+    "system_theme_control",
+    "disable_camera_light",
+    "autoroot",
+    "remove_shizuku",
+)
+
+
+def _connect_only(args: argparse.Namespace) -> bool:
+    return not any(getattr(args, name, None) for name in _ACTION_ATTRIBUTES)
+
+
 def main(
     config: CliConfig, provisioner_factory: Callable[..., Any]
 ) -> int:
     args = parse_args(config)
+    if args.connect:
+        if shutil.which("adb") is None:
+            print(
+                "PROVISION_ERROR: adb was not found on your PATH. "
+                "Install the Android platform-tools (they provide "
+                "adb), make sure adb is on your PATH, and run this "
+                "again.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            args.serial = guided_connect()
+        except ProvisionError as exc:
+            print(f"PROVISION_ERROR: {exc}", file=sys.stderr)
+            return 1
+        if _connect_only(args):
+            print(
+                "To provision it, run:\n"
+                f"  python3 tools/provision_portal.py --serial "
+                f"{args.serial} --full"
+            )
+            return 0
     serial, serial_error = _resolve_serial(args)
     if serial is None:
         print(f"PROVISION_ERROR: {serial_error}", file=sys.stderr)
