@@ -402,5 +402,46 @@ class NodemonStatusTest(unittest.TestCase):
         self.assertEqual(status["updates"]["nodemon"], "true")
 
 
+class OtaRestoreMarkerEvidenceTest(unittest.TestCase):
+    """verify_ota_restored's marker gate.
+
+    In the credential-scoped context the block restore writes its
+    marker inside the alohausers app-private directory, which the
+    host cannot stat; a run whose own restore completed carries
+    this-run evidence instead (2026-11-21: a group restore's OTA
+    phase was never scheduled, and once scheduled its marker
+    still could not be checked from the host).
+    """
+
+    def make_verify_provisioner(self, temporary: str) -> PortalProvisioner:
+        provisioner = make_provisioner(temporary, target=None)
+
+        def fake_adb_run(args, timeout=None, check=False):
+            if args[:3] == ["shell", "test", "-f"]:
+                return completed(args, returncode=1)
+            if args[:2] == ["shell", "cat"]:
+                return completed(args, returncode=1)
+            if args[:4] == ["shell", "pm", "list", "packages"]:
+                return completed(args, stdout="")
+            raise AssertionError(f"unexpected adb call: {args}")
+
+        provisioner.adb_run = fake_adb_run
+        return provisioner
+
+    def test_absent_marker_without_this_run_evidence_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.make_verify_provisioner(temporary)
+            with self.assertRaises(provision_portal.ProvisionError) as caught:
+                provisioner.verify_ota_restored()
+            self.assertIn("OTA restore marker is absent", str(caught.exception))
+
+    def test_absent_marker_with_this_run_evidence_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = self.make_verify_provisioner(temporary)
+            provisioner._ota_restore_verified_this_run = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                provisioner.verify_ota_restored()
+
+
 if __name__ == "__main__":
     unittest.main()
