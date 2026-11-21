@@ -41,6 +41,7 @@ from features.settings import (  # noqa: E402
     SettingsConfig,
     SettingsFeature,
 )
+from portal_targets import TARGETS  # noqa: E402
 from provision_portal import (  # noqa: E402
     OTA_PACKAGES_BACKUP_REMOTE,
     OTA_SETUP_PACKAGE,
@@ -895,6 +896,84 @@ class MetaAuthenticatorsRestoreTest(unittest.TestCase):
                 f"/{component}",
                 contents,
             )
+
+
+
+ALOHA = next(
+    target for target in TARGETS if target.key == "portal-plus-aloha-1041515800015050"
+)
+
+
+class DebloatGroupShellDomainTest(unittest.TestCase):
+    """The debloat group keeps the preserved shell domain.
+
+    Regression (2026-11-21): the flag consolidation folded the
+    update block, Private DNS and the app verifier into --debloat
+    and its restore, but the shell-domain gate in
+    build_exploit_environment still admitted only the four
+    pre-consolidation action keys. A --restore debloat race phase
+    therefore ran its component control under the init SELinux
+    domain, where it aborted before processing any action,
+    discarding every race win the phase earned.
+    """
+
+    def build_environment(self, **kwargs):
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555", 1, pathlib.Path(temporary), **kwargs
+            )
+            provisioner.target = ALOHA
+
+            def adb_run(arguments, timeout=None, check=False):
+                del timeout, check
+                value = (
+                    "1204" if arguments[:2] == ["shell", "pidof"] else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n", ""
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                return provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+
+    def test_debloat_restore_group_preserves_shell_domain(self) -> None:
+        environment = self.build_environment(
+            restore_bloat=True,
+            restore_remote_wipe=True,
+            enable_updates=True,
+            restore_privacy_dns=True,
+            restore_app_verifier=True,
+        )
+        self.assertEqual(
+            environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"], "1"
+        )
+
+    def test_debloat_apply_fold_preserves_shell_domain(self) -> None:
+        environment = self.build_environment(
+            debloat=True,
+            disable_updates=True,
+            block_remote_wipe=True,
+            dhcp_dns=True,
+            allow_app_updates=True,
+        )
+        self.assertEqual(
+            environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"], "1"
+        )
+
+    def test_mixed_run_still_excluded(self) -> None:
+        environment = self.build_environment(
+            restore_bloat=True,
+            restore_remote_wipe=True,
+            enable_updates=True,
+            restore_privacy_dns=True,
+            restore_app_verifier=True,
+            audio=True,
+        )
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
 
 
 if __name__ == "__main__":
