@@ -9,6 +9,23 @@ must match it.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-21
+
+First release since 0.9.0. The user-facing surface was
+simplified: the `--custom-payload`, `--dns` and
+`--allow-app-updates` options are gone, with what they did
+folded into the actions that use them; guided connect
+(`--connect`) was added; a plain-language summary and
+confirmation now precede a run; and releases ship as a `.zip`
+only, with four files nothing read dropped from the bundle.
+Meta-control removal was then consolidated into the single
+`--debloat` command, as originally intended. `--status` now
+reports the retail model and kernel version a support request
+needs, and the README and CLI help text were rewritten to a
+plain-language standard (steps say what the user does and what
+happens; mechanism explanations and developer notes removed).
+Detailed entries follow.
+
 - Documentation pass over the README and the CLI help text,
   following the 2026-11-21 docs review: steps now say what the
   user does and what happens, mechanism explanations and
