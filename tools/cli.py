@@ -135,7 +135,15 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
             "device is used"
         ),
     )
-    parser.add_argument("--attempts", type=int, default=12)
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=12,
+        help=(
+            "maximum exploit attempts per phase "
+            "(default: 12, between 1 and 100)"
+        ),
+    )
     parser.add_argument(
         "--connect",
         action="store_true",
@@ -193,8 +201,9 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         "--audio",
         action="store_true",
         help=(
-            "install the persistent hardware AEC/NS watchdog; this remains "
-            "the default action when no provisioning action is specified"
+            "stop the Portal from suppressing microphone audio while "
+            "its speaker is playing; this is the default action when "
+            "no provisioning action is specified"
         ),
     )
     parser.add_argument(
@@ -206,20 +215,20 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         default=None,
         metavar="PATH",
         help=(
-            "use a prebuilt release bundle (directory or .tar.gz) instead "
-            "of building: the bundle's hash manifest is verified against "
-            "the device's target and its artifacts are installed in place "
-            "of the local build, so the host needs only Python and adb"
+            "use a prebuilt release bundle (directory or .zip) instead "
+            "of building from source: the bundle is checked against "
+            "the Portal's exact build before anything is installed, "
+            "so the host needs only Python and adb"
         ),
     )
     parser.add_argument(
         "--force",
         action="store_true",
         help=(
-            "bypass the re-run fast paths (the already-provisioned no-op "
-            "exit and the root-channel apply) and run the full race-based "
-            "provision, re-installing the provisioner's own packages even "
-            "when they are byte-identical; the autoroot guard still applies"
+            "redo the full provisioning from the start, even on an "
+            "already provisioned Portal, instead of finishing early "
+            "or applying only what changed; the provisioner's own "
+            "packages are reinstalled even when unchanged"
         ),
     )
     shizuku_group = parser.add_mutually_exclusive_group()
@@ -227,8 +236,9 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         "--shizuku",
         action="store_true",
         help=(
-            "install official Shizuku and a device-local boot helper that "
-            "starts it with Android shell privileges through loopback ADB"
+            "install official Shizuku and a device-local boot helper "
+            "that starts it after every boot with Android shell "
+            "privileges"
         ),
     )
     shizuku_group.add_argument(
@@ -249,20 +259,17 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         "--skip-shizuku-root",
         action="store_true",
         help=(
-            "with --shizuku, leave shizuku_server "
-            "running with shell privileges instead of restarting it as "
-            "uid 0 through the root payload"
+            "with --autoroot, leave Shizuku running with shell "
+            "privileges instead of restarting it as root"
         ),
     )
     parser.add_argument(
         "--autoroot",
         action="store_true",
         help=(
-            "stage the on-device autoroot runner and boot helper so "
-            "the root payload returns by itself after later reboots, "
-            "with no host watcher (the exploit sentinel app stays "
-            "installed). Implies --shizuku and the root-payload step "
-            "(the in-repo root daemon)"
+            "root comes back by itself after every reboot, with no "
+            "computer involved: the Portal re-roots on each boot and "
+            "restarts Shizuku as root. Implies --shizuku"
         ),
     )
     parser.add_argument(
@@ -282,39 +289,37 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         choices=("light", "dark"),
         metavar="{light,dark}",
         help=(
-            "set the live Android system theme; on locked Android 10 builds, "
-            "install or reuse the constrained UID-1000 theme controller"
+            "set the Android system theme (light or dark) on builds "
+            "whose own settings have no theme switch"
         ),
     )
     parser.add_argument(
         "--debloat",
         action="store_true",
         help=(
-            "strip Meta's control and background services in one "
-            "step: persistently disable the conservative Meta "
-            "app/telemetry profile (saving each package's original "
-            "state), block Meta system updates, block Meta remote "
+            "turn off Meta's control and background services in one "
+            "step: disable the tested list of Meta apps and "
+            "background services (each one's original state is "
+            "saved), block Meta system updates, block Meta remote "
             "wipe, turn Android Private DNS off so the Portal uses "
-            "the network's own DNS, and disable Meta's app "
-            "verifier so third-party and other non-Meta apps can "
-            "update"
+            "the network's DNS, and disable Meta's app verifier so "
+            "non-Meta apps can update normally"
         ),
     )
     parser.add_argument(
         "--remove-meta-accounts",
         action="store_true",
         help=(
-            "remove the three Portal user accounts locally and persistently "
-            "disable only their authenticator service components"
+            "remove the Portal's local Meta accounts and turn off "
+            "their sign-in services. This cannot be undone"
         ),
     )
     parser.add_argument(
         "--optimize-presence",
         action="store_true",
         help=(
-            "disable Smart Camera background segmentation, liveness scoring, "
-            "and re-identification, force full-frame capture, and require "
-            "AIService's analysis and pose pipeline to remain live"
+            "lower the Smart Camera's processing work while person "
+            "detection keeps running on the full camera view"
         ),
     )
     parser.add_argument(
@@ -340,7 +345,7 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     mode_group.add_argument(
         "--recover",
         action="store_true",
-        help="clean stale staging and resume actions from a pending state manifest",
+        help="resume an interrupted run from where it left off",
     )
     mode_group.add_argument(
         "--collect-diagnostics",
