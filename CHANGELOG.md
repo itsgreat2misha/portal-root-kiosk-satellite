@@ -9,6 +9,14 @@ must match it.
 
 ## [Unreleased]
 
+- `--status` now reports two more fields in its `target`
+  section, the ones a support request for another build needs:
+  `retail_model` (the retail model name, for example "Meta
+  Portal+ (1st generation)"; null when the build is not
+  supported) and `kernel` (the device's full `uname -a` string).
+  The raw model, device and build fingerprint were already
+  reported.
+
 - Consolidated Meta-control removal into the single `--debloat`
   command, as originally intended: `--block-remote-wipe` and
   `--disable-updates` are no longer standalone flags; their
