@@ -142,7 +142,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # The "-dev" suffix marks an untagged development state; it is dropped
 # in the commit that cuts a release. This fork ships preview releases
 # on the 0.9.x line until the 1.0.0 relaunch.
-PROVISIONER_VERSION = "0.9.0"
+PROVISIONER_VERSION = "0.9.1"
 PROJECT_URL = "https://github.com/itsgreat2misha/portal-root-kiosk-satellite"
 ANDROID_NDK_VERSION = "28.2.13676358"
 ANDROID_BUILD_TOOLS_VERSION = "37.0.0"
