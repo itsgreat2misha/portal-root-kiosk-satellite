@@ -3217,5 +3217,73 @@ class OtaPollingOverrideTest(unittest.TestCase):
             )
 
 
+class CollectStatusSupportFieldsTest(unittest.TestCase):
+    """--status carries what a support request for another build
+    needs: the retail model name when the build is supported, and
+    the raw model, device, fingerprint and full kernel string
+    either way."""
+
+    ALOHA_FINGERPRINT = (
+        "Facebook/aloha_prod/aloha:9/PKQ1.191202.001/"
+        "1041515800015050:user/prod-keys"
+    )
+    KERNEL = (
+        "Linux localhost 4.4.153+ #1 SMP PREEMPT armv7l"
+    )
+
+    def collect(self, fingerprint: str) -> dict:
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555", 1, pathlib.Path(temporary)
+            )
+
+            def fake_adb_run(arguments, timeout=None, **_kwargs):
+                command = list(arguments)
+                if command[:1] == ["shell"]:
+                    command = command[1:]
+                output = ""
+                returncode = 1
+                if command[:1] == ["getprop"]:
+                    returncode = 0
+                    output = {
+                        "ro.build.fingerprint": fingerprint,
+                        "ro.product.device": "aloha",
+                        "ro.product.model": "Portal+",
+                    }.get(command[1], "")
+                elif command[:2] == ["uname", "-a"]:
+                    returncode = 0
+                    output = self.KERNEL
+                return subprocess.CompletedProcess(
+                    arguments, returncode, output, ""
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=fake_adb_run
+            ):
+                return provisioner.collect_status()
+
+    def test_supported_build_reports_retail_model_and_kernel(self) -> None:
+        status = self.collect(self.ALOHA_FINGERPRINT)
+        target = status["target"]
+        self.assertTrue(target["supported"])
+        self.assertEqual(
+            target["retail_model"], "Meta Portal+ (1st generation)"
+        )
+        self.assertEqual(target["kernel"], self.KERNEL)
+        self.assertEqual(target["fingerprint"], self.ALOHA_FINGERPRINT)
+
+    def test_unsupported_build_still_reports_identifiers(self) -> None:
+        status = self.collect(
+            "Facebook/aloha_prod/aloha:9/PKQ1.191202.001/"
+            "9999999999999999:user/prod-keys"
+        )
+        target = status["target"]
+        self.assertFalse(target["supported"])
+        self.assertIsNone(target["retail_model"])
+        self.assertEqual(target["model"], "Portal+")
+        self.assertEqual(target["device"], "aloha")
+        self.assertEqual(target["kernel"], self.KERNEL)
+
+
 if __name__ == "__main__":
     unittest.main()

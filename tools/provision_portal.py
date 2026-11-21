@@ -3998,9 +3998,15 @@ class PortalProvisioner:
             "target": {
                 "supported": target is not None,
                 "key": target.key if target else None,
+                # The retail model name a support request needs.
+                # Only a matched target has one; an unsupported
+                # build reports null here and is identified by the
+                # raw model, device, fingerprint and kernel below.
+                "retail_model": target.model if target else None,
                 "model": product_model,
                 "device": device,
                 "fingerprint": fingerprint,
+                "kernel": shell("uname", "-a", timeout=5),
             },
             "runtime": {
                 "boot_id": shell("cat", "/proc/sys/kernel/random/boot_id", timeout=5),
