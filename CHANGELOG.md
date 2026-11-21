@@ -9,6 +9,28 @@ must match it.
 
 ## [Unreleased]
 
+- Consolidated Meta-control removal into the single `--debloat`
+  command, as originally intended: `--block-remote-wipe` and
+  `--disable-updates` are no longer standalone flags; their
+  actions (blocking Meta system updates and Meta remote wipe)
+  are part of debloat, alongside the Private DNS and app
+  verifier changes folded in earlier. `--strip-meta` (an added
+  preset, not the consolidation) is removed, and the retired
+  `--disable-camera-light` flag stub is gone too. Restores
+  consolidated to match: one `--restore debloat` puts back
+  everything debloat changed (apps, update block, remote-wipe
+  block, Private DNS, app verifier) from the recorded original
+  states; the folded pieces' separate restore names (`bloat`,
+  `remote-wipe`, `updates`, `dns`, `app-verifier`) are no
+  longer accepted. `--full` applies the same end state as
+  before, now via debloat, and the pre-flight summary describes
+  debloat's full contents in plain words. Clean breaks are
+  intended pre-1.0: the removed flags error as unrecognized
+  arguments and the removed restore names as invalid choices.
+  Internal per-action records, desired-state and drift handling
+  are unchanged; a fresh `--full --force` still roots a device
+  provisioned by an older version.
+
 Pre-release development toward 1.0.0 in this fork. Highlights since
 the fork diverged from upstream:
 

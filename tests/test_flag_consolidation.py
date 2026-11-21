@@ -79,17 +79,16 @@ class FullPresetTest(unittest.TestCase):
         for attribute, value in cli_module.FULL_PRESET.items():
             self.assertEqual(getattr(arguments, attribute), value, attribute)
         # The preset is exactly the documented line: audio,
-        # disable-updates, block-remote-wipe, debloat,
-        # remove-meta-accounts, optimize-presence,
+        # debloat, remove-meta-accounts, optimize-presence,
         # disable-adb-auth-timeout, autoroot. (Debloat carries the
-        # Private-DNS-off change and the app-verifier disable with
-        # it; see DebloatDnsTest and AppVerifierFoldTest.)
+        # update block, the remote-wipe block, the Private-DNS-off
+        # change and the app-verifier disable with it; see
+        # DebloatGroupFoldTest, DebloatDnsTest and
+        # AppVerifierFoldTest.)
         self.assertEqual(
             set(cli_module.FULL_PRESET),
             {
                 "audio",
-                "disable_updates",
-                "block_remote_wipe",
                 "debloat",
                 "remove_meta_accounts",
                 "optimize_presence",
@@ -97,8 +96,11 @@ class FullPresetTest(unittest.TestCase):
                 "autoroot",
             },
         )
-        # The full run still turns Private DNS off and disables
-        # the app verifier, both via debloat.
+        # The full run still blocks updates and remote wipe, turns
+        # Private DNS off and disables the app verifier, all via
+        # debloat.
+        self.assertTrue(arguments.disable_updates)
+        self.assertTrue(arguments.block_remote_wipe)
         self.assertTrue(arguments.dhcp_dns)
         self.assertIsNone(arguments.privacy_dns)
         self.assertTrue(arguments.allow_app_updates)
@@ -111,50 +113,49 @@ class FullPresetTest(unittest.TestCase):
 
     def test_full_rejects_a_restore_of_a_preset_feature(self) -> None:
         self.assertIn(
-            "--debloat cannot be combined with --restore bloat",
-            parse_error(["--full", "--restore", "bloat"]),
+            "--debloat cannot be combined with --restore debloat",
+            parse_error(["--full", "--restore", "debloat"]),
         )
 
 
-class StripMetaPresetTest(unittest.TestCase):
-    """--strip-meta expands to exactly block-remote-wipe +
-    debloat + disable-updates, composed like --full. The one-way
-    account removal is NOT in it and stays explicit."""
+class DebloatGroupFoldTest(unittest.TestCase):
+    """Debloat is the single Meta-control removal command: it
+    carries the update block and the remote-wipe block alongside
+    the Private-DNS-off change and the app-verifier disable.
+    --strip-meta (an added preset, never the consolidation the
+    owner asked for), --block-remote-wipe, --disable-updates and
+    the retired --disable-camera-light stub are clean breaks."""
 
-    def test_preset_expands_to_exactly_its_documented_set(self) -> None:
-        self.assertEqual(
-            set(cli_module.STRIP_META_PRESET),
-            {"block_remote_wipe", "debloat", "disable_updates"},
-        )
-        arguments = parse(["--strip-meta"])
-        self.assertTrue(arguments.block_remote_wipe)
-        self.assertTrue(arguments.debloat)
+    def test_debloat_sets_the_whole_group(self) -> None:
+        arguments = parse(["--debloat"])
         self.assertTrue(arguments.disable_updates)
-
-    def test_preset_excludes_account_removal_and_root(self) -> None:
-        arguments = parse(["--strip-meta"])
+        self.assertTrue(arguments.block_remote_wipe)
+        self.assertTrue(arguments.dhcp_dns)
+        self.assertTrue(arguments.allow_app_updates)
+        # Debloat alone never removes accounts or roots.
         self.assertFalse(arguments.remove_meta_accounts)
         self.assertFalse(arguments.autoroot)
         self.assertIsNone(arguments.custom_payload)
-        self.assertFalse(arguments.audio)
-        self.assertFalse(arguments.optimize_presence)
 
-    def test_preset_carries_the_debloat_fellow_travellers(self) -> None:
-        arguments = parse(["--strip-meta"])
-        self.assertTrue(arguments.dhcp_dns)
-        self.assertTrue(arguments.allow_app_updates)
+    def test_no_debloat_no_group(self) -> None:
+        arguments = parse(["--audio"])
+        self.assertFalse(arguments.disable_updates)
+        self.assertFalse(arguments.block_remote_wipe)
 
-    def test_preset_members_still_conflict_with_their_restores(
-        self,
-    ) -> None:
+    def test_removed_flags_are_a_clean_break(self) -> None:
+        for argv in (
+            ["--strip-meta"],
+            ["--block-remote-wipe"],
+            ["--disable-updates"],
+            ["--disable-camera-light"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("unrecognized arguments", parse_error(argv))
+
+    def test_debloat_rejects_its_own_restore(self) -> None:
         self.assertIn(
-            "--disable-updates cannot be combined with "
-            "--restore updates",
-            parse_error(["--strip-meta", "--restore", "updates"]),
-        )
-        self.assertIn(
-            "--debloat cannot be combined with --restore bloat",
-            parse_error(["--strip-meta", "--restore", "bloat"]),
+            "--debloat cannot be combined with --restore debloat",
+            parse_error(["--debloat", "--restore", "debloat"]),
         )
 
 
@@ -175,8 +176,11 @@ class DnsMergeTest(unittest.TestCase):
                 self.assertIn("unrecognized arguments", parse_error(argv))
 
     def test_debloat_rejects_a_dns_restore(self) -> None:
+        # "dns" is no longer a restore name of its own: the DNS
+        # restore rides along with --restore debloat, and the old
+        # name is rejected as an invalid choice.
         self.assertIn(
-            "--debloat cannot be combined with --restore dns",
+            "invalid choice",
             parse_error(["--debloat", "--restore", "dns"]),
         )
 
@@ -272,8 +276,8 @@ class DebloatDnsTest(unittest.TestCase):
 class AppVerifierFoldTest(unittest.TestCase):
     """Disabling Meta's app verifier (so non-Meta apps can
     update) is part of the debloat action set now; the standalone
-    --allow-app-updates flag is a clean break, and
-    --restore app-verifier keeps working on its own."""
+    --allow-app-updates flag is a clean break, and the verifier
+    restore rides along with --restore debloat."""
 
     def test_debloat_disables_the_app_verifier(self) -> None:
         arguments = parse(["--debloat"])
@@ -288,14 +292,14 @@ class AppVerifierFoldTest(unittest.TestCase):
             "unrecognized arguments", parse_error(["--allow-app-updates"])
         )
 
-    def test_debloat_rejects_an_app_verifier_restore(self) -> None:
+    def test_app_verifier_restore_name_left_the_surface(self) -> None:
         self.assertIn(
-            "--debloat cannot be combined with --restore app-verifier",
-            parse_error(["--debloat", "--restore", "app-verifier"]),
+            "invalid choice",
+            parse_error(["--restore", "app-verifier"]),
         )
 
-    def test_app_verifier_restore_still_parses_alone(self) -> None:
-        arguments = parse(["--restore", "app-verifier"])
+    def test_restore_debloat_covers_the_app_verifier(self) -> None:
+        arguments = parse(["--restore", "debloat"])
         self.assertTrue(arguments.restore_app_verifier)
         self.assertFalse(arguments.allow_app_updates)
 
@@ -307,14 +311,30 @@ class RestoreSurfaceTest(unittest.TestCase):
                 arguments = parse(["--restore", name])
                 self.assertTrue(getattr(arguments, attribute))
 
-    def test_restore_names_and_map_cover_each_other(self) -> None:
+    def test_restore_debloat_sets_the_whole_group(self) -> None:
+        arguments = parse(["--restore", "debloat"])
+        for attribute in cli_module.RESTORE_GROUP_MAP["debloat"]:
+            with self.subTest(attribute=attribute):
+                self.assertTrue(getattr(arguments, attribute))
+
+    def test_restore_names_and_maps_cover_each_other(self) -> None:
         self.assertEqual(
-            set(cli_module.RESTORE_NAMES), set(cli_module.RESTORE_FLAG_MAP)
+            set(cli_module.RESTORE_NAMES),
+            set(cli_module.RESTORE_FLAG_MAP)
+            | set(cli_module.RESTORE_GROUP_MAP),
         )
 
+    def test_folded_restore_names_left_the_surface(self) -> None:
+        for name in ("bloat", "remote-wipe", "updates", "dns", "app-verifier"):
+            with self.subTest(name=name):
+                self.assertIn(
+                    "invalid choice", parse_error(["--restore", name])
+                )
+
     def test_several_restores_accumulate(self) -> None:
-        arguments = parse(["--restore", "audio", "--restore", "dns"])
+        arguments = parse(["--restore", "audio", "--restore", "debloat"])
         self.assertTrue(arguments.restore_audio)
+        self.assertTrue(arguments.restore_bloat)
         self.assertTrue(arguments.restore_privacy_dns)
 
     def test_unknown_restore_name_is_rejected(self) -> None:
