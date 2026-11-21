@@ -6432,7 +6432,17 @@ class PortalProvisioner:
                 environment["GHOSTLOCK_OTA_PRIVATE_ONLY"] = "1"
             if private_presence_action:
                 environment["GHOSTLOCK_PRESENCE_PRIVATE_ONLY"] = "1"
-        if preserve_shell_domain:
+        # Preserve and a cloned credential are mutually exclusive
+        # context choices: the payload applies preserve by keeping
+        # the child's own (shell) SELinux SID pair instead of the
+        # cloned source's, so in a credential-scoped phase (the
+        # dedicated OTA, audio, meta, presence and uid1000 phases)
+        # preserve would silently strip the very domain the phase
+        # exists to clone, and its app-private actions fail with
+        # EACCES (2026-11-21: the debloat restore's dedicated OTA
+        # phase carried both, and restore_ota_block failed every
+        # won race at step 17).
+        if preserve_shell_domain and not credential_action:
             environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"] = "1"
         if (
             self.remove_meta_accounts

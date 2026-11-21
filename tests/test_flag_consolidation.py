@@ -964,6 +964,17 @@ class DebloatGroupShellDomainTest(unittest.TestCase):
             environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"], "1"
         )
 
+    def test_dedicated_ota_phase_never_preserves(self) -> None:
+        # The dedicated OTA phase clones the system_server
+        # credential so its action child can write inside the
+        # alohausers app-private directory. Preserve would keep
+        # the shell domain instead and the OTA block restore
+        # would fail every won race at step 17 (2026-11-21).
+        environment = self.build_environment(enable_updates=True)
+        self.assertIn("GHOSTLOCK_ACTION_CREDENTIAL_PID", environment)
+        self.assertIn("GHOSTLOCK_RESTORE_OTA_BLOCK", environment)
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
+
     def test_mixed_run_still_excluded(self) -> None:
         environment = self.build_environment(
             restore_bloat=True,
