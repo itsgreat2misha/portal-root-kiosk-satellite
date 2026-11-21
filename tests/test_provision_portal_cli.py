@@ -1470,10 +1470,13 @@ class RemoteWipeCliTest(unittest.TestCase):
             self.assertTrue(provisioner.needs_component_ctl())
 
     def test_standalone_block_targets_only_the_two_receivers(self) -> None:
+        # The block itself is reached through --debloat now (the
+        # fold sets the internal attribute); the provisioner-level
+        # action still targets only the two receivers.
         with mock.patch.object(
             sys,
             "argv",
-            ["provision_portal.py", "--block-remote-wipe"],
+            ["provision_portal.py", "--debloat"],
         ):
             arguments = parse_args()
 
@@ -2065,14 +2068,15 @@ class DeKioskScrubTest(unittest.TestCase):
             self.assertFalse(hasattr(arguments, name), name)
 
     def test_bootstrap_generic_flag_set_parses(self) -> None:
-        # The exact generic flag set bootstrap.sh passes for Portal
+        # The generic flag set bootstrap.sh passes for Portal
         # devices after the scrub (replacing --profile kiosk).
+        # The update block and remote-wipe block ride along with
+        # --debloat since the consolidation; bootstrap.sh's list
+        # was updated to match.
         argv = [
             "provision_portal.py",
             "--serial", "192.0.2.1:5555",
             "--audio",
-            "--disable-updates",
-            "--block-remote-wipe",
             "--debloat",
             "--remove-meta-accounts",
             "--optimize-presence",

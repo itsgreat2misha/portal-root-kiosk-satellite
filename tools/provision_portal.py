@@ -2771,7 +2771,7 @@ class PortalProvisioner:
         by the staged autoroot conf the per-boot drift pass
         enforces from: an earlier run staged it (the recorded
         case), this run's autoroot staging renders OTA_NODEMON
-        from its own --disable-updates request, or the staged
+        from its own debloat request (the disable_updates action), or the staged
         conf already carries OTA_NODEMON."""
         return bool(
             recorded or self.autoroot or self._ota_nodemon_conf_staged()
@@ -2790,7 +2790,8 @@ class PortalProvisioner:
         desire (the C3-A case: the accounts flow re-enabled the
         package mid-run and the recorded end state is restored),
         or when the run itself stages the OTA posture — it
-        requested --disable-updates without --enable-updates, so
+        requested the update block (disable_updates) without its
+        restore (enable_updates), so
         its staged autoroot conf carries OTA_NODEMON: the
         disabled posture is the decided end state on aloha, so
         such a run establishes it instead of only ever
@@ -3372,14 +3373,17 @@ class PortalProvisioner:
         "block_remote_wipe": "Block Meta remote wipe and factory reset",
         "restore_remote_wipe": "Allow Meta remote wipe again",
         "debloat": (
-            "Disable unused Meta apps and diagnostics; this also "
+            "Turn off Meta system updates, block Meta remote wipe, "
+            "and disable unused Meta apps and diagnostics; this also "
             "turns Android Private DNS off (the Portal uses your "
             "network's DNS) and disables Meta's app verifier so "
             "other apps can update"
         ),
         "restore_bloat": (
-            "Re-enable the apps debloat disabled, from the recorded "
-            "original states"
+            "Undo debloat: re-enable the apps it disabled and put "
+            "Meta system updates, remote wipe, Private DNS and "
+            "Meta's app verifier back to their recorded original "
+            "states"
         ),
         "remove_meta_accounts": "Remove the Meta accounts from this Portal",
         "optimize_presence": "Reduce presence-detection CPU use",
@@ -3440,10 +3444,20 @@ class PortalProvisioner:
                 flush=True,
             )
         for name in actions:
-            if name in ("dhcp_dns", "allow_app_updates") and (
-                "debloat" in actions
-            ):
+            if name in (
+                "disable_updates",
+                "block_remote_wipe",
+                "dhcp_dns",
+                "allow_app_updates",
+            ) and ("debloat" in actions):
                 continue  # folded into the debloat line
+            if name in (
+                "restore_remote_wipe",
+                "enable_updates",
+                "restore_privacy_dns",
+                "restore_app_verifier",
+            ) and ("restore_bloat" in actions):
+                continue  # folded into the restore-debloat line
             line = self._PREFLIGHT_ACTION_LINES.get(name)
             if line is not None:
                 print(f"  - {line}", flush=True)
@@ -7525,7 +7539,7 @@ class PortalProvisioner:
 
     def read_ota_package_record(self) -> dict[str, str] | None:
         """The first-run record of the OTA packages' states, or
-        None when no --disable-updates run with recording has
+        None when no debloat run with recording has
         happened on this device yet."""
         result = self.adb_run(
             ["shell", "cat", OTA_PACKAGES_BACKUP_REMOTE], timeout=5

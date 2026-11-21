@@ -43,20 +43,18 @@ class CliConfig:
     banner: str
 
 
-#: Names accepted by --restore <name>. Each maps onto the provisioner's
-#: existing restore attributes (see RESTORE_FLAG_MAP); the four names
-#: marked Phase D close restore-completeness gaps the audit found
-#: (autoroot, wireless-adb, theme, meta-authenticators).
+#: Names accepted by --restore <name>. Most map onto one of the
+#: provisioner's restore attributes (see RESTORE_FLAG_MAP);
+#: "debloat" maps onto the whole debloat group (see
+#: RESTORE_GROUP_MAP). The four names marked Phase D close
+#: restore-completeness gaps the audit found (autoroot,
+#: wireless-adb, theme, meta-authenticators).
 RESTORE_NAMES = (
     "audio",
-    "bloat",
-    "remote-wipe",
-    "updates",
-    "dns",
+    "debloat",
     "presence",
     "presence-fps",
     "adb-auth-timeout",
-    "app-verifier",
     "camera-light",
     "autoroot",
     "wireless-adb",
@@ -67,14 +65,9 @@ RESTORE_NAMES = (
 #: --restore name -> provisioner attribute it sets.
 RESTORE_FLAG_MAP = {
     "audio": "restore_audio",
-    "bloat": "restore_bloat",
-    "remote-wipe": "restore_remote_wipe",
-    "updates": "enable_updates",
-    "dns": "restore_privacy_dns",
     "presence": "restore_presence_profile",
     "presence-fps": "restore_presence_fps",
     "adb-auth-timeout": "restore_adb_auth_timeout",
-    "app-verifier": "restore_app_verifier",
     "camera-light": "restore_camera_light",
     "autoroot": "restore_autoroot",
     "wireless-adb": "restore_wireless_adb",
@@ -82,29 +75,41 @@ RESTORE_FLAG_MAP = {
     "meta-authenticators": "restore_meta_authenticators",
 }
 
+#: --restore name -> the provisioner attributes it sets together.
+#: Debloat is one command, so its restore is one name covering
+#: everything debloat changed: the apps it disabled, the update
+#: block, the remote-wipe block, Private DNS, and Meta's app
+#: verifier, each back to its recorded original state.
+RESTORE_GROUP_MAP = {
+    "debloat": (
+        "restore_bloat",
+        "restore_remote_wipe",
+        "enable_updates",
+        "restore_privacy_dns",
+        "restore_app_verifier",
+    ),
+}
+
+#: Every restore attribute any --restore name can set.
+RESTORE_ATTRIBUTES = tuple(RESTORE_FLAG_MAP.values()) + tuple(
+    attribute
+    for attributes in RESTORE_GROUP_MAP.values()
+    for attribute in attributes
+)
+
 #: The documented full-setup line, as --full expands it: attribute ->
 #: value. --full is a preset only; it sets exactly these flags and
 #: nothing else (the taste opt-ins --presence-fps-cap and
-#: --system-theme-control stay out by design).
+#: --system-theme-control stay out by design). Debloat carries the
+#: update block and the remote-wipe block with it (see the fold in
+#: parse_args), so they are not preset keys of their own anymore.
 FULL_PRESET = {
     "audio": True,
-    "disable_updates": True,
-    "block_remote_wipe": True,
     "debloat": True,
     "remove_meta_accounts": True,
     "optimize_presence": True,
     "disable_adb_auth_timeout": True,
     "autoroot": True,
-}
-
-#: The Meta-control removal set, as --strip-meta expands it:
-#: block remote wipe, debloat, disable updates. Deliberately NOT
-#: in it: --remove-meta-accounts (the project's only one-way
-#: action stays explicit everywhere) and anything root-related.
-STRIP_META_PRESET = {
-    "block_remote_wipe": True,
-    "debloat": True,
-    "disable_updates": True,
 }
 
 
@@ -149,23 +154,10 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         action="store_true",
         help=(
             "apply the full documented setup in one run: audio, "
-            "disable-updates, block-remote-wipe, debloat, "
-            "remove-meta-accounts, optimize-presence, "
-            "disable-adb-auth-timeout, and "
-            "autoroot. Exactly the long flag line it replaces; the "
-            "granular flags below remain for partial setups"
-        ),
-    )
-    parser.add_argument(
-        "--strip-meta",
-        action="store_true",
-        help=(
-            "apply the Meta-control removal set in one run: "
-            "block-remote-wipe, debloat (which also turns Private "
-            "DNS off and disables Meta's app verifier), and "
-            "disable-updates. No root, and it does NOT remove Meta "
-            "accounts: that stays a separate explicit "
-            "--remove-meta-accounts step"
+            "debloat, remove-meta-accounts, optimize-presence, "
+            "disable-adb-auth-timeout, and autoroot. Exactly the "
+            "long flag line it replaces; the granular flags below "
+            "remain for partial setups"
         ),
     )
     parser.add_argument(
@@ -295,38 +287,17 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--disable-updates",
-        action="store_true",
-        help=(
-            "disable Meta's OTA UI/test packages and install a persistent "
-            "MobileConfig override for the native OTA daemon"
-        ),
-    )
-    parser.add_argument(
-        "--block-remote-wipe",
-        action="store_true",
-        help=(
-            "disable Meta's two known factory-reset and remote-wipe receivers "
-            "without disabling the rest of the device-admin package"
-        ),
-    )
-    parser.add_argument(
-        "--disable-camera-light",
-        action="store_true",
-        help=(
-            "retired unsafe action; Meta's camera provider rejects capture "
-            "while its green indicator is cleared"
-        ),
-    )
-    parser.add_argument(
         "--debloat",
         action="store_true",
         help=(
-            "persistently disable the conservative Meta app/telemetry "
-            "profile and save each package's original state; also "
-            "turns Android Private DNS off so the Portal uses the "
-            "network's own DNS, and disables Meta's app verifier so "
-            "third-party and other non-Meta apps can update"
+            "strip Meta's control and background services in one "
+            "step: persistently disable the conservative Meta "
+            "app/telemetry profile (saving each package's original "
+            "state), block Meta system updates, block Meta remote "
+            "wipe, turn Android Private DNS off so the Portal uses "
+            "the network's own DNS, and disable Meta's app "
+            "verifier so third-party and other non-Meta apps can "
+            "update"
         ),
     )
     parser.add_argument(
@@ -395,14 +366,25 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         parser.error("--attempts must be between 1 and 100")
     # --restore <name> maps onto the restore attributes the rest of
     # the shell (and the provisioner) already use; initialize them
-    # all, then set the requested ones.
-    for attribute in RESTORE_FLAG_MAP.values():
+    # all, then set the requested ones. Most names set one
+    # attribute; the group names (RESTORE_GROUP_MAP) set several.
+    for attribute in RESTORE_ATTRIBUTES:
         setattr(args, attribute, False)
     for name in args.restore:
-        setattr(args, RESTORE_FLAG_MAP[name], True)
+        if name in RESTORE_GROUP_MAP:
+            for attribute in RESTORE_GROUP_MAP[name]:
+                setattr(args, attribute, True)
+        else:
+            setattr(args, RESTORE_FLAG_MAP[name], True)
     args.privacy_dns = None
     args.dhcp_dns = False
     args.allow_app_updates = False
+    # Internal, not user options: these action attributes are set
+    # by the debloat fold below (and by --full through it), never
+    # by flags of their own anymore.
+    args.disable_updates = False
+    args.block_remote_wipe = False
+    args.disable_camera_light = False
     # Internal, not a user option: the root-payload step always uses
     # the in-repo root daemon. Only the autoroot implication below
     # arms it; there is deliberately no flag (and no PATH override)
@@ -413,37 +395,33 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     if args.full:
         for attribute, value in FULL_PRESET.items():
             setattr(args, attribute, value)
-    # --strip-meta expands the same way, to its smaller set.
-    if args.strip_meta:
-        for attribute, value in STRIP_META_PRESET.items():
-            setattr(args, attribute, value)
-    # Debloat carries two fellow-traveller changes with it: a
-    # debloated Portal uses the network's own DNS, so turning
-    # Android Private DNS off is part of the debloat action set
-    # (no separate --dns flag anymore, and no resolver-hostname
-    # form), and Meta's app verifier is disabled so non-Meta apps
-    # can update (no separate --allow-app-updates flag anymore).
-    # The internal attributes set here — dhcp_dns and
+    # Debloat is the single Meta-control removal command. It
+    # carries four fellow-traveller changes with it: Meta system
+    # updates are blocked, Meta remote wipe is blocked, a
+    # debloated Portal uses the network's own DNS (Android
+    # Private DNS off; no resolver-hostname form), and Meta's app
+    # verifier is disabled so non-Meta apps can update. None of
+    # them has a flag of its own anymore. The internal attributes
+    # set here — disable_updates, block_remote_wipe, dhcp_dns and
     # allow_app_updates — are what the applies, the verifies, the
     # manifest recording and the recorded-state readers all key
     # off, exactly as before.
     if args.debloat:
+        args.disable_updates = True
+        args.block_remote_wipe = True
         args.dhcp_dns = True
         args.allow_app_updates = True
     # Apply/restore pairs for one feature stay mutually exclusive,
     # as they were when each pair had its own flag group.
     for apply_attribute, restore_name, apply_label in (
         ("audio", "audio", "--audio"),
-        ("disable_updates", "updates", "--disable-updates"),
-        ("block_remote_wipe", "remote-wipe", "--block-remote-wipe"),
-        ("debloat", "bloat", "--debloat"),
+        ("debloat", "debloat", "--debloat"),
         ("optimize_presence", "presence", "--optimize-presence"),
         (
             "disable_adb_auth_timeout",
             "adb-auth-timeout",
             "--disable-adb-auth-timeout",
         ),
-        ("disable_camera_light", "camera-light", "--disable-camera-light"),
     ):
         if getattr(args, apply_attribute) and restore_name in args.restore:
             parser.error(
@@ -459,12 +437,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
         parser.error(
             "--restore presence cannot be combined with "
             "--restore presence-fps"
-        )
-    if (args.privacy_dns or args.dhcp_dns) and "dns" in args.restore:
-        parser.error("--debloat cannot be combined with --restore dns")
-    if args.debloat and "app-verifier" in args.restore:
-        parser.error(
-            "--debloat cannot be combined with --restore app-verifier"
         )
     if args.persistent_wireless_adb and "wireless-adb" in args.restore:
         parser.error(
@@ -553,12 +525,6 @@ def parse_args(config: CliConfig) -> argparse.Namespace:
     )
     if args.shizuku_apk and not args.shizuku:
         parser.error("--shizuku-apk requires --shizuku")
-    if args.disable_camera_light:
-        parser.error(
-            "--disable-camera-light has been retired because it breaks camera "
-            "capture. Run --restore camera-light on previously provisioned "
-            "devices."
-        )
     if args.recover and selected:
         parser.error("--recover resumes its saved action set and cannot take action flags")
     if args.recover and args.backup:
@@ -770,15 +736,12 @@ def guided_connect(wait_seconds: int = 180) -> str:
 #: is audio: it defaults on, so it cannot mark an explicit ask.
 _ACTION_ATTRIBUTES = (
     "full",
-    "strip_meta",
     "restore",
     "status",
     "dry_run",
     "backup",
     "recover",
     "collect_diagnostics",
-    "disable_updates",
-    "block_remote_wipe",
     "debloat",
     "remove_meta_accounts",
     "optimize_presence",

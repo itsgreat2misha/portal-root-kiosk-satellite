@@ -187,7 +187,6 @@ class CliDefaultsTest(unittest.TestCase):
                 "serial": None,
                 "attempts": 12,
                 "full": False,
-                "strip_meta": False,
                 "connect": False,
                 "restore": [],
                 "persistent_wireless_adb": False,
@@ -281,19 +280,13 @@ class CliSingleFlagMappingTest(unittest.TestCase):
             pathlib.Path("/tmp/s.apk"),
             False,
         ),
-        (["--restore", "app-verifier"], "restore_app_verifier", True, False),
-        (["--disable-updates"], "disable_updates", True, False),
-        (["--restore", "updates"], "enable_updates", True, False),
-        (["--block-remote-wipe"], "block_remote_wipe", True, False),
-        (["--restore", "remote-wipe"], "restore_remote_wipe", True, False),
         (["--restore", "camera-light"], "restore_camera_light", True, False),
         (["--debloat"], "debloat", True, False),
-        (["--restore", "bloat"], "restore_bloat", True, False),
+        (["--restore", "debloat"], "restore_bloat", True, False),
         (["--remove-meta-accounts"], "remove_meta_accounts", True, False),
         (["--optimize-presence"], "optimize_presence", True, False),
         (["--restore", "presence"], "restore_presence_profile", True, False),
         (["--restore", "presence-fps"], "restore_presence_fps", True, False),
-        (["--restore", "dns"], "restore_privacy_dns", True, False),
         (["--restore", "autoroot"], "restore_autoroot", True, False),
         (["--restore", "wireless-adb"], "restore_wireless_adb", True, False),
         (["--restore", "theme"], "restore_theme", True, False),
@@ -394,27 +387,8 @@ class CliValidationTest(unittest.TestCase):
             "--audio cannot be combined with --restore audio",
         ),
         (
-            ["--debloat", "--restore", "app-verifier"],
-            "--debloat cannot be combined with "
-            "--restore app-verifier",
-        ),
-        (
-            ["--disable-updates", "--restore", "updates"],
-            "--disable-updates cannot be combined with --restore updates",
-        ),
-        (
-            ["--block-remote-wipe", "--restore", "remote-wipe"],
-            "--block-remote-wipe cannot be combined with "
-            "--restore remote-wipe",
-        ),
-        (
-            ["--disable-camera-light", "--restore", "camera-light"],
-            "--disable-camera-light cannot be combined with "
-            "--restore camera-light",
-        ),
-        (
-            ["--debloat", "--restore", "bloat"],
-            "--debloat cannot be combined with --restore bloat",
+            ["--debloat", "--restore", "debloat"],
+            "--debloat cannot be combined with --restore debloat",
         ),
         (
             ["--optimize-presence", "--restore", "presence"],
@@ -429,10 +403,6 @@ class CliValidationTest(unittest.TestCase):
             ["--restore", "presence", "--restore", "presence-fps"],
             "--restore presence cannot be combined with "
             "--restore presence-fps",
-        ),
-        (
-            ["--debloat", "--restore", "dns"],
-            "--debloat cannot be combined with --restore dns",
         ),
     )
 
@@ -480,9 +450,11 @@ class CliValidationTest(unittest.TestCase):
             parse_error(["--shizuku-apk", "/tmp/s.apk"]),
         )
 
-    def test_disable_camera_light_is_retired_at_parse_time(self) -> None:
+    def test_disable_camera_light_flag_is_a_clean_break(self) -> None:
+        # The retired apply flag left the surface entirely; the
+        # cleanup for old installs is --restore camera-light.
         self.assertIn(
-            "--disable-camera-light has been retired",
+            "unrecognized arguments",
             parse_error(["--disable-camera-light"]),
         )
 
@@ -563,8 +535,6 @@ class MainConfigMappingTest(unittest.TestCase):
                     "--autoroot",
                     "--verify-boots", "2",
                     "--system-theme-control", "dark",
-                    "--disable-updates",
-                    "--block-remote-wipe",
                     "--debloat",
                     "--remove-meta-accounts",
                     "--presence-fps-cap", "4",
