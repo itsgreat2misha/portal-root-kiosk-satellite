@@ -9,6 +9,24 @@ must match it.
 
 ## [Unreleased]
 
+- Documentation pass over the README and the CLI help text,
+  following the 2026-11-21 docs review: steps now say what the
+  user does and what happens, mechanism explanations and
+  developer notes are removed, the "What a full setup does"
+  table lists exactly what `--full` applies (with the presence
+  frame-rate cap and theme control named as not included), the
+  support-request section uses `--status` instead of raw
+  `getprop` commands, and the help text for `--attempts` (new),
+  `--audio`, `--bundle` (zip, not tar.gz), `--force`,
+  `--shizuku`, `--skip-shizuku-root`, `--autoroot`,
+  `--system-theme-control`, `--debloat`,
+  `--remove-meta-accounts`, `--optimize-presence` and
+  `--recover` is rewritten in plain words. New suite guards pin
+  the docs to the surface: every exposed flag appears in the
+  README, every flag the README names exists, and the listed
+  restore names are exactly the accepted ones. No behavior
+  changes.
+
 - `--status` now reports two more fields in its `target`
   section, the ones a support request for another build needs:
   `retail_model` (the retail model name, for example "Meta
