@@ -276,6 +276,31 @@ APPLY_RESTORE_PAIRS = (
     ("system_theme_control", "restore_theme"),
     ("shizuku", "remove_shizuku"),
 )
+#: The action keys of the debloat group, in both directions: the
+#: CLI fold sets the apply keys together (debloat, disable_updates,
+#: block_remote_wipe, dhcp_dns, allow_app_updates) and the debloat
+#: restore sets the restore keys together (see RESTORE_GROUP_MAP in
+#: cli.py). A phase carrying only these keys does its work through
+#: the component control and the shell-level package actions, which
+#: need the action child SELinux domain (the shell domain)
+#: preserved: under the init domain the component control cannot
+#: run at all (2026-11-21: every race win of a --restore debloat
+#: run died at the component action, and the child could not even
+#: create its output file under /data/local/tmp).
+SHELL_DOMAIN_ACTION_KEYS = frozenset(
+    {
+        "debloat",
+        "restore_bloat",
+        "block_remote_wipe",
+        "restore_remote_wipe",
+        "disable_updates",
+        "enable_updates",
+        "dhcp_dns",
+        "restore_privacy_dns",
+        "allow_app_updates",
+        "restore_app_verifier",
+    }
+)
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
 ADB_AUTH_TIMEOUT_BACKUP_REMOTE = (
     "/data/local/tmp/portal-adb-auth-timeout-before-v1.json"
@@ -6322,19 +6347,19 @@ class PortalProvisioner:
                     == {"remove_meta_accounts": True}
                 )
                 or (
-                    set(self.requested_actions())
-                    <= {
-                        "debloat",
-                        "restore_bloat",
-                        "block_remote_wipe",
-                        "restore_remote_wipe",
-                    }
+                    set(self.requested_actions()) <= SHELL_DOMAIN_ACTION_KEYS
                     and any(
                         (
                             self.debloat,
                             self.restore_bloat,
                             self.block_remote_wipe,
                             self.restore_remote_wipe,
+                            self.disable_updates,
+                            self.enable_updates,
+                            self.dhcp_dns,
+                            self.restore_privacy_dns,
+                            self.allow_app_updates,
+                            self.restore_app_verifier,
                         )
                     )
                 )
