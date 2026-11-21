@@ -546,6 +546,13 @@ class PortalProvisioner:
         # as its last step. The posture judgment's override-presence
         # evidence when no root channel can stat the file.
         self._ota_install_verified_this_run = False
+        # Set when this run's own OTA block restore completed (its
+        # attempt, or the dedicated restore phase's). The restore
+        # marker lives in the alohausers app-private directory in
+        # the credential context, where the host cannot stat it, so
+        # verify_ota_restored() accepts this as its evidence (the
+        # same pattern as the install flag above).
+        self._ota_restore_verified_this_run = False
         # While true, report_deferred_failures() re-judges but does
         # not raise: a custom payload phase is still to run in this
         # invocation, and the judgment that ends the run happens in
@@ -7340,6 +7347,8 @@ class PortalProvisioner:
                 f"INSTALL_ATTEMPT_RESULT attempt={attempt} "
                 f"success={int(success)} early_failure={int(failed)}"
             )
+            if success and "GHOSTLOCK_RESTORE_OTA_BLOCK" in environment:
+                self._ota_restore_verified_this_run = True
             if not success:
                 self._log_watch_result_evidence(attempt)
             if not skip_final_reboot or not success:
@@ -7680,7 +7689,10 @@ class PortalProvisioner:
 
     def verify_ota_restored(self) -> None:
         marker = "/data/local/tmp/portal-ota-backup/restored-v1"
-        if self.adb_run(["shell", "test", "-f", marker], timeout=5).returncode != 0:
+        if (
+            self.adb_run(["shell", "test", "-f", marker], timeout=5).returncode != 0
+            and not self._ota_restore_verified_this_run
+        ):
             raise ProvisionError("OTA restore marker is absent")
         if self.target and self.target.device == "aloha":
             original = self.read_ota_backend_backup()
@@ -8882,6 +8894,56 @@ class PortalProvisioner:
                     raise ProvisionError(
                         "the dedicated Aloha OTA bootstrap did not verify"
                     )
+                self.write_state("pending")
+        with self.bootstrap_guard("enable_updates"):
+            if (
+                self.enable_updates
+                and self.target
+                and (
+                    self.target.ota_installer_credentials
+                    or self.target.ota_system_credentials
+                    or self.target.ota_credential_process is not None
+                )
+                and self.requested_actions() != {"enable_updates": True}
+                and self.read_ota_backend_backup() is not None
+                and self.adb_run(
+                    [
+                        "shell",
+                        "test",
+                        "-f",
+                        "/data/local/tmp/portal-ota-backup/restored-v1",
+                    ],
+                    timeout=5,
+                ).returncode
+                != 0
+            ):
+                phase_logs = self.log_dir / "ota-restore-bootstrap"
+                phase_logs.mkdir(parents=True, exist_ok=True)
+                print(
+                    "OTA_RESTORE_BOOTSTRAP_PHASE action=restore "
+                    "reason=installer-credential",
+                    flush=True,
+                )
+                bootstrap = PortalProvisioner(
+                    self.serial,
+                    self.attempts,
+                    phase_logs,
+                    enable_updates=True,
+                    skip_build=self.skip_build,
+                    bundle=self.bundle,
+                )
+                bootstrap.provision()
+                self.connect(wait_seconds=30)
+                self.verify_target()
+                # The nested run returned normally, so its restore
+                # action completed -- and that action verifies the
+                # override's restored state as its last step. The
+                # restore marker lives in the alohausers app-private
+                # directory in this credential context, where the
+                # host cannot stat it, so the parent's verification
+                # uses this as its restore evidence (see
+                # verify_ota_restored).
+                self._ota_restore_verified_this_run = True
                 self.write_state("pending")
         if (
             self.ota_already_configured
