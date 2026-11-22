@@ -975,6 +975,26 @@ class DebloatGroupShellDomainTest(unittest.TestCase):
         self.assertIn("GHOSTLOCK_RESTORE_OTA_BLOCK", environment)
         self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
 
+    def test_meta_authenticator_restore_is_credential_scoped(self) -> None:
+        # --restore meta-authenticators flips protected component
+        # states, which the action child can only do with the cloned
+        # credential; without a donor the exploit takes its other
+        # route and loses the timing race (2026-11-21: six attempts,
+        # every one STEP=22 WATCH_CFI_OK=0).
+        environment = self.build_environment(
+            restore_meta_authenticators=True
+        )
+        self.assertIn("GHOSTLOCK_ACTION_CREDENTIAL_PID", environment)
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
+
+    def test_autoroot_payload_is_credential_scoped(self) -> None:
+        # --autoroot stages the root daemon as a custom payload; it
+        # needs the same donor, and preserve would strip the cloned
+        # domain the daemon runs under.
+        environment = self.build_environment(autoroot=True)
+        self.assertIn("GHOSTLOCK_ACTION_CREDENTIAL_PID", environment)
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
+
     def test_mixed_run_still_excluded(self) -> None:
         environment = self.build_environment(
             restore_bloat=True,

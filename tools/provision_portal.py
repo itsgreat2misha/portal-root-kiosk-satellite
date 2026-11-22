@@ -6378,6 +6378,13 @@ class PortalProvisioner:
             or private_meta_action
             or private_presence_action
             or private_uid1000_action
+            # --restore meta-authenticators: sin donante el exploit corre por
+            # otra ruta y pierde la carrera (STEP=21/22). Con installd aterriza.
+            or self.restore_meta_authenticators
+            # --autoroot / --custom-payload: misma historia (sin donante el
+            # exploit pierde la carrera y el daemon nunca se instala).
+            or self.custom_payload is not None
+            or self.autoroot
         )
         self._action_credential_source = None
         if credential_action:
@@ -6400,6 +6407,9 @@ class PortalProvisioner:
                         )
                         or private_presence_action
                         or private_uid1000_action
+                        or self.restore_meta_authenticators
+                        or self.custom_payload is not None
+                        or self.autoroot
                     )
                     else "system_server"
                 )
