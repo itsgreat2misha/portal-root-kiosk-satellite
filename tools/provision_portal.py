@@ -5247,7 +5247,14 @@ class PortalProvisioner:
             APP_VERIFIER_PACKAGE,
         ]
         self.adb_run(package_command, timeout=15, check=True)
-        self.adb_run(["shell", "sync"], timeout=10, check=True)
+        # PackageManager persists package state asynchronously. A
+        # run staged through the race path reboots into a crash-prone
+        # attempt boot soon after this staging step, and an unsettled
+        # enable was silently lost there (2026-11-21: the restore
+        # verified enabled at staging and read disabled at the final
+        # persistence check). Settle the write first, the way the
+        # OTA package restore does.
+        self.settle_package_state(before_reboot=True)
         self.verify_app_verifier_setting()
 
     def verify_app_verifier_setting(self) -> None:

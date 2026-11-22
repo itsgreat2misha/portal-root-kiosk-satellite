@@ -443,5 +443,47 @@ class OtaRestoreMarkerEvidenceTest(unittest.TestCase):
                 provisioner.verify_ota_restored()
 
 
+class AppVerifierRestoreSettleTest(unittest.TestCase):
+    """The app verifier restore must settle its package write.
+
+    PackageManager persists package state asynchronously; staged
+    through the race path, the next step is a reboot into a
+    crash-prone attempt boot, which silently discarded an
+    unsettled enable (2026-11-21: verified enabled at staging,
+    read disabled at the final persistence check).
+    """
+
+    def test_restore_settles_package_state_before_verifying(self) -> None:
+        import json as json_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = make_provisioner(temporary, target=None)
+            backup = json_module.dumps(
+                {
+                    "schema": 2,
+                    "package_verifier_enable": "1",
+                    "meta_verifier_package_disabled": False,
+                }
+            )
+
+            def fake_adb_run(args, timeout=None, check=False):
+                if args[:2] == ["shell", "cat"]:
+                    return completed(args, stdout=backup)
+                if args[:3] == ["shell", "settings", "put"]:
+                    return completed(args)
+                if args[:3] == ["shell", "pm", "enable"]:
+                    return completed(args)
+                raise AssertionError(f"unexpected adb call: {args}")
+
+            provisioner.adb_run = fake_adb_run
+            settled: list[bool] = []
+            provisioner.settle_package_state = (
+                lambda before_reboot=False: settled.append(before_reboot)
+            )
+            provisioner.verify_app_verifier_setting = lambda: None
+            provisioner.restore_app_verifier_setting()
+            self.assertEqual(settled, [True])
+
+
 if __name__ == "__main__":
     unittest.main()
