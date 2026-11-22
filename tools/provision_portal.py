@@ -286,7 +286,11 @@ APPLY_RESTORE_PAIRS = (
 #: preserved: under the init domain the component control cannot
 #: run at all (2026-11-21: every race win of a --restore debloat
 #: run died at the component action, and the child could not even
-#: create its output file under /data/local/tmp).
+#: create its output file under /data/local/tmp). The set also
+#: carries restore_meta_authenticators: that restore does its work
+#: through the same component control, and leaving its key out
+#: repeated the same failure on 2026-11-22 (every race attempt of
+#: --restore meta-authenticators died at watch step 22, EACCES).
 SHELL_DOMAIN_ACTION_KEYS = frozenset(
     {
         "debloat",
@@ -299,6 +303,7 @@ SHELL_DOMAIN_ACTION_KEYS = frozenset(
         "restore_privacy_dns",
         "allow_app_updates",
         "restore_app_verifier",
+        "restore_meta_authenticators",
     }
 )
 ADB_AUTH_TIMEOUT_SETTING = "adb_allowed_connection_time"
@@ -6411,6 +6416,7 @@ class PortalProvisioner:
                             self.restore_privacy_dns,
                             self.allow_app_updates,
                             self.restore_app_verifier,
+                            self.restore_meta_authenticators,
                         )
                     )
                 )

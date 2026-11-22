@@ -987,5 +987,58 @@ class DebloatGroupShellDomainTest(unittest.TestCase):
         self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
 
 
+
+class MetaAuthenticatorsRestoreShellDomainTest(unittest.TestCase):
+    """The meta-authenticators restore keeps the preserved shell domain.
+
+    Regression (2026-11-22): the restore does its work through the
+    same component control as the debloat group, but its action key
+    was missing from SHELL_DOMAIN_ACTION_KEYS and its flag from the
+    preserve condition, so a --restore meta-authenticators race
+    phase ran the component control under the init SELinux domain
+    and every attempt died at watch step 22 with EACCES. A
+    credential donor cannot substitute: a credential-scoped phase
+    suppresses the preserve and clones the donor's domain instead
+    of keeping the shell domain the component control needs.
+    """
+
+    def build_environment(self, **kwargs):
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = PortalProvisioner(
+                "192.0.2.1:5555", 1, pathlib.Path(temporary), **kwargs
+            )
+            provisioner.target = ALOHA
+
+            def adb_run(arguments, timeout=None, check=False):
+                del timeout, check
+                value = (
+                    "1204" if arguments[:2] == ["shell", "pidof"] else "1000"
+                )
+                return subprocess.CompletedProcess(
+                    arguments, 0, value + "\n", ""
+                )
+
+            with mock.patch.object(
+                provisioner, "adb_run", side_effect=adb_run
+            ):
+                return provisioner.build_exploit_environment(
+                    0x1000, 0x2000, 1
+                )
+
+    def test_meta_authenticators_restore_preserves_shell_domain(self) -> None:
+        environment = self.build_environment(restore_meta_authenticators=True)
+        self.assertEqual(
+            environment["GHOSTLOCK_ACTION_PRESERVE_SELINUX"], "1"
+        )
+        self.assertNotIn("GHOSTLOCK_ACTION_CREDENTIAL_PID", environment)
+
+    def test_meta_authenticators_restore_mixed_run_still_excluded(self) -> None:
+        environment = self.build_environment(
+            restore_meta_authenticators=True,
+            audio=True,
+        )
+        self.assertNotIn("GHOSTLOCK_ACTION_PRESERVE_SELINUX", environment)
+
+
 if __name__ == "__main__":
     unittest.main()
