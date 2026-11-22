@@ -2026,7 +2026,8 @@ class AutorootStagedMarkerTest(unittest.TestCase):
                 "SIMPLEPERF=/data/local/tmp/portal-simpleperf\n"
                 "KASLR_OFFSETS="
                 + ",".join(hex(o) for o in ALOHA.kaslr_pc_offsets)
-                + "\n",
+                + "\n"
+                + f"EXPECTED_FINGERPRINT={ALOHA.fingerprint}\n",
             )
 
 

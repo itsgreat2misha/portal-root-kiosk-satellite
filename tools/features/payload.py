@@ -826,6 +826,12 @@ class PayloadFeature:
                 f"SESSION_WINDOW_SEC={AUTOROOT_SESSION_WINDOW_SEC}\n"
                 f"SIMPLEPERF={simpleperf_remote}\n"
                 f"KASLR_OFFSETS={offsets}\n"
+                # Per-boot build gate: the helper compares this
+                # expectation against Build.FINGERPRINT before any
+                # attempt and stands down on a mismatch (see
+                # BuildGate), so a firmware update cannot leave a
+                # stale staged payload racing a new kernel.
+                f"EXPECTED_FINGERPRINT={self._target().fingerprint}\n"
             )
             if self._ota_nodemon_desired():
                 conf += "OTA_NODEMON=1\n"
