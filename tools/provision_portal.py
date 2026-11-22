@@ -4024,6 +4024,23 @@ class PortalProvisioner:
         system_theme_control_configured = exists(
             self.uid1000_path(SYSTEM_THEME_CONTROL_MARKER)
         )
+        autoroot_conf = shell("cat", AUTOROOT_CONF_REMOTE, timeout=5)
+        autoroot_state = shell(
+            "cat", f"{AUTOROOT_REMOTE_DIR}/state", timeout=5
+        )
+        autoroot_service_log = shell(
+            "cat", f"{AUTOROOT_REMOTE_DIR}/service.log", timeout=5
+        )
+        autoroot_conf_values = dict(
+            line.split("=", 1)
+            for line in autoroot_conf.splitlines()
+            if "=" in line
+        )
+        autoroot_state_values = dict(
+            line.split("=", 1)
+            for line in autoroot_state.splitlines()
+            if "=" in line
+        )
         return {
             "schema": 1,
             "serial": self.serial,
@@ -4389,6 +4406,26 @@ class PortalProvisioner:
                     if camera_light_configured
                     else None
                 ),
+            },
+            "autoroot": {
+                "expected_fingerprint": autoroot_conf_values.get(
+                    "EXPECTED_FINGERPRINT"
+                ),
+                "build_gate": {
+                    "stood_down": (
+                        autoroot_state_values.get("build_gate_stood_down")
+                        == "1"
+                    ),
+                    "expected": autoroot_state_values.get(
+                        "build_gate_expected"
+                    ),
+                    "found": autoroot_state_values.get("build_gate_found"),
+                    "log": [
+                        line
+                        for line in autoroot_service_log.splitlines()
+                        if "build gate" in line
+                    ],
+                },
             },
             "provision_manifest": manifest,
         }

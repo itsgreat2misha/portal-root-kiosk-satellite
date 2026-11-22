@@ -9,6 +9,17 @@ must match it.
 
 ## [Unreleased]
 
+- Per-boot build gate for autoroot: staging now records the build
+  fingerprint it staged for in `autoroot.conf`, and on every boot
+  the helper compares it against the running build before any
+  rooting attempt. On a mismatch it makes no attempts, records the
+  stand-down in its state file, posts a notification, and reports
+  the build it found in its status and log; `--status` surfaces
+  the recorded expectation and the gate state. The gate clears by
+  itself when the build matches again, and a re-stage clears it
+  from the host side. Units staged before this change carry no
+  recorded expectation and are not gated until their next staging.
+
 ## [0.9.1] - 2026-11-21
 
 First release since 0.9.0. The user-facing surface was

@@ -183,6 +183,9 @@ public final class AutorootActivity extends Activity {
             case "STOOD_DOWN":
                 status = "Autoroot stopped itself";
                 break;
+            case "BUILD_MISMATCH":
+                status = "Autoroot stopped: unsupported build";
+                break;
             default:
                 status = "Autoroot idle";
                 break;

@@ -97,11 +97,13 @@ public final class AutorootService extends Service {
     public static final String PREF_DETAIL = "detail";
     public static final String PREF_DISABLED = "disabled";
     public static final String PREF_STOOD_DOWN = "stood_down";
+    public static final String PREF_BUILD_MISMATCH = "build_mismatch";
 
     // The failure-budget stand-down notification: posted on the
     // stood-down boot and kept while stood down (see FailureBudget).
     private static final String NOTIFY_CHANNEL_ID = "autoroot_stood_down";
     private static final int NOTIFY_ID_STOOD_DOWN = 1;
+    private static final int NOTIFY_ID_BUILD_GATE = 2;
 
     private volatile boolean workerRunning;
     private volatile boolean stopRequested;
@@ -170,6 +172,7 @@ public final class AutorootService extends Service {
         // below: it is kept while stood down and cleared only when
         // the stand-down itself clears.
         refreshStandDownNotification();
+        refreshBuildGateNotification();
         if (!shell("test -f " + DISABLE_FLAG + " && echo yes").contains("yes")) {
             // not disabled: fall through
         } else {
@@ -181,6 +184,37 @@ public final class AutorootService extends Service {
         publishStatus("WORKING", lastAttempt, lastMax, "checking");
         String bootId = shell("cat /proc/sys/kernel/random/boot_id").trim();
         Map<String, String> conf = readKeyValues(CONF);
+        // Per-boot build gate (2026-11-22): before any rooting
+        // attempt - ahead of the root-already-up exits, discovery
+        // and the race - compare the fingerprint recorded at
+        // staging time against the build of this boot. On a
+        // mismatch the staged payload targets a different kernel:
+        // make no attempts, persist the stood-down state, and
+        // surface it. The gate re-evaluates every boot, so it
+        // clears when the build matches again; a re-stage rewrites
+        // the expectation and deletes the state file, clearing it
+        // from the host side.
+        String expectedBuild = conf.get(BuildGate.CONF_KEY);
+        String foundBuild = Build.FINGERPRINT;
+        if (BuildGate.stoodDown(expectedBuild, foundBuild)) {
+            Map<String, String> gateState = readKeyValues(STATE);
+            gateState.put(BuildGate.KEY_STOOD_DOWN, "1");
+            gateState.put(BuildGate.KEY_EXPECTED,
+                    expectedBuild == null ? "" : expectedBuild.trim());
+            gateState.put(BuildGate.KEY_FOUND,
+                    foundBuild == null ? "" : foundBuild);
+            writeState(gateState);
+            Log.w(TAG, "autoroot stood down by build gate: expected "
+                    + expectedBuild + " but this boot is " + foundBuild);
+            logFile("build gate stood down expected=" + expectedBuild
+                    + " found=" + foundBuild);
+            publishStatus("BUILD_MISMATCH", lastAttempt, lastMax,
+                    "unsupported build " + foundBuild
+                            + " (staged for " + expectedBuild + ")");
+            refreshBuildGateNotification();
+            return;
+        }
+        clearBuildGateState();
         int maxAttempts = parseInt(conf.get("MAX_ATTEMPTS"), 4);
         long sessionWindowSec = parseLong(conf.get("SESSION_WINDOW_SEC"), 7200);
         String simpleperf = conf.getOrDefault("SIMPLEPERF", "/data/local/tmp/portal-simpleperf");
@@ -813,6 +847,101 @@ public final class AutorootService extends Service {
                     getSystemService(NOTIFICATION_SERVICE);
             if (manager != null) {
                 manager.cancel(NOTIFY_ID_STOOD_DOWN);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Clears a persisted build-gate stand-down once the live build
+     * matches the staged expectation again (or none is recorded):
+     * drops the gate keys from the state file and the notification.
+     * A no-op when the gate never stood this unit down, so a normal
+     * boot does not rewrite the state file.
+     */
+    private void clearBuildGateState() {
+        try {
+            Map<String, String> state = readKeyValues(STATE);
+            if (!"1".equals(state.get(BuildGate.KEY_STOOD_DOWN))) {
+                return;
+            }
+            state.remove(BuildGate.KEY_STOOD_DOWN);
+            state.remove(BuildGate.KEY_EXPECTED);
+            state.remove(BuildGate.KEY_FOUND);
+            writeState(state);
+            logFile("build gate cleared: build matches again");
+        } catch (Exception ignored) {
+        }
+        refreshBuildGateNotification();
+    }
+
+    /**
+     * Keeps the build-gate notification and the published mismatch
+     * pref in step with the persisted gate state: posted while the
+     * gate stands the unit down, cancelled when it does not.
+     */
+    private void refreshBuildGateNotification() {
+        boolean stoodDown = false;
+        String found = "";
+        try {
+            Map<String, String> state = readKeyValues(STATE);
+            stoodDown = "1".equals(state.get(BuildGate.KEY_STOOD_DOWN));
+            found = state.getOrDefault(BuildGate.KEY_FOUND, "");
+        } catch (Exception ignored) {
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_BUILD_MISMATCH, stoodDown).apply();
+        if (stoodDown) {
+            postBuildGateNotification(found);
+        } else {
+            cancelBuildGateNotification();
+        }
+    }
+
+    private void postBuildGateNotification(String foundBuild) {
+        try {
+            NotificationManager manager = (NotificationManager)
+                    getSystemService(NOTIFICATION_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 26) {
+                manager.createNotificationChannel(new NotificationChannel(
+                        NOTIFY_CHANNEL_ID, "Autoroot stand-down",
+                        NotificationManager.IMPORTANCE_DEFAULT));
+            }
+            Intent intent = new Intent(this, AutorootActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            PendingIntent pending = PendingIntent.getActivity(
+                    this, 0, intent,
+                    Build.VERSION.SDK_INT >= 23
+                            ? PendingIntent.FLAG_IMMUTABLE : 0);
+            Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, NOTIFY_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            Notification notification = builder
+                    .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                    .setContentTitle("Autoroot is off")
+                    .setContentText("This Portal updated to an"
+                            + " unsupported build (" + foundBuild + "),"
+                            + " so autoroot turned itself off."
+                            + " Re-run the provisioner to set it up"
+                            + " for the new build.")
+                    .setContentIntent(pending)
+                    .setOngoing(true)
+                    .build();
+            manager.notify(NOTIFY_ID_BUILD_GATE, notification);
+        } catch (Exception error) {
+            Log.w(TAG, "build gate notification failed", error);
+        }
+    }
+
+    private void cancelBuildGateNotification() {
+        try {
+            NotificationManager manager = (NotificationManager)
+                    getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.cancel(NOTIFY_ID_BUILD_GATE);
             }
         } catch (Exception ignored) {
         }
