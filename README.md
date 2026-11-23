@@ -1,3 +1,9 @@
+## Archived
+
+This repository is archived and is no longer maintained. Development has moved to a private repository.
+
+This tool roots Meta Portal devices through a Linux kernel vulnerability (CVE-2026-43499, "GhostLock"). Meta's current Portal firmware, build 3051392000021050, includes the upstream fix for that vulnerability, and the root method here does not work on that build. The releases in this repository support only the firmware builds listed in the compatibility table below.
+
 > ⚠️ **Under heavy development — not ready for release.** This project is being actively restructured and validated. It may not work on your device yet, behavior can change between commits, and there is no stable release. Use at your own risk.
 
 # Meta Portal Root Provisioner
